@@ -1,0 +1,44 @@
+# Python and local tooling
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.comate/
+.venv/
+venv/
+.DS_Store
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*apiKey*.csv
+*apikey*.csv
+
+# Runtime data and generated artifacts
+quant_data/
+snapshots/
+logs/
+*.log
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Private/vendor SDK binaries and external archives
+sdk/
+*.whl
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.pdf
+*.htm
+*.html

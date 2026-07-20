@@ -1,0 +1,16 @@
+# 构建镜像时无需进入 context 的大文件/敏感文件
+星耀数智.zip
+*.pdf
+*.csv
+.env
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.git
+.comate
+snapshots
+quant_data
+logs
+*.zip

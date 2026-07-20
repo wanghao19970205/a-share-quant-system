@@ -1,0 +1,12 @@
+# 定时任务/训练侧依赖（容器内跑 quant.scheduled_workflow + snapshot_batch）。
+# 排除 torch/xgboost；CatBoost Ranker 与 ExtraTrees 作为可选影子模型。
+# scikit-learn/scipy 会随券商 AmazingData SDK 一并装上，这里显式声明保证可用。
+akshare>=1.12
+pandas>=2.0
+numpy>=1.24
+pyarrow>=15.0
+scikit-learn>=1.4
+threadpoolctl>=3.5
+lightgbm>=4.0
+catboost>=1.2.8,<2.0
+yfinance>=0.2

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wanghao81.stock-daily-light</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/wanghao81/Desktop/A</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Developer/CommandLineTools/usr/bin/python3</string>
+        <string>-m</string>
+        <string>quant.scheduled_workflow</string>
+        <string>--universe</string>
+        <string>mainboard_active</string>
+        <string>--update-workers</string>
+        <string>12</string>
+        <string>--lookback-days</string>
+        <string>5</string>
+        <string>--event-window-days</string>
+        <string>30</string>
+        <string>--skip-valuation</string>
+        <string>--skip-fundamentals</string>
+        <string>--skip-snapshots</string>
+        <string>--snapshot-dir</string>
+        <string>/Users/wanghao81/Desktop/A/snapshots</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/wanghao81/Desktop/A</string>
+        <key>QUANT_DATA_DIR</key>
+        <string>/Users/wanghao81/Desktop/A/quant_data/full_a_2018_wide</string>
+        <key>SNAPSHOT_DIR</key>
+        <string>/Users/wanghao81/Desktop/A/snapshots</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>0</integer><key>Hour</key><integer>11</integer><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>11</integer><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>11</integer><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>11</integer><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>11</integer><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>11</integer><key>Minute</key><integer>40</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/wanghao81/Desktop/A/logs/stock-daily-light.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/wanghao81/Desktop/A/logs/stock-daily-light.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

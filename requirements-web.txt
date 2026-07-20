@@ -1,0 +1,9 @@
+# Web/容器运行所需依赖（Streamlit UI + 行情 + 读取量化预测 parquet）。
+# 训练侧依赖（lightgbm/xgboost/torch/scikit-learn/tables）不进容器，见 requirements.txt。
+streamlit>=1.30
+akshare>=1.12
+pandas>=2.0
+numpy>=1.24
+plotly>=5.18
+yfinance>=0.2
+pyarrow>=15.0

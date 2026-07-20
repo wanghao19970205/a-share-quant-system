@@ -1,0 +1,34 @@
+# 容器内生产定时任务（时区 Asia/Shanghai，由 entrypoint 设置 /etc/localtime）。
+# 字段：分 时 日 月 周 用户 命令   （周：0/7=周日,1=周一,...,5=周五,6=周六）
+# 注意：/etc/cron.d 中 % 有特殊含义（转成换行），date 格式里的 % 需转义为 \%。
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# 心跳：每 10 分钟写一行到中心日志，用于确认 cron 调度存活。
+# 若某天任务没跑：有心跳=cron活着(任务条目/执行有问题)；无心跳=cron本身没在调度。
+*/10 * * * * root date '+\%Y-\%m-\%d \%H:\%M:\%S cron-heartbeat' >> /app/logs/cron.log 2>&1
+
+# 交易日 10:30、13:30：轻量盘中刷新，只拉当天慢数据以外的行情并训练最近 6 个窗口。
+30 10 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh intraday-light
+30 13 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh intraday-light
+# 每周一~周五 11:40：盘中快速日更 + 短线/波段训练 + 发布。
+40 11 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh daily-light
+# 每周一~周四 15:40（收盘后）：用当日完整收盘数据快速日更 + 训练 + 发布。
+40 15 * * 1,2,3,4 root /app/docker/scheduler_jobs.sh daily-light
+# 每周五 15:40（收盘后）：完整日更（估值/财报/180天事件窗口）+ 训练 + 发布。
+40 15 * * 5 root /app/docker/scheduler_jobs.sh weekly-full
+# 每月第一个周六 01:00：最近36个窗口滚动因子审计；前30个月选参数、后6个月验收，达标才升级
+0 1 * * 6 root [ "$(date '+\%d')" -le 7 ] && /app/docker/scheduler_jobs.sh monthly-factor
+# 每天 17:00：读取白名单，积累多维快照（新闻/情绪周末也更新，保留每天）
+0 17 * * * root /app/docker/scheduler_jobs.sh snapshots
+# 每天 16:40（收盘后）：白名单新闻增量入库（公告/研报/个股新闻/市场要闻），日积月累建库
+40 16 * * * root /app/docker/scheduler_jobs.sh news-daily
+# 每10分钟：Qwen 实时结构化标注历史新闻（20 条/轮，内容哈希幂等、可断点续跑）。
+# 与日更最新新闻标注分开：该任务按历史待标注顺序逐步回溯，不影响 16:40->17:00 快照链路。
+*/10 * * * * root /app/docker/scheduler_jobs.sh news-annotation
+# 每周日 00:30：刷新全 A 东财行业/概念板块映射；失败板块沿用上次成功快照
+30 0 * * 0 root /app/docker/scheduler_jobs.sh all-a-meta
+# 每月第一个周日 02:30：用已积累的一年舆情重选衰减/类别权重；留出验证不过则不加分
+30 2 * * 0 root [ "$(date '+\%d')" -le 7 ] && /app/docker/scheduler_jobs.sh sentiment-model
+# 每天 03:10：日志清理，超过阈值大小的 .log 仅保留末尾若干行，避免无限增长
+10 3 * * * root /app/docker/scheduler_jobs.sh rotate

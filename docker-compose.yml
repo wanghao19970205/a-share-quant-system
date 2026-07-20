@@ -1,0 +1,76 @@
+services:
+  app:
+    build:
+      context: .
+    platform: linux/amd64
+    image: stock-app
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env            # 自动注入券商账号，无需每次手输
+    volumes:
+      - ./snapshots:/app/snapshots   # 多维快照持久化到宿主机
+      - ./quant_data/full_a_2018_wide:/app/quant_data/full_a_2018_wide:ro  # 量化模型预测结果，只读挂载
+    environment:
+      - SNAPSHOT_DIR=/app/snapshots
+      - QUANT_DATA_DIR=/app/quant_data/full_a_2018_wide
+      - QUANT_MODEL=active_quant
+      - AMAZINGDATA_AUTO_LOGIN=1
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mobile:
+    build:
+      context: .
+    platform: linux/amd64
+    image: stock-app
+    ports:
+      - "8502:8502"
+    env_file:
+      - .env
+    volumes:
+      - ./snapshots:/app/snapshots:ro
+      - ./quant_data/full_a_2018_wide:/app/quant_data/full_a_2018_wide:ro
+    environment:
+      - SNAPSHOT_DIR=/app/snapshots
+      - QUANT_DATA_DIR=/app/quant_data/full_a_2018_wide
+      - QUANT_MODEL=active_quant
+      - PYTHONPATH=/app
+    command: ["streamlit", "run", "mobile_app.py", "--server.address=0.0.0.0", "--server.port=8502"]
+    restart: unless-stopped
+
+  # 定时任务/训练服务：拉数 -> 训练 -> 发布 active 预测，写入共享 quant_data 卷。
+  # 与 app 共享同一宿主机目录：scheduler 可写，app 只读。
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    platform: linux/amd64
+    image: stock-scheduler
+    env_file:
+      - .env            # 券商账号：容器内 Linux 可用 AmazingData 优先源
+    environment:
+      - SNAPSHOT_DIR=/app/snapshots
+      - QUANT_DATA_DIR=/app/quant_data/full_a_2018_wide
+      - QUANT_MODEL=active_quant
+      - AMAZINGDATA_AUTO_LOGIN=1
+      - TZ=Asia/Shanghai
+      - PYTHONPATH=/app
+      - LOG_DIR=/app/logs
+      - SNAPSHOT_BATCH=1
+      - DASHSCOPE_BATCH_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+      - RUN_ON_START=0  # 设为 1 则容器启动即补跑一次快速日更
+    volumes:
+      - ./snapshots:/app/snapshots                                   # 快照读写
+      - ./quant_data/full_a_2018_wide:/app/quant_data/full_a_2018_wide  # 行情/预测读写
+      - ./logs:/app/logs                                             # 定时任务日志
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

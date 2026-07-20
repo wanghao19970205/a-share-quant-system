@@ -1,0 +1,46 @@
+# 定时任务/训练容器（Linux x86_64，含银河 AmazingData 券商 SDK）。
+# 与 UI 镜像分离：UI 保持精简只读，本镜像负责拉数/训练/发布，写入共享 quant_data 卷。
+# 券商 SDK 仅提供 Linux x86_64 原生库，arm64 Mac 需 docker build --platform linux/amd64。
+FROM docker.m.daocloud.io/library/python:3.12-slim
+
+WORKDIR /app
+
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=5
+
+# 训练/行情/券商 SDK 运行所需系统依赖：
+# - libgomp1: lightgbm 多线程；libgssapi_krb5: tgw .so 依赖
+# - cron: 容器内定时任务；tzdata: 时区（Asia/Shanghai）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libstdc++6 ca-certificates \
+        libgssapi-krb5-2 libkrb5-3 \
+        cron tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV TZ=Asia/Shanghai
+
+# 训练侧依赖
+COPY requirements-scheduler.txt .
+RUN pip install --no-cache-dir -r requirements-scheduler.txt
+
+# 券商 SDK（Linux x86_64 wheel；AmazingData 用 cp312 匹配 Python 3.12）
+COPY sdk/tgw-1.0.8.7-py3-none-any.whl sdk/AmazingData-1.1.7-cp312-none-any.whl /tmp/sdk/
+RUN pip install --no-cache-dir /tmp/sdk/tgw-1.0.8.7-py3-none-any.whl \
+    && pip install --no-cache-dir /tmp/sdk/AmazingData-1.1.7-cp312-none-any.whl
+
+# 让 tgw 原生 .so 可被动态加载
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/tgw/common_linux_lib64
+ENV PYTHONPATH=/app
+
+# 应用代码（训练 + 数据接入 + 快照）
+COPY quant ./quant
+COPY stock_analyzer ./stock_analyzer
+COPY docker ./docker
+
+# 定时任务（cron.d 需 root 用户列、0644 权限；文件名不含点，避免 run-parts 忽略）
+COPY docker/scheduler.crontab /etc/cron.d/stock-scheduler
+RUN chmod 0644 /etc/cron.d/stock-scheduler \
+    && chmod +x /app/docker/scheduler_jobs.sh /app/docker/scheduler-entrypoint.sh
+
+CMD ["/app/docker/scheduler-entrypoint.sh"]
