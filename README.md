@@ -3,6 +3,8 @@
 一个面向A股的完整研究与生产运行项目，包含Streamlit分析界面、移动端界面、行情与新闻快照、滚动因子训练、模型融合、候选晋级评估和容器内定时调度。
 
 > 本项目仅用于数据分析和量化研究，不构成投资建议。历史回测和模型评分不代表未来收益。
+> <img width="1761" height="959" alt="image" src="https://github.com/user-attachments/assets/caf9217f-e674-4733-b586-29fe089d7e5a" />
+
 
 ## 功能概览
 
