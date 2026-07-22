@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,11 @@ from quant import config, warehouse
 
 _PRICE_COLS = ["open", "high", "low", "close", "volume", "amount", "turnover", "pct_change"]
 _PANEL_WORKERS = 12
+_PRICE_PROCESS_MIN_CODES = 50
+_PRICE_PROCESS_WORKERS = min(
+    max(int(os.environ.get("PANEL_PRICE_PROCESS_WORKERS", "8") or 8), 1),
+    os.cpu_count() or 1,
+)
 
 
 def _technical_rule_score(df: pd.DataFrame) -> pd.Series:
@@ -125,7 +130,14 @@ def _first_col(df: pd.DataFrame, patterns: list[str]) -> str | None:
     return None
 
 
-def _price_factors(code: str) -> pd.DataFrame:
+def _price_factors(
+    code: str,
+    start_date: pd.Timestamp | None = None,
+    warmup_rows: int = 0,
+) -> pd.DataFrame:
+    # EWM-based indicators carry recursive state, so compute from full history and
+    # only trim the emitted rows. This preserves exact full-panel factor values.
+    del warmup_rows
     df = warehouse.load_price(code)
     if df.empty:
         return df
@@ -164,16 +176,20 @@ def _price_factors(code: str) -> pd.DataFrame:
         df["amount_chg_5"] = df["amount"].pct_change(5)
     df["rule_score"] = _technical_rule_score(df)
     df["rule_score_chg_5"] = df["rule_score"] - df["rule_score"].shift(5)
+    if start_date is not None:
+        df = df[df["date"] >= pd.Timestamp(start_date)].copy()
 
     return df[["code", "date", "close"] + [c for c in df.columns if c not in {"code", "date", "close"}]]
 
 
-def _valuation_factors(code: str) -> pd.DataFrame:
+def _valuation_factors(code: str, start_date: pd.Timestamp | None = None) -> pd.DataFrame:
     df = warehouse.load_valuation(code)
     if df.empty:
         return df
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if start_date is not None:
+        df = df[df["date"] >= pd.Timestamp(start_date)].copy()
     keep = ["code", "date"]
     for c in ("pe_ttm", "pe_static", "pb", "ps", "peg", "pcf", "mv_total", "mv_float"):
         if c in df.columns:
@@ -321,31 +337,64 @@ def _filter_codes_by_price_rows(codes: list[str], min_price_rows: int = 0) -> li
     return kept
 
 
+def _factor_subset(factor: pd.DataFrame, codes: set[str]) -> pd.DataFrame:
+    if factor.empty or "code" not in factor.columns:
+        return factor
+    return factor[factor["code"].astype(str).isin(codes)].copy()
+
+
+def _price_factor_job(args: tuple[str, pd.Timestamp | None, int]) -> pd.DataFrame:
+    return _price_factors(*args)
+
+
+def _price_factor_parts(
+    codes: list[str],
+    start_date: pd.Timestamp | None,
+    warmup_rows: int,
+) -> list[pd.DataFrame]:
+    jobs = [(code, start_date, warmup_rows) for code in codes]
+    if len(codes) < _PRICE_PROCESS_MIN_CODES or _PRICE_PROCESS_WORKERS <= 1:
+        with ThreadPoolExecutor(max_workers=_PANEL_WORKERS) as executor:
+            return list(executor.map(_price_factor_job, jobs))
+    with ProcessPoolExecutor(max_workers=_PRICE_PROCESS_WORKERS) as executor:
+        return list(executor.map(_price_factor_job, jobs, chunksize=5))
+
+
 def build_panel(codes: list[str] | None = None, limit: int = 0, horizon: int = 5,
-                min_price_rows: int = 0) -> pd.DataFrame:
-    """生成训练面板。返回包含 ``target_ret_{horizon}d`` 的 DataFrame。"""
+                min_price_rows: int = 0, output_start: pd.Timestamp | None = None,
+                warmup_rows: int = 260,
+                shared_factors: dict[str, pd.DataFrame] | None = None) -> pd.DataFrame:
+    """生成训练面板。返回包含 ``target_ret_{horizon}d`` 的 DataFrame。
+
+    ``output_start`` limits emitted rows for incremental refreshes. Price factors
+    still use full history so recursive EWM indicators remain exactly stable.
+    """
     panel_started = time.perf_counter()
     stage_started = panel_started
     codes = codes or _read_codes(0)
     codes = _filter_codes_by_price_rows(codes, min_price_rows)
     if limit and codes:
         codes = codes[:limit]
-    with ThreadPoolExecutor(max_workers=_PANEL_WORKERS) as executor:
-        price_parts = list(executor.map(_price_factors, codes))
-        price_parts = [p for p in price_parts if p is not None and not p.empty]
-        if not price_parts:
-            return pd.DataFrame()
-        panel = pd.concat(price_parts, ignore_index=True).sort_values(["code", "date"])
-        panel["market_cat"] = panel["code"].astype(str).map(_market_of_code)
-        codes_set = set(panel["code"].astype(str))
-        print(
-            f"[panel:raw:timing] stage=price seconds={time.perf_counter() - stage_started:.2f} "
-            f"codes={len(codes_set)} rows={len(panel)}",
-            flush=True,
-        )
+    factor_start = pd.Timestamp(output_start) if output_start is not None else None
+    price_parts = _price_factor_parts(codes, factor_start, warmup_rows)
+    price_parts = [p for p in price_parts if p is not None and not p.empty]
+    if not price_parts:
+        return pd.DataFrame()
+    panel = pd.concat(price_parts, ignore_index=True).sort_values(["code", "date"])
+    panel["market_cat"] = panel["code"].astype(str).map(_market_of_code)
+    codes_set = set(panel["code"].astype(str))
+    print(
+        f"[panel:raw:timing] stage=price seconds={time.perf_counter() - stage_started:.2f} "
+        f"codes={len(codes_set)} rows={len(panel)}",
+        flush=True,
+    )
 
-        stage_started = time.perf_counter()
-        val_parts = list(executor.map(_valuation_factors, codes))
+    stage_started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=_PANEL_WORKERS) as executor:
+        val_parts = list(executor.map(
+            lambda code: _valuation_factors(code, factor_start),
+            codes,
+        ))
     val_parts = [p for p in val_parts if p is not None and not p.empty]
     if val_parts:
         val = pd.concat(val_parts, ignore_index=True)
@@ -356,21 +405,45 @@ def build_panel(codes: list[str] | None = None, limit: int = 0, horizon: int = 5
     )
 
     stage_started = time.perf_counter()
+    shared_factors = shared_factors or {}
     for name, prefix in (("financial_yjbb", "yjbb"), ("income", "income"), ("cashflow", "cashflow"), ("balance", "balance")):
-        panel = _merge_asof_panel(panel, _asof_report_factor(name, prefix, codes_set))
+        factor = shared_factors.get(name)
+        if factor is None:
+            factor = _asof_report_factor(name, prefix, codes_set)
+        else:
+            factor = _factor_subset(factor, codes_set)
+        panel = _merge_asof_panel(panel, factor)
     print(
         f"[panel:raw:timing] stage=financial_asof seconds={time.perf_counter() - stage_started:.2f}",
         flush=True,
     )
 
     stage_started = time.perf_counter()
-    for asof_ev in (_forecast_events(codes_set), _margin_underlying(codes_set)):
+    forecast = shared_factors.get("performance_forecast")
+    if forecast is None:
+        forecast = _forecast_events(codes_set)
+    else:
+        forecast = _factor_subset(forecast, codes_set)
+    margin = shared_factors.get("margin_underlying_szse")
+    if margin is None:
+        margin = _margin_underlying(codes_set)
+    else:
+        margin = _factor_subset(margin, codes_set)
+    for asof_ev in (forecast, margin):
         panel = _merge_asof_panel(panel, asof_ev)
 
     event_frames = [
-        _event_counts("block_trades", codes_set, "block_trade"),
-        _event_counts("lhb", codes_set, "lhb"),
+        shared_factors.get("block_trades"),
+        shared_factors.get("lhb"),
     ]
+    if event_frames[0] is None:
+        event_frames[0] = _event_counts("block_trades", codes_set, "block_trade")
+    else:
+        event_frames[0] = _factor_subset(event_frames[0], codes_set)
+    if event_frames[1] is None:
+        event_frames[1] = _event_counts("lhb", codes_set, "lhb")
+    else:
+        event_frames[1] = _factor_subset(event_frames[1], codes_set)
     for ev in event_frames:
         if not ev.empty:
             panel = panel.merge(ev, on=["code", "date"], how="left")
@@ -408,6 +481,8 @@ def build_panel(codes: list[str] | None = None, limit: int = 0, horizon: int = 5
             panel["buyable_next"] = entry_open.notna()
 
     panel = panel.replace([np.inf, -np.inf], np.nan)
+    if factor_start is not None:
+        panel = panel[panel["date"] >= factor_start].copy()
     print(
         f"[panel:raw:timing] stage=targets seconds={time.perf_counter() - stage_started:.2f} "
         f"total_seconds={time.perf_counter() - panel_started:.2f}",

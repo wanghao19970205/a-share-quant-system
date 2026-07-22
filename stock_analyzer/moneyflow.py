@@ -61,6 +61,27 @@ def _unavailable(note: str) -> MoneyFlowAnalysis:
     return MoneyFlowAnalysis(False, 0.0, "neutral", "资金流向不可用", note=note)
 
 
+def price_volume_history(price_df: pd.DataFrame, days: int = 14) -> pd.DataFrame:
+    """按 PC 端口径生成量价资金代理：涨日成交额为正，跌日为负。"""
+    if price_df is None or price_df.empty:
+        return pd.DataFrame(columns=["date", "net_amount"])
+    px = price_df.sort_values("date").tail(max(int(days), 20)).copy()
+    for column in ("close", "volume", "amount"):
+        if column in px.columns:
+            px[column] = pd.to_numeric(px[column], errors="coerce")
+    if "close" not in px.columns or "volume" not in px.columns:
+        return pd.DataFrame(columns=["date", "net_amount"])
+    amount = px["amount"] if "amount" in px.columns else px["close"] * px["volume"]
+    if amount.isna().all() or float(amount.tail(5).fillna(0).sum()) <= 0:
+        amount = px["close"] * px["volume"]
+    direction = px["close"].pct_change().fillna(0.0).apply(
+        lambda value: 1.0 if value > 0 else (-1.0 if value < 0 else 0.0)
+    )
+    result = px[["date"]].copy()
+    result["net_amount"] = amount * direction
+    return result.dropna(subset=["date", "net_amount"]).tail(max(int(days), 0))
+
+
 def _price_volume_analysis(symbol: str, note: str = "", price_df: pd.DataFrame | None = None) -> MoneyFlowAnalysis:
     """用本地行情做量价资金代理。"""
     if price_df is not None:
@@ -124,9 +145,8 @@ def _price_volume_analysis(symbol: str, note: str = "", price_df: pd.DataFrame |
 
     # 量价资金代理：按当日涨跌方向对成交额赋号，作为资金净流入/流出的近似，
     # 使其可正可负（流出为负），而非仅展示无向的成交额。
-    day_ret = px["close"].pct_change().fillna(0.0)
-    sign = day_ret.apply(lambda x: 1.0 if x > 0 else (-1.0 if x < 0 else 0.0))
-    signed_amount = amount * sign
+    proxy_history = price_volume_history(px, days=20)
+    signed_amount = pd.Series(proxy_history["net_amount"].to_numpy(), index=px.index)
     net1 = float(signed_amount.iloc[-1]) if len(signed_amount) else 0.0
     net5 = float(signed_amount.tail(5).sum())
     ratio1_signed = turnover1 * (1.0 if ret1 > 0 else (-1.0 if ret1 < 0 else 0.0))

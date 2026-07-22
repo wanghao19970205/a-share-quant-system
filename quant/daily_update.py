@@ -139,24 +139,24 @@ def _spot_value(row: pd.Series, name: str, default=None):
 
 
 def _update_one_intraday_spot(code: str, row: pd.Series, trade_date: dt.date) -> tuple[str, str, int]:
-    old = warehouse.load_price(code)
-    close = _spot_value(row, "最新价")
-    if close is None or close <= 0:
-        return code, "InvalidSpot", 0
-    previous = _spot_value(row, "昨收", close)
-    item = {
-        "code": code,
-        "date": pd.Timestamp(trade_date),
-        "open": _spot_value(row, "今开", close),
-        "high": _spot_value(row, "最高", close),
-        "low": _spot_value(row, "最低", close),
-        "close": close,
-        "volume": _spot_value(row, "成交量", 0.0),
-        "amount": _spot_value(row, "成交额", 0.0),
-        "turnover": _spot_value(row, "换手率", 0.0),
-        "pct_change": _spot_value(row, "涨跌幅", (close / previous - 1) * 100 if previous else 0.0),
-    }
     try:
+        old = warehouse.load_price(code)
+        close = _spot_value(row, "最新价")
+        if close is None or close <= 0:
+            return code, "InvalidSpot", 0
+        previous = _spot_value(row, "昨收", close)
+        item = {
+            "code": code,
+            "date": pd.Timestamp(trade_date),
+            "open": _spot_value(row, "今开", close),
+            "high": _spot_value(row, "最高", close),
+            "low": _spot_value(row, "最低", close),
+            "close": close,
+            "volume": _spot_value(row, "成交量", 0.0),
+            "amount": _spot_value(row, "成交额", 0.0),
+            "turnover": _spot_value(row, "换手率", 0.0),
+            "pct_change": _spot_value(row, "涨跌幅", (close / previous - 1) * 100 if previous else 0.0),
+        }
         merged = _merge_time_series(old, pd.DataFrame([item]), keys=["code", "date"])
         warehouse.save_price(code, merged)
         return code, "ok", 1
@@ -164,8 +164,80 @@ def _update_one_intraday_spot(code: str, row: pd.Series, trade_date: dt.date) ->
         return code, type(e).__name__, 0
 
 
+def _merge_broker_daily(
+    code: str,
+    frame: pd.DataFrame | None,
+) -> tuple[str, str, int]:
+    if frame is None or frame.empty:
+        return code, "EmptyBrokerData", 0
+    try:
+        old = warehouse.load_price(code)
+        new = frame.copy()
+        if "code" in new.columns:
+            new = new.drop(columns=["code"])
+        new.insert(0, "code", code)
+        merged = _merge_time_series(old, new, keys=["code", "date"])
+        warehouse.save_price(code, merged)
+        return code, "ok", len(new)
+    except Exception as e:  # noqa: BLE001
+        return code, type(e).__name__, 0
+
+
+def _update_intraday_from_broker(
+    codes: list[str],
+    workers: int,
+    trade_date: dt.date,
+) -> dict | None:
+    if not datafeed.broker_available():
+        print("[intraday] AmazingData unavailable=config-or-sdk", flush=True)
+        return None
+    start = _yyyymmdd(trade_date - dt.timedelta(days=5))
+    end = _yyyymmdd(trade_date)
+    try:
+        frames = datafeed.broker_daily_prices(codes, start, end)
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[intraday] AmazingData batch failed={type(e).__name__}; "
+            "falling back to whole-market free snapshot",
+            flush=True,
+        )
+        return None
+    print(
+        f"[intraday] source=AmazingData batch_frames={len(frames)}/{len(codes)}",
+        flush=True,
+    )
+    result = _run_batch(
+        codes,
+        lambda code: _merge_broker_daily(code, frames.get(code)),
+        workers,
+        "intraday-amazingdata",
+    )
+    coverage = result["ok"] / max(len(codes), 1)
+    print(
+        f"[intraday] AmazingData coverage={coverage:.1%} "
+        f"ok={result['ok']} fail={result['fail']}",
+        flush=True,
+    )
+    if coverage < 0.80:
+        print(
+            "[intraday] AmazingData coverage below 80%; "
+            "falling back to whole-market free snapshot",
+            flush=True,
+        )
+        return None
+    result["source"] = "AmazingData"
+    result["trade_date"] = str(trade_date)
+    return result
+
+
 def update_intraday_spot(codes: list[str], workers: int = 12) -> dict:
-    """Fetch one whole-market snapshot and publish today's temporary bar per stock."""
+    """Prefer AmazingData, then use the free whole-market intraday snapshot."""
+    trade_date = dt.date.today()
+    broker = _update_intraday_from_broker(codes, workers, trade_date)
+    if broker is not None:
+        return broker
+
+    print("[intraday] source=free-whole-market-spot", flush=True)
     spot = datafeed.market_spot()
     if spot is None or spot.empty or "代码" not in spot.columns:
         raise RuntimeError("whole-market intraday snapshot is empty")
@@ -316,12 +388,16 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
         skip_price: bool = False, skip_valuation: bool = False,
         skip_events: bool = False, skip_fundamentals: bool = False,
         skip_snapshots: bool = False, limit: int = 0, force_latest: bool = False,
-        intraday_spot: bool = False) -> dict:
+        intraday_spot: bool = False, codes_file: str | None = None) -> dict:
     config.ensure_dirs()
     u = config.UNIVERSES[universe]
-    if u["kind"] == "mainboard_active":
-        datafeed.refresh_mainboard_universe()
-    codes = datafeed.universe(u["kind"], u["arg"])
+    if codes_file:
+        with open(codes_file, encoding="utf-8") as fh:
+            codes = sorted({line.strip() for line in fh if re.fullmatch(r"\\d{6}", line.strip())})
+    else:
+        if u["kind"] == "mainboard_active":
+            datafeed.refresh_mainboard_universe()
+        codes = datafeed.universe(u["kind"], u["arg"])
     if limit:
         codes = codes[:limit]
     print(f"[universe] {universe} codes={len(codes)} quant_dir={config.QUANT_DIR}")
@@ -330,7 +406,11 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
     if not skip_price:
         if intraday_spot:
             summary["price"] = update_intraday_spot(codes, workers=workers)
-            summary["price"]["mode"] = "whole-market-spot"
+            summary["price"]["mode"] = (
+                "broker-daily-bars"
+                if summary["price"].get("source") == "AmazingData"
+                else "whole-market-spot"
+            )
         else:
             price_latest = _probe_latest_price_date(codes, lookback_days)
             price_codes = _stale_codes(codes, warehouse.load_price, price_latest, "price",
@@ -375,13 +455,15 @@ def main() -> None:
                     help="收盘后强制重抓最新交易日那根K线，覆盖盘中/午间跑批写入的临时值")
     ap.add_argument("--intraday-spot", action="store_true",
                     help="盘中使用一次全市场实时快照覆盖当日临时K线，避免逐股网络请求")
+    ap.add_argument("--codes-file", default="",
+                    help="仅更新文件中列出的6位股票代码，用于崩溃后的缺口恢复")
     args = ap.parse_args()
     res = run(universe=args.universe, workers=args.workers, lookback_days=args.lookback_days,
               event_window_days=args.event_window_days, snapshot_dir=args.snapshot_dir or None,
               skip_price=args.skip_price, skip_valuation=args.skip_valuation,
               skip_events=args.skip_events, skip_fundamentals=args.skip_fundamentals,
               skip_snapshots=args.skip_snapshots, limit=args.limit, force_latest=args.force_latest,
-              intraday_spot=args.intraday_spot)
+              intraday_spot=args.intraday_spot, codes_file=args.codes_file or None)
     print("[done]", res)
     # 券商 tgw 原生库在解释器退出（atexit/析构）时可能段错误(SIGSEGV)，此时数据已全部落盘。
     # 用 os._exit(0) 跳过 native 析构直接干净退出，避免非零退出码被上游 check=True 误判为失败、

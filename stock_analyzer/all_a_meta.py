@@ -21,6 +21,9 @@ _META_COLUMNS = [
     "code", "name", "market_board", "a_industry", "a_industries",
     "a_concepts", "meta_updated_at",
 ]
+_INDUSTRY_HISTORY_COLUMNS = [
+    "code", "industry", "valid_from", "valid_to", "available_from", "source_updated_at", "source",
+]
 
 
 def _snapshot_dir() -> str:
@@ -33,6 +36,56 @@ def membership_path() -> str:
 
 def meta_path() -> str:
     return os.path.join(_snapshot_dir(), "all_a_stock_meta.parquet")
+
+
+def industry_history_path() -> str:
+    return os.path.join(_snapshot_dir(), "sw_industry_history_pit.parquet")
+
+
+def build_sw_industry_history() -> pd.DataFrame:
+    """Convert SW's classification-change file into a conservative PIT interval table."""
+    raw = ak.stock_industry_clf_hist_sw()
+    required = {"symbol", "start_date", "industry_code", "update_time"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"SW industry history columns missing: {sorted(missing)}")
+    history = raw.rename(columns={
+        "symbol": "code",
+        "industry_code": "industry",
+        "start_date": "valid_from",
+        "update_time": "source_updated_at",
+    }).copy()
+    history["code"] = history["code"].astype(str).map(data._normalize_symbol)
+    history["industry"] = history["industry"].astype(str).str.strip()
+    history["valid_from"] = pd.to_datetime(history["valid_from"], errors="coerce").dt.normalize()
+    history["source_updated_at"] = pd.to_datetime(
+        history["source_updated_at"], errors="coerce"
+    ).dt.normalize()
+    history = history.dropna(subset=["code", "industry", "valid_from", "source_updated_at"])
+    history = history.sort_values(["code", "valid_from"]).drop_duplicates(
+        ["code", "valid_from"], keep="last"
+    )
+    history["valid_to"] = history.groupby("code")["valid_from"].shift(-1)
+    # A classification is only usable after both its effective date and the source publication date.
+    history["available_from"] = history[["valid_from", "source_updated_at"]].max(axis=1)
+    history["source"] = "akshare.stock_industry_clf_hist_sw"
+    return history[_INDUSTRY_HISTORY_COLUMNS].reset_index(drop=True)
+
+
+def update_sw_industry_history() -> dict:
+    history = build_sw_industry_history()
+    if history.empty or history["code"].nunique() < 3000:
+        raise RuntimeError("refusing to publish incomplete SW industry history")
+    _atomic_parquet(history, industry_history_path())
+    result = {
+        "rows": len(history),
+        "stocks": int(history["code"].nunique()),
+        "industries": int(history["industry"].nunique()),
+        "available_min": str(history["available_from"].min().date()),
+        "available_max": str(history["available_from"].max().date()),
+    }
+    print(f"[sw-industry-history] done {result}", flush=True)
+    return result
 
 
 def market_board(code: str) -> str:
@@ -310,8 +363,12 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--delay", type=float, default=0.4)
+    parser.add_argument("--sw-history-only", action="store_true")
     args = parser.parse_args()
-    update_all_a_meta(workers=args.workers, retries=args.retries, delay=args.delay)
+    if args.sw_history_only:
+        update_sw_industry_history()
+    else:
+        update_all_a_meta(workers=args.workers, retries=args.retries, delay=args.delay)
 
 
 if __name__ == "__main__":

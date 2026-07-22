@@ -229,7 +229,10 @@ def _score_pred(df: pd.DataFrame, ic_weight: float, naive_weight: float = 0.0,
                 catboost_weight: float = 0.0, extra_trees_weight: float = 0.0) -> pd.DataFrame:
     out = _apply_model_blend(df, lgbm_weight)
     base = pd.to_numeric(out["base_pred"], errors="coerce")
-    ic = pd.to_numeric(out.get("ic_z"), errors="coerce").fillna(0.0)
+    if "ic_z" in out.columns:
+        ic = pd.to_numeric(out["ic_z"], errors="coerce").fillna(0.0)
+    else:
+        ic = pd.Series(0.0, index=out.index)
     out["pred"] = base + float(ic_weight) * ic
     if elastic_weight and "elastic_z" in out.columns:
         out["pred"] = out["pred"] + float(elastic_weight) * pd.to_numeric(

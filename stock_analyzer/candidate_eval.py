@@ -83,9 +83,19 @@ def _normalize_market_frame(frame: pd.DataFrame | None, code: str) -> pd.DataFra
     return out.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
 
 
-def _merged_market_frame(code: str, days: int = 250) -> tuple[pd.DataFrame, str]:
-    """Merge network daily bars with the newer intraday bar from quant warehouse."""
-    network = _normalize_market_frame(data.fetch_daily(code, days=days), code)
+def _merged_market_frame(
+    code: str,
+    days: int = 250,
+    freshness_bucket: int | None = None,
+) -> tuple[pd.DataFrame, str]:
+    """Prefer broker/network bars; use local warehouse only when newer or as fallback."""
+    try:
+        network = _normalize_market_frame(
+            data.fetch_daily(code, days=days, freshness_bucket=freshness_bucket),
+            code,
+        )
+    except Exception:  # noqa: BLE001 网络不可用时继续读取本地日更仓
+        network = pd.DataFrame()
     quant_dir = os.environ.get("QUANT_DATA_DIR", "")
     local = pd.DataFrame()
     if quant_dir:
@@ -99,15 +109,17 @@ def _merged_market_frame(code: str, days: int = 250) -> tuple[pd.DataFrame, str]
         return network, "行情接口"
     if network.empty:
         return local.tail(days).reset_index(drop=True), "午间/收盘日更仓"
-    local_latest = local["date"].max()
     network_latest = network["date"].max()
-    if local_latest < network_latest:
-        return network, "行情接口"
+    newer_local = local[local["date"] > network_latest]
+    if newer_local.empty:
+        return network.tail(days).reset_index(drop=True), "行情接口"
     columns = list(dict.fromkeys(network.columns.tolist() + local.columns.tolist()))
-    merged = pd.concat([network.reindex(columns=columns), local.reindex(columns=columns)], ignore_index=True)
-    merged = merged.sort_values("date").drop_duplicates("date", keep="last").tail(days).reset_index(drop=True)
-    source = "午间/收盘日更仓" if local_latest >= network_latest else "行情接口"
-    return merged, source
+    merged = pd.concat(
+        [network.reindex(columns=columns), newer_local.reindex(columns=columns)],
+        ignore_index=True,
+    )
+    merged = merged.sort_values("date").drop_duplicates("date", keep="first").tail(days).reset_index(drop=True)
+    return merged, "午间/收盘日更仓"
 
 
 def _sanitize_limit_claims(text: str, name: str, latest: pd.Series) -> str:
@@ -134,12 +146,17 @@ def _sanitize_limit_claims(text: str, name: str, latest: pd.Series) -> str:
 
 def evaluate_candidate(symbol: str, key: str = "", model: str = "", base_url: str = "",
                        profile: str | None = None, style: str = "short_1_3",
-                       broker_retry: int = 6) -> dict:
+                       broker_retry: int = 6,
+                       freshness_bucket: int | None = None) -> dict:
     """单只候选的多维综合研判，返回排序所需字段（不落盘）。"""
     code = data._normalize_symbol(symbol)
     name = _safe(lambda: data.get_stock_name(code)) or code
     try:
-        market_frame, quote_source = _merged_market_frame(code, days=250)
+        market_frame, quote_source = _merged_market_frame(
+            code,
+            days=250,
+            freshness_bucket=freshness_bucket,
+        )
         if len(market_frame) < 2:
             raise ValueError("有效行情不足两条")
         df = indicators.compute_all(market_frame)
@@ -148,8 +165,11 @@ def evaluate_candidate(symbol: str, key: str = "", model: str = "", base_url: st
                 "note": f"行情失败：{type(e).__name__}", "rank_score": -1e9}
     advice = advisor.advise(df)
     latest = df.iloc[-1]
-    prev = float(df["close"].iloc[-2])
-    pct = (float(latest["close"]) / prev - 1) * 100
+    closes = pd.to_numeric(df["close"], errors="coerce")
+    prior = closes.iloc[:-1]
+    prior = prior[prior > 0]
+    prev = float(prior.iloc[-1]) if not prior.empty else float("nan")
+    pct = (float(latest["close"]) / prev - 1) * 100 if pd.notna(prev) else 0.0
 
     sent = _safe(overseas.analyze)
     link = _safe(lambda: sectors.analyze_linkage(code, key=key, model=model, base_url=base_url))
@@ -171,7 +191,33 @@ def evaluate_candidate(symbol: str, key: str = "", model: str = "", base_url: st
         "close": round(float(latest["close"]), 2), "pct": round(pct, 2),
         "quote_date": quote_date, "quote_source": quote_source,
         "quote_asof": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "chart_data": [
+            {
+                "date": pd.Timestamp(item["date"]).strftime("%Y-%m-%d"),
+                "close": round(float(item["close"]), 4),
+                "ma5": round(float(item["ma5"]), 4) if pd.notna(item["ma5"]) else None,
+                "ma10": round(float(item["ma10"]), 4) if pd.notna(item["ma10"]) else None,
+                "ma20": round(float(item["ma20"]), 4) if pd.notna(item["ma20"]) else None,
+            }
+            for _, item in indicators.add_ma(df[["date", "close"]], windows=(5, 10, 20)).tail(60).iterrows()
+        ],
+        "moneyflow_data": [
+            {
+                "date": pd.Timestamp(item["date"]).strftime("%Y-%m-%d"),
+                "net_amount": round(float(item["net_amount"]), 2),
+            }
+            for _, item in moneyflow.price_volume_history(df, days=14).iterrows()
+        ],
         "direction": pred.direction, "level": pred.level, "confidence": pred.confidence,
+        "advice_total_score": getattr(advice, "total_score", None),
+        "advice_signals": [
+            {
+                "name": signal.name,
+                "score": signal.score,
+                "detail": signal.detail,
+            }
+            for signal in (getattr(advice, "signals", None) or [])
+        ],
         "composite": pred.composite, "logic": _sanitize_limit_claims(pred.logic, name, latest),
         "action": _sanitize_limit_claims(pred.action, name, latest),
         "engine": pred.engine,
@@ -244,7 +290,8 @@ def latest_quotes(codes, freshness_bucket: int, max_workers: int = 4) -> dict[st
 def evaluate_top(codes, key: str = "", model: str = "", base_url: str = "",
                  progress: dict | None = None, max_workers: int = 2,
                  profile: str | None = None, style: str = "short_1_3",
-                 broker_retry: int = 6) -> dict:
+                 broker_retry: int = 6,
+                 freshness_bucket: int | None = None) -> dict:
     """并发评估候选并按大模型综合排序。
 
     model 留空时随机选模型（与 snapshot_batch 一致：llm.get_random_model()）。
@@ -253,6 +300,7 @@ def evaluate_top(codes, key: str = "", model: str = "", base_url: str = "",
     codes = [c for c in (data._normalize_symbol(x) for x in (codes or [])) if c]
     key = llm.get_key(key)
     model = llm.get_model(model) if model else llm.get_random_model()
+    base_url = llm.get_base_url(base_url)
     if progress is not None:
         progress["model"] = model
         progress["total"] = len(codes)
@@ -268,12 +316,24 @@ def evaluate_top(codes, key: str = "", model: str = "", base_url: str = "",
     lock = threading.Lock()
 
     def _one(c):
-        r = evaluate_candidate(c, key=key, model=model, base_url=base_url,
-                               profile=profile, style=style, broker_retry=broker_retry)
-        if progress is not None:
-            with lock:
-                progress["done"] = int(progress.get("done", 0)) + 1
-        return r
+        try:
+            return evaluate_candidate(
+                c, key=key, model=model, base_url=base_url,
+                profile=profile, style=style, broker_retry=broker_retry,
+                freshness_bucket=freshness_bucket,
+            )
+        except Exception as exc:  # noqa: BLE001 单只外部接口异常不能丢弃整个批次
+            return {
+                "code": c,
+                "name": c,
+                "available": False,
+                "note": f"评估失败：{type(exc).__name__}",
+                "rank_score": -1e9,
+            }
+        finally:
+            if progress is not None:
+                with lock:
+                    progress["done"] = int(progress.get("done", 0)) + 1
 
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(codes)))) as ex:
         rows = list(ex.map(_one, codes))

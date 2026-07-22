@@ -14,12 +14,16 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+import time
 from copy import deepcopy
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from quant import config
+from quant import datafeed
 from quant import watchlist_grid
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -195,19 +199,22 @@ def _atomic_copy(src: Path, dst: Path) -> None:
     os.replace(tmp, dst)
 
 
-def merge_active_predictions(active_path: Path, fresh_path: Path, dst: Path) -> None:
-    """Merge a fresh (single-window) prediction file into existing active history.
-
-    Daily incumbent refresh only trains the latest window, so its prediction file
-    covers just the newest test month. We must keep older active rows and only
-    replace overlapping (code, date) pairs, otherwise the UI/backtest history is lost.
-    """
-    if not fresh_path.exists():
-        raise FileNotFoundError(fresh_path)
-    fresh = pd.read_parquet(fresh_path)
-    fresh["code"] = fresh["code"].astype(str)
-    fresh["date"] = pd.to_datetime(fresh["date"], errors="coerce").dt.normalize()
-    fresh = fresh.dropna(subset=["date"])
+def merge_active_predictions(
+    active_path: Path,
+    fresh_path: Path,
+    dst: Path,
+    fresh_frame: pd.DataFrame | None = None,
+) -> None:
+    """Merge fresh predictions into active history without mutating shared input."""
+    if fresh_frame is None:
+        if not fresh_path.exists():
+            raise FileNotFoundError(fresh_path)
+        fresh = pd.read_parquet(fresh_path)
+        fresh["code"] = fresh["code"].astype(str)
+        fresh["date"] = pd.to_datetime(fresh["date"], errors="coerce").dt.normalize()
+        fresh = fresh.dropna(subset=["date"])
+    else:
+        fresh = fresh_frame.copy()
 
     if active_path.exists():
         old = pd.read_parquet(active_path)
@@ -241,44 +248,76 @@ def merge_active_predictions(active_path: Path, fresh_path: Path, dst: Path) -> 
 
 
 
+def _parquet_max_date(path: Path) -> pd.Timestamp | None:
+    try:
+        parquet = pq.ParquetFile(path)
+        date_index = parquet.schema_arrow.get_field_index("date")
+        if date_index >= 0:
+            maxima = []
+            for group_index in range(parquet.metadata.num_row_groups):
+                statistics = parquet.metadata.row_group(group_index).column(date_index).statistics
+                if statistics is not None and statistics.has_min_max:
+                    maxima.append(statistics.max)
+            if maxima:
+                value = pd.to_datetime(pd.Series(maxima), errors="coerce").max()
+                if pd.notna(value):
+                    return pd.Timestamp(value).normalize()
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        dates = pd.read_parquet(path, columns=["date"])
+    except Exception:  # noqa: BLE001
+        return None
+    if dates.empty:
+        return None
+    value = pd.to_datetime(dates["date"], errors="coerce").max()
+    return pd.Timestamp(value).normalize() if pd.notna(value) else None
+
+
 def _latest_price_date() -> pd.Timestamp | None:
     latest: pd.Timestamp | None = None
     for path in Path(config.PRICE_DIR).glob("*.parquet"):
-        try:
-            df = pd.read_parquet(path, columns=["date"])
-        except Exception:  # noqa: BLE001
-            continue
-        if df.empty:
-            continue
-        d = pd.to_datetime(df["date"], errors="coerce").max()
-        if pd.notna(d) and (latest is None or d > latest):
-            latest = pd.Timestamp(d).normalize()
+        value = _parquet_max_date(path)
+        if value is not None and (latest is None or value > latest):
+            latest = value
     return latest
 
 
-def _price_freshness() -> tuple[pd.Timestamp | None, float, int]:
-    """扫描价格仓库，返回 (全库最新交易日, 该日覆盖率, 有效个股数)。
-
-    覆盖率 = 「自身最新日期 == 全库最新日期」的个股占比。用于区分「数据完备」与
-    「拉取中途崩溃/滞后」——后者会有大量个股停留在更早的交易日、覆盖率偏低。
-    """
-    latests: list[pd.Timestamp] = []
-    for path in Path(config.PRICE_DIR).glob("*.parquet"):
+def _price_freshness(codes: list[str] | None = None) -> tuple[pd.Timestamp | None, float, int]:
+    """Return latest date and coverage, restricted to the active update universe."""
+    paths = {
+        code: Path(config.PRICE_DIR) / f"{code}.parquet"
+        for code in (codes or [])
+    } if codes else {
+        path.stem: path for path in Path(config.PRICE_DIR).glob("*.parquet")
+    }
+    latests: list[pd.Timestamp | None] = []
+    for path in paths.values():
         try:
             df = pd.read_parquet(path, columns=["date"])
         except Exception:  # noqa: BLE001
+            latests.append(None)
             continue
         if df.empty:
+            latests.append(None)
             continue
         d = pd.to_datetime(df["date"], errors="coerce").max()
-        if pd.notna(d):
-            latests.append(pd.Timestamp(d).normalize())
-    if not latests:
-        return None, 0.0, 0
-    s = pd.Series(latests)
-    overall = pd.Timestamp(s.max())
-    coverage = float((s == overall).mean())
-    return overall, coverage, len(s)
+        latests.append(pd.Timestamp(d).normalize() if pd.notna(d) else None)
+    valid = [value for value in latests if value is not None]
+    if not valid:
+        return None, 0.0, len(latests)
+    overall = max(valid)
+    coverage = float(sum(value == overall for value in latests) / max(len(latests), 1))
+    return overall, coverage, len(latests)
+
+
+def _write_recovery_codes(codes: list[str]) -> Path:
+    fd, name = tempfile.mkstemp(prefix="daily-update-recovery-", suffix=".txt")
+    os.close(fd)
+    path = Path(name)
+    path.write_text("".join(f"{code}\\n" for code in codes), encoding="utf-8")
+    return path
 
 
 def _prediction_max_date(path: Path) -> pd.Timestamp | None:
@@ -294,8 +333,13 @@ def _prediction_max_date(path: Path) -> pd.Timestamp | None:
     return pd.Timestamp(d).normalize() if pd.notna(d) else None
 
 
-def assert_active_is_latest(active_path: Path, strict: bool = True) -> None:
-    price_latest = _latest_price_date()
+def assert_active_is_latest(
+    active_path: Path,
+    strict: bool = True,
+    price_latest: pd.Timestamp | None = None,
+) -> None:
+    if price_latest is None:
+        price_latest = _latest_price_date()
     pred_latest = _prediction_max_date(active_path)
     print(f"[publish:check] price_latest={price_latest.date() if price_latest is not None else ''} "
           f"prediction_latest={pred_latest.date() if pred_latest is not None else ''}", flush=True)
@@ -502,10 +546,29 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     short_active = quant_dir / ACTIVE_STYLE_FILES["short_1_3"]
     legacy_active = quant_dir / LEGACY_ACTIVE_FILE
+    fresh: pd.DataFrame | None = None
     if publish_predictions:
         if merge_history:
-            merge_active_predictions(short_active, source_predictions, short_active)
-            merge_active_predictions(legacy_active, source_predictions, legacy_active)
+            fresh_started = time.perf_counter()
+            fresh = pd.read_parquet(source_predictions)
+            fresh["code"] = fresh["code"].astype(str)
+            fresh["date"] = pd.to_datetime(fresh["date"], errors="coerce").dt.normalize()
+            fresh = fresh.dropna(subset=["date"])
+            print(
+                f"[publish:timing] stage=fresh_read seconds={time.perf_counter() - fresh_started:.2f} "
+                f"rows={len(fresh)}",
+                flush=True,
+            )
+            merge_started = time.perf_counter()
+            merge_active_predictions(
+                short_active, source_predictions, short_active, fresh_frame=fresh)
+            merge_active_predictions(
+                legacy_active, source_predictions, legacy_active, fresh_frame=fresh)
+            print(
+                f"[publish:timing] stage=short_legacy_merge "
+                f"seconds={time.perf_counter() - merge_started:.2f}",
+                flush=True,
+            )
         else:
             _atomic_copy(source_predictions, short_active)
             _atomic_copy(source_predictions, legacy_active)
@@ -537,7 +600,14 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
         # 预测刷新波段预测文件，避免波段信号停在旧交易日。
         swing_active = quant_dir / ACTIVE_STYLE_FILES["swing_7_15"]
         if merge_history:
-            merge_active_predictions(swing_active, source_predictions, swing_active)
+            swing_started = time.perf_counter()
+            merge_active_predictions(
+                swing_active, source_predictions, swing_active, fresh_frame=fresh)
+            print(
+                f"[publish:timing] stage=swing_merge "
+                f"seconds={time.perf_counter() - swing_started:.2f}",
+                flush=True,
+            )
         else:
             _atomic_copy(source_predictions, swing_active)
         swing_latest = _prediction_max_date(swing_active)
@@ -682,24 +752,66 @@ def run_daily_update(args: argparse.Namespace, env: dict[str, str]) -> None:
     # 因此不能只看全库最新日期，必须叠加「最新交易日覆盖率」判断：达标才算完备、可安全训练；
     # 否则视为残缺、中止，避免用残缺数据训练。
     if rc in (-signal.SIGSEGV, 128 + int(signal.SIGSEGV)):
-        after, coverage, n = _price_freshness()
+        u = config.UNIVERSES[args.universe]
+        if u["kind"] == "mainboard_active":
+            datafeed.refresh_mainboard_universe()
+        codes = datafeed.universe(u["kind"], u["arg"])
+        after, coverage, n = _price_freshness(codes)
         today = pd.Timestamp.now().normalize()
         advanced = after is not None and before is not None and after > before
         fresh = after is not None and after >= today - pd.Timedelta(days=5)
         MIN_COVERAGE = 0.85
+        if (advanced or fresh) and coverage < MIN_COVERAGE and after is not None:
+            missing: list[str] = []
+            for code in codes:
+                path = Path(config.PRICE_DIR) / f"{code}.parquet"
+                try:
+                    dates = pd.read_parquet(path, columns=["date"])
+                    latest = pd.to_datetime(dates["date"], errors="coerce").max()
+                except Exception:  # noqa: BLE001
+                    latest = None
+                if latest is None or pd.isna(latest) or pd.Timestamp(latest).normalize() < after:
+                    missing.append(code)
+            if missing:
+                recovery_file = _write_recovery_codes(missing)
+                recovery_cmd = [
+                    sys.executable, "-m", "quant.daily_update",
+                    "--universe", args.universe,
+                    "--workers", str(min(int(args.update_workers), 4)),
+                    "--lookback-days", str(args.lookback_days),
+                    "--snapshot-dir", args.snapshot_dir,
+                    "--skip-valuation", "--skip-events", "--skip-fundamentals", "--skip-snapshots",
+                    "--force-latest", "--codes-file", str(recovery_file),
+                ]
+                recovery_env = dict(env)
+                recovery_env["AMAZINGDATA_AUTO_LOGIN"] = "0"
+                print(
+                    f"[daily_update] tgw SIGSEGV rc={rc}; recovering missing="
+                    f"{len(missing)}/{len(codes)} via free sources workers="
+                    f"{min(int(args.update_workers), 4)}",
+                    flush=True,
+                )
+                try:
+                    recovery_rc = subprocess.run(
+                        recovery_cmd, cwd=PROJECT_ROOT, env=recovery_env,
+                    ).returncode
+                finally:
+                    recovery_file.unlink(missing_ok=True)
+                if recovery_rc == 0:
+                    after, coverage, n = _price_freshness(codes)
         if (advanced or fresh) and coverage >= MIN_COVERAGE:
             print(
-                f"[daily_update] tgw 退出段错误(rc={rc})，但价格仓库已落盘至 "
-                f"{after.date() if after is not None else '?'}、最新交易日覆盖率 "
-                f"{coverage:.1%}（{n} 只）≥ {MIN_COVERAGE:.0%}；视为完备，继续训练。",
+                f"[daily_update] tgw 退出段错误(rc={rc})，价格仓库已落盘至 "
+                f"{after.date() if after is not None else '?'}、本次股票池覆盖率 "
+                f"{coverage:.1%}（{n} 只）≥ {MIN_COVERAGE:.0%}；继续训练。",
                 flush=True,
             )
             return
         raise RuntimeError(
             f"daily_update 段错误(rc={rc}) 后数据不完备：latest="
-            f"{after.date() if after is not None else None}、覆盖率={coverage:.1%}"
+            f"{after.date() if after is not None else None}、本次股票池覆盖率={coverage:.1%}"
             f"（{n} 只，阈值 {MIN_COVERAGE:.0%}，advanced={advanced} fresh={fresh}）；"
-            f"拒绝在残缺数据上训练，请重跑 daily_update 补齐后再训。"
+            f"拒绝在残缺数据上训练，请补齐后再训。"
         )
     raise subprocess.CalledProcessError(rc, cmd)
 
@@ -1087,8 +1199,19 @@ def main() -> None:
             merge_history=True, refresh_swing=True,
             champion_score_params=champion_params,
         )
+        check_started = time.perf_counter()
+        price_latest = _latest_price_date()
         for active_path in active_paths:
-            assert_active_is_latest(active_path, strict=not args.allow_stale_active)
+            assert_active_is_latest(
+                active_path,
+                strict=not args.allow_stale_active,
+                price_latest=price_latest,
+            )
+        print(
+            f"[publish:timing] stage=latest_checks "
+            f"seconds={time.perf_counter() - check_started:.2f}",
+            flush=True,
+        )
         print("[workflow] incumbent short refreshed; swing predictions re-derived from fresh short "
               "(swing params frozen); history merged", flush=True)
         return
@@ -1096,8 +1219,19 @@ def main() -> None:
                                          swing_score_params=swing_score_params,
                                          short_score_params=short_score_params, dry_run=args.dry_run)
     if not args.dry_run:
+        check_started = time.perf_counter()
+        price_latest = _latest_price_date()
         for active_path in active_paths:
-            assert_active_is_latest(active_path, strict=not args.allow_stale_active)
+            assert_active_is_latest(
+                active_path,
+                strict=not args.allow_stale_active,
+                price_latest=price_latest,
+            )
+        print(
+            f"[publish:timing] stage=latest_checks "
+            f"seconds={time.perf_counter() - check_started:.2f}",
+            flush=True,
+        )
     print("[workflow] done", flush=True)
 
 

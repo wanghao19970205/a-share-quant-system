@@ -109,7 +109,7 @@ case "$job" in
             --snapshot-dir "$SNAPSHOT_DIR"
     workflow_rc=$?
     if [ "$workflow_rc" -eq 0 ]; then
-        "$0" top10-eval
+        TOP10_SOURCE_JOB=intraday-light "$0" top10-eval
     else
         exit "$workflow_rc"
     fi
@@ -124,6 +124,7 @@ case "$job" in
             --universe mainboard_active --update-workers 12 \
             --lookback-days 5 --event-window-days 30 \
             --skip-valuation --skip-fundamentals --skip-snapshots \
+            --force-latest-price \
             --strategy-mode incumbent-refresh \
             --skip-swing-grid \
             --model-threads 12 \
@@ -133,7 +134,7 @@ case "$job" in
             --snapshot-dir "$SNAPSHOT_DIR"
     workflow_rc=$?
     if [ "$workflow_rc" -eq 0 ]; then
-        "$0" top10-eval
+        TOP10_SOURCE_JOB=daily-light "$0" top10-eval
     else
         exit "$workflow_rc"
     fi

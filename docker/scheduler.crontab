@@ -13,10 +13,10 @@ PATH=/usr/local/bin:/usr/bin:/bin
 30 13 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh intraday-light
 # 每周一~周五 11:40：盘中快速日更 + 短线/波段训练 + 发布。
 40 11 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh daily-light
-# 每周一~周四 15:40（收盘后）：用当日完整收盘数据快速日更 + 训练 + 发布。
-40 15 * * 1,2,3,4 root /app/docker/scheduler_jobs.sh daily-light
-# 每周五 15:40（收盘后）：完整日更（估值/财报/180天事件窗口）+ 训练 + 发布。
-40 15 * * 5 root /app/docker/scheduler_jobs.sh weekly-full
+# 每周一~周四 15:05（收盘后）：用当日完整收盘数据快速日更 + 训练 + 发布。
+5 15 * * 1,2,3,4 root /app/docker/scheduler_jobs.sh daily-light
+# 每周五 15:05（收盘后）：完整日更（估值/财报/180天事件窗口）+ 训练 + 发布。
+5 15 * * 5 root /app/docker/scheduler_jobs.sh weekly-full
 # 每月第一个周六 01:00：最近36个窗口滚动因子审计；前30个月选参数、后6个月验收，达标才升级
 0 1 * * 6 root [ "$(date '+\%d')" -le 7 ] && /app/docker/scheduler_jobs.sh monthly-factor
 # 每天 17:00：读取白名单，积累多维快照（新闻/情绪周末也更新，保留每天）

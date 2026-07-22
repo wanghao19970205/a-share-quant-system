@@ -330,6 +330,10 @@ else:
     symbol = _main_codes[0]
 _prefetch_codes = [c for c in _main_codes if c != symbol]
 
+# 点击分析后立即给出可见反馈。后续量化文件和行情接口即使响应较慢，页面也不会像无响应。
+_analysis_status = st.status("正在准备分析...", expanded=True)
+_analysis_status.write("正在读取量化模型与白名单结果...")
+
 # ---- 白名单量化总览 + 当前3只股票量化并排 ----
 def _safe(fn):
     try:
@@ -494,12 +498,14 @@ with st.expander("🧮 白名单量化打分总览（全部自选股 · 打分/�
     _q3_dual = _safe(lambda: quant_signal.trade_advice_for_codes(_main_codes))
     _render_quant_advice_tables(_q3_dual, "当前股票无量化打分。", height=220)
 
+_analysis_status.write(f"正在加载 {symbol} 行情并计算技术指标...")
 try:
-    with st.spinner("正在拉取行情并计算指标…"):
-        df, name, _load_profile = load(symbol, days, adjust)
+    df, name, _load_profile = load(symbol, days, adjust)
 except Exception as e:  # noqa: BLE001
+    _analysis_status.update(label="分析失败", state="error", expanded=True)
     st.error(f"分析失败：{e}")
     st.stop()
+_analysis_status.write("行情和技术指标已完成，正在启动外围、新闻、资金流和基本面接口...")
 
 latest = df.iloc[-1]
 prev_close = float(df["close"].iloc[-2])
@@ -671,6 +677,38 @@ def _task_status_frame() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+_pending_now = (
+    any(not fut.done() for task in _tasks.values() for fut in _iter_task_futures(task))
+    or any(not fut.done() for fut in _iter_task_futures(_warmup_task or {}))
+)
+if _pending_now:
+    _analysis_status.update(
+        label="首屏已就绪，后台数据继续加载",
+        state="running",
+        expanded=True,
+    )
+else:
+    _analysis_status.update(label="分析数据已就绪", state="complete", expanded=False)
+
+with st.expander("接口加载状态", expanded=_pending_now):
+    st.dataframe(_task_status_frame(), use_container_width=True, hide_index=True)
+    if _pending_now:
+        st.caption("外围、新闻、资金流和基本面正在后台运行；已完成内容可先查看，刷新后会更新状态。")
+    else:
+        st.caption("后台接口已全部返回。")
+    if st.button("刷新后台结果 / 重试券商", key="refresh_prefetch_results"):
+        broker_task = _tasks.get("broker")
+        if broker_task and broker_task["future"].done():
+            try:
+                broker_val = broker_task["future"].result()
+            except Exception:  # noqa: BLE001
+                broker_val = None
+            if broker_val is None or not getattr(broker_val, "signals", None):
+                st.session_state["_broker_retry_token"] = int(st.session_state.get("_broker_retry_token", 0) or 0) + 1
+                load_broker.clear()
+                broker_extra.clear_cache()
+        st.rerun()
+
 
 # ---- 头部卡片 ----
 st.markdown(
@@ -835,25 +873,7 @@ tab_pred, tab_vol, tab_kdj, tab_ma, tab_adv, tab_out, tab_news, tab_money, tab_f
     ["🔮 次日涨跌预估", "📊 成交量分析", "📈 KDJ指标", "〰 均线系统", "🎯 加减仓建议",
      "🌍 外围市场", "📰 新闻资讯", "💰 资金流向", "🏦 基本面/资金面", "🧮 选股/回测"]
 )
-with st.expander("⏱ 接口加载状态", expanded=False):
-    st.dataframe(_task_status_frame(), use_container_width=True, hide_index=True)
-    _pending_now = any(not fut.done() for task in _tasks.values() for fut in _iter_task_futures(task)) or any(not fut.done() for fut in _iter_task_futures(_warmup_task or {}))
-    if _pending_now:
-        st.caption("接口后台运行中；已完成的接口会在下一次页面刷新后展示。")
-    else:
-        st.caption("后台接口已全部返回。")
-    if st.button("刷新后台结果 / 重试券商", key="refresh_prefetch_results"):
-        broker_task = _tasks.get("broker")
-        if broker_task and broker_task["future"].done():
-            try:
-                broker_val = broker_task["future"].result()
-            except Exception:  # noqa: BLE001
-                broker_val = None
-            if broker_val is None or not getattr(broker_val, "signals", None):
-                st.session_state["_broker_retry_token"] = int(st.session_state.get("_broker_retry_token", 0) or 0) + 1
-                load_broker.clear()
-                broker_extra.clear_cache()
-        st.rerun()
+with st.expander("基本面接口诊断", expanded=False):
     if st.button("基本面Top3自测", key="broker_top3_self_test"):
         rows = []
         broker_extra.clear_cache()
@@ -868,7 +888,7 @@ with st.expander("⏱ 接口加载状态", expanded=False):
                 rows.append({"代码": code, "可用": False, "信号数": 0, "财务": "无",
                              "耗时": f"{time.perf_counter() - t0:.1f}s", "说明": f"{type(e).__name__}: {e}"[:80]})
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    st.caption("首屏行情/指标完成后，外围、新闻、资金流、基本面会并发加载；未完成的栏目先显示占位，不再阻塞其它栏目。")
+    st.caption("仅在券商基本面数据长时间无结果时使用；普通分析无需执行。")
 
 # ---- Tab 1 成交量 ----
 with tab_vol:

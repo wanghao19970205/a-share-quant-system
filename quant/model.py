@@ -423,15 +423,18 @@ def train_lightgbm_ranker(panel: pd.DataFrame, features: list[str], horizon: int
                           valid_end: str | None = None, predict_start: str | None = None,
                           decay_half_life_days: float | None = 90.0, min_weight: float = 0.05,
                           n_estimators: int = 800, learning_rate: float | None = None,
-                          early_stopping_rounds: int = 50, n_jobs: int | None = None) -> TrainResult:
+                          early_stopping_rounds: int = 50, n_jobs: int | None = None,
+                          rank_bins: int = 5, eval_at: tuple[int, ...] = (3,)) -> TrainResult:
     try:
         import lightgbm as lgb
     except Exception as e:  # noqa: BLE001
         return TrainResult("lightgbm_ranker", False, f"缺少 lightgbm：{e}", {}, pd.DataFrame())
     target = f"target_ret_{horizon}d"
     train, valid, predict_df = _split_train_valid_predict(panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
-    train_sub, x, y, group, _, _ = _rank_xy(train, features, target)
-    valid_sub, xv, yv, valid_group, _, yv_raw = _rank_xy(valid, features, target)
+    train_sub, x, y, group, _, _ = _rank_xy(train, features, target, n_bins=rank_bins)
+    valid_sub, xv, yv, valid_group, _, yv_raw = _rank_xy(
+        valid, features, target, n_bins=rank_bins
+    )
     pred_sub, xp, yp_raw = _rank_predict_x(predict_df, features, target)
     if len(y) < 50 or len(yv) == 0 or len(xp) == 0:
         return TrainResult("lightgbm_ranker", False, "训练、验证或预测样本不足", {}, pd.DataFrame())
@@ -443,7 +446,8 @@ def train_lightgbm_ranker(panel: pd.DataFrame, features: list[str], horizon: int
         model = lgb.LGBMRanker(objective="lambdarank", metric="ndcg", n_estimators=n_estimators, learning_rate=learning_rate or 0.02, num_leaves=31, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, verbose=-1, n_jobs=n_jobs)
         callbacks = [lgb.early_stopping(early_stopping_rounds, verbose=False)] if early_stopping_rounds else []
         model.fit(x_df, y, group=group.tolist(), sample_weight=sample_weight,
-                  eval_set=[(xv_df, yv)], eval_group=[valid_group.tolist()], eval_at=[3], callbacks=callbacks)
+                  eval_set=[(xv_df, yv)], eval_group=[valid_group.tolist()],
+                  eval_at=list(eval_at), callbacks=callbacks)
         pred = model.predict(xp_df)
     except Exception as e:  # noqa: BLE001
         return TrainResult("lightgbm_ranker", False, f"lightgbm_ranker 训练失败：{e}", {}, pd.DataFrame())
@@ -455,6 +459,8 @@ def train_lightgbm_ranker(panel: pd.DataFrame, features: list[str], horizon: int
     if decay_half_life_days:
         metrics["decay_half_life_days"] = float(decay_half_life_days)
         metrics["min_weight"] = float(min_weight)
+    metrics["rank_bins"] = int(rank_bins)
+    metrics["eval_at"] = [int(value) for value in eval_at]
     return TrainResult("lightgbm_ranker", True, "ok", metrics, out)
 
 

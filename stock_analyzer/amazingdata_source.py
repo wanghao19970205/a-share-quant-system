@@ -213,6 +213,49 @@ def raw_kline(symbol: str, start_date: str, end_date: str):
     return kl[code]
 
 
+def _normalize_kline(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None or len(df) == 0:
+        return None
+    out = df.reset_index() if df.index.name else df.copy()
+    out = out.rename(columns={
+        c: _KL_COLMAP.get(str(c).lower(), _KL_COLMAP.get(str(c), c))
+        for c in out.columns
+    })
+    need = {"open", "high", "low", "close"}
+    if not need.issubset(set(out.columns)):
+        raise ValueError(f"K线列不匹配，实际列：{list(out.columns)}（请用 raw_kline 联调）")
+    if "date" not in out.columns:
+        out["date"] = pd.RangeIndex(len(out))
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    return out.sort_values("date").reset_index(drop=True)
+
+
+def fetch_daily_batch(symbols: list[str], start_date: str, end_date: str) -> dict[str, pd.DataFrame]:
+    """Fetch daily bars in bounded SDK requests and merge results by symbol."""
+    if not _ensure_login():
+        raise RuntimeError(f"AmazingData 不可用：{_last_error or '未安装 SDK 或账号未配置'}")
+    mapping = {str(symbol).strip()[:6]: _to_broker_code(str(symbol)) for symbol in symbols}
+    result: dict[str, pd.DataFrame] = {}
+    batch_size = max(int(os.environ.get("AMAZINGDATA_KLINE_BATCH_SIZE", "200") or 200), 1)
+    broker_items = list(mapping.items())
+    for offset in range(0, len(broker_items), batch_size):
+        chunk = broker_items[offset:offset + batch_size]
+        raw = sdk_call(
+            _market.query_kline,
+            [broker_code for _, broker_code in chunk],
+            begin_date=int(start_date),
+            end_date=int(end_date),
+            period=_ad.constant.Period.day.value,
+        )
+        if not isinstance(raw, dict):
+            raise TypeError(f"AmazingData 批量 K 线返回类型异常：{type(raw).__name__}")
+        for code, broker_code in chunk:
+            frame = _normalize_kline(raw.get(broker_code))
+            if frame is not None and not frame.empty:
+                result[code] = frame
+    return result
+
+
 def fetch_daily(symbol: str, start_date: str, end_date: str,
                 adjust: str = "qfq") -> pd.DataFrame | None:
     """拉取日线并标准化为项目通用列（date/open/high/low/close/volume/...）。
@@ -220,16 +263,4 @@ def fetch_daily(symbol: str, start_date: str, end_date: str,
     注：复权在 SDK 中为独立的复权因子接口，这里先取原始行情；adjust 暂忽略。
     列名做了容错映射，首次联调后如有出入可据 raw_kline() 结果微调。
     """
-    df = raw_kline(symbol, start_date, end_date)
-    if df is None or len(df) == 0:
-        return None
-    df = df.reset_index() if df.index.name else df.copy()
-    df = df.rename(columns={c: _KL_COLMAP.get(str(c).lower(), _KL_COLMAP.get(str(c), c))
-                            for c in df.columns})
-    need = {"open", "high", "low", "close"}
-    if not need.issubset(set(df.columns)):
-        raise ValueError(f"K线列不匹配，实际列：{list(df.columns)}（请用 raw_kline 联调）")
-    if "date" not in df.columns:
-        df["date"] = pd.RangeIndex(len(df))
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    return df.sort_values("date").reset_index(drop=True)
+    return _normalize_kline(raw_kline(symbol, start_date, end_date))

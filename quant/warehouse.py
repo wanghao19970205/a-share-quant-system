@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 
 import pandas as pd
 
@@ -19,9 +20,22 @@ def _p(name: str) -> str:
     return os.path.join(config.QUANT_DIR, f"{name}.parquet")
 
 
+def _atomic_parquet(df: pd.DataFrame, path: str, row_group_size: int | None = None) -> None:
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    os.close(fd)
+    try:
+        df.to_parquet(temporary, index=False, row_group_size=row_group_size)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def save(name: str, df: pd.DataFrame) -> None:
     config.ensure_dirs()
-    df.to_parquet(_p(name), index=False)
+    _atomic_parquet(df, _p(name))
 
 
 def load(name: str) -> pd.DataFrame:
@@ -43,7 +57,30 @@ def upsert(name: str, df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
 # ------------------------- 每股时序 -------------------------
 def save_price(code: str, df: pd.DataFrame) -> None:
     config.ensure_dirs()
-    df.to_parquet(os.path.join(config.PRICE_DIR, f"{code}.parquet"), index=False)
+    _atomic_parquet(df, os.path.join(config.PRICE_DIR, f"{code}.parquet"), row_group_size=256)
+
+
+def load_price_tail(
+    code: str,
+    start_date: pd.Timestamp,
+    warmup_rows: int,
+) -> pd.DataFrame:
+    """Read the exact warmup tail and current rows without decoding old price columns."""
+    path = os.path.join(config.PRICE_DIR, f"{code}.parquet")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    dates = pd.read_parquet(path, columns=["date"])
+    if dates.empty:
+        return dates
+    normalized = pd.to_datetime(dates["date"], errors="coerce")
+    start = pd.Timestamp(start_date)
+    before = normalized[normalized < start].dropna()
+    warmup = max(int(warmup_rows), 0)
+    if before.empty or warmup == 0:
+        cutoff = start
+    else:
+        cutoff = pd.Timestamp(before.iloc[-min(len(before), warmup)])
+    return pd.read_parquet(path, filters=[("date", ">=", cutoff)])
 
 
 def load_price(code: str) -> pd.DataFrame:
@@ -53,7 +90,7 @@ def load_price(code: str) -> pd.DataFrame:
 
 def save_valuation(code: str, df: pd.DataFrame) -> None:
     config.ensure_dirs()
-    df.to_parquet(os.path.join(config.VALUATION_DIR, f"{code}.parquet"), index=False)
+    _atomic_parquet(df, os.path.join(config.VALUATION_DIR, f"{code}.parquet"))
 
 
 def load_valuation(code: str) -> pd.DataFrame:

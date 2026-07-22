@@ -61,6 +61,8 @@ services:
       - TZ=Asia/Shanghai
       - PYTHONPATH=/app
       - LOG_DIR=/app/logs
+      - CACHE_DIR=/app/snapshots/cache
+      - TOP10_EVAL_WORKERS=4
       - SNAPSHOT_BATCH=1
       - DASHSCOPE_BATCH_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
       - RUN_ON_START=0  # 设为 1 则容器启动即补跑一次快速日更

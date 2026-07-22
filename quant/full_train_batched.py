@@ -32,13 +32,29 @@ MODEL_NAME = "ridge_lightgbm_ranker_ensemble"
 WINDOW_CACHE_VERSION = 1
 
 
-def _recipe_signature(**kwargs) -> str:
-    """Stable hash of every parameter that changes a window's stored predictions."""
+def _recipe_signature_payload(ignore_universe: bool, **kwargs) -> str:
     payload = {"_v": WINDOW_CACHE_VERSION, "model": MODEL_NAME}
     for key, value in kwargs.items():
+        if ignore_universe and key == "universe_codes":
+            continue
         payload[key] = sorted(map(str, value)) if key == "factors" else value
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
+def _recipe_signature(**kwargs) -> str:
+    """Stable hash of parameters that change a window's stored predictions.
+
+    Universe membership is applied when cached predictions are read. The monthly
+    panel file signature already invalidates windows whose actual input rows changed,
+    so raw universe-file churn must not invalidate every historical window.
+    """
+    return _recipe_signature_payload(True, **kwargs)
+
+
+def _legacy_recipe_signature(**kwargs) -> str:
+    """Return the pre-optimization signature so existing caches can be promoted."""
+    return _recipe_signature_payload(False, **kwargs)
 
 
 def _window_month_signature(prepared_dir: Path, start: pd.Timestamp, end: pd.Timestamp) -> list:
@@ -349,10 +365,44 @@ def build_monthly_panel(name: str, horizon: int, batch_size: int,
                 prepared_path.unlink()
         print(f"[panel] refresh recent months: {sorted(refresh_keys)}", flush=True)
 
+    refresh_start = (
+        min(pd.Timestamp(f"{month}-01") for month in refresh_keys)
+        if refresh_keys
+        else None
+    )
+    if refresh_start is not None:
+        print(
+            f"[panel] incremental output_start={refresh_start.date()} warmup_rows=260",
+            flush=True,
+        )
+
     print(f"[panel] codes={len(codes)} batch_size={batch_size} min_price_rows={min_price_rows}", flush=True)
+    shared_started = time.perf_counter()
+    all_codes = set(codes)
+    shared_factors = {
+        "financial_yjbb": engineering._asof_report_factor("financial_yjbb", "yjbb", all_codes),  # noqa: SLF001
+        "income": engineering._asof_report_factor("income", "income", all_codes),  # noqa: SLF001
+        "cashflow": engineering._asof_report_factor("cashflow", "cashflow", all_codes),  # noqa: SLF001
+        "balance": engineering._asof_report_factor("balance", "balance", all_codes),  # noqa: SLF001
+        "performance_forecast": engineering._forecast_events(all_codes),  # noqa: SLF001
+        "margin_underlying_szse": engineering._margin_underlying(all_codes),  # noqa: SLF001
+        "block_trades": engineering._event_counts("block_trades", all_codes, "block_trade"),  # noqa: SLF001
+        "lhb": engineering._event_counts("lhb", all_codes, "lhb"),  # noqa: SLF001
+    }
+    print(
+        f"[panel] shared factor cache seconds={time.perf_counter() - shared_started:.2f}",
+        flush=True,
+    )
 
     for bi, batch in _chunks(codes, batch_size):
-        raw = engineering.build_panel(codes=batch, horizon=horizon, min_price_rows=0)
+        raw = engineering.build_panel(
+            codes=batch,
+            horizon=horizon,
+            min_price_rows=0,
+            output_start=refresh_start,
+            warmup_rows=260,
+            shared_factors=shared_factors,
+        )
         if raw.empty:
             print(f"[panel:raw] batch={bi} empty", flush=True)
             continue
@@ -520,11 +570,12 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
     daily_ic_cache = DailyICCache(workers=min(model_threads or 8, 8))
 
     recipe_sig = None
+    legacy_recipe_sig = None
     cache_dir = None
     cache_hits = 0
     cache_misses = 0
     if window_cache_dir:
-        recipe_sig = _recipe_signature(
+        recipe_params = dict(
             factors=factors, horizon=horizon, train_months=train_months,
             validation_months=validation_months, test_months=test_months,
             decay_half_life_days=decay_half_life_days, min_weight=min_weight,
@@ -542,6 +593,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             max_factor_ic_corr=max_factor_ic_corr,
             universe_codes=sorted(universe_codes) if universe_codes is not None else [],
         )
+        recipe_sig = _recipe_signature(**recipe_params)
+        legacy_recipe_sig = _legacy_recipe_signature(**recipe_params)
         cache_dir = Path(window_cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
         print(f"[train:cache] window cache enabled dir={cache_dir} recipe={recipe_sig[:12]}", flush=True)
@@ -572,13 +625,25 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             window_cache_key = _window_cache_key(
                 prepared_dir, recipe_sig, train_start, valid_start, current, test_end)
             cache_path = cache_dir / f"{window_cache_key}.parquet"
-            if cache_path.exists():
+            legacy_cache_path = None
+            if legacy_recipe_sig and legacy_recipe_sig != recipe_sig:
+                legacy_key = _window_cache_key(
+                    prepared_dir, legacy_recipe_sig, train_start, valid_start, current, test_end)
+                legacy_cache_path = cache_dir / f"{legacy_key}.parquet"
+            read_path = cache_path if cache_path.exists() else legacy_cache_path
+            if read_path is not None and read_path.exists():
                 try:
-                    cached = pd.read_parquet(cache_path)
+                    cached = pd.read_parquet(read_path)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[train:cache] window={windows} read failed, recomputing: {exc}", flush=True)
                     cached = None
                 if cached is not None:
+                    if read_path != cache_path:
+                        cached.to_parquet(cache_path, index=False)
+                        print(
+                            f"[train:cache] window={windows} promoted legacy key={read_path.stem[:12]}",
+                            flush=True,
+                        )
                     if universe_codes is not None:
                         cached = cached[cached["code"].astype(str).isin(universe_codes)].copy()
                     pred_parts.append(cached)

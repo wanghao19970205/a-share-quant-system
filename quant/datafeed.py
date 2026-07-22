@@ -17,6 +17,7 @@ import datetime as _dt
 import akshare as ak
 import pandas as pd
 
+from stock_analyzer import amazingdata_source
 from stock_analyzer import data as _sa_data
 from stock_analyzer import net
 
@@ -107,7 +108,12 @@ def universe(kind: str = "all", arg: str | None = None) -> list[str]:
     return sorted({_norm(c) for c in codes if _norm(c).isdigit()})
 
 
-# ------------------------- 日线行情（复用新浪源） -------------------------
+# ------------------------- 日线行情（AmazingData 优先，多免费源兜底） -------------------------
+def broker_available() -> bool:
+    """Return whether the configured AmazingData SDK can be attempted."""
+    return amazingdata_source.available()
+
+
 def daily_price(code: str, start: str = "20180101") -> pd.DataFrame:
     """单只日线（前复权），复用项目已有多源拉取（新浪直连可用）。"""
     code = _norm(code)
@@ -280,7 +286,22 @@ def margin_underlying_szse(date: str) -> pd.DataFrame:
 
 
 # 需代理（push2 行情推送服务器）——配置代理后可用
+# AmazingData 批量 K 线接口；盘中主链路用单次请求覆盖整批代码。
+def broker_daily_prices(codes: list[str], start: str, end: str) -> dict[str, pd.DataFrame]:
+    return amazingdata_source.fetch_daily_batch(codes, start, end)
+
+
 def market_spot() -> pd.DataFrame:
-    """全市场实时快照（东财 push2，被屏蔽时需代理）。"""
-    with net.akshare_proxied():
-        return ak.stock_zh_a_spot_em()
+    """全市场实时快照：东财失败时回退到新浪批量快照。"""
+    try:
+        with net.akshare_proxied():
+            return ak.stock_zh_a_spot_em()
+    except Exception as first_error:  # noqa: BLE001
+        try:
+            return ak.stock_zh_a_spot()
+        except Exception as second_error:  # noqa: BLE001
+            raise RuntimeError(
+                "all whole-market intraday snapshot sources failed: "
+                f"eastmoney={type(first_error).__name__}; "
+                f"legacy={type(second_error).__name__}"
+            ) from second_error
