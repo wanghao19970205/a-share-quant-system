@@ -187,6 +187,18 @@ case "$job" in
             --month-cache-size "$MONTH_CACHE_SIZE" \
             --snapshot-dir "$SNAPSHOT_DIR"
     ;;
+  refresh-qfq)
+    # 月度 qfq 口径维护：检测最近 window-days 内除权(后复权因子跳变)的票，整条重拉覆盖。
+    # 增量日更只重写最近几行，除权票历史 qfq base 会与新行分裂——这里把这些票整条刷新。
+    # CACHE_TTL_KLINE=0 关行情磁盘缓存，确保拿到最新价而非缓存的旧口径。
+    acquire_quant_lock
+    QFQ_WINDOW_DAYS="${QFQ_WINDOW_DAYS:-35}"
+    run_job refresh-qfq "$LOG_DIR/refresh-qfq.out.log" "$LOG_DIR/refresh-qfq.err.log" \
+        env CACHE_TTL_KLINE=0 \
+        python -m quant.refresh_qfq \
+            --mode ex-div --universe mainboard_active \
+            --workers 12 --window-days "$QFQ_WINDOW_DAYS"
+    ;;
   snapshots)
     run_job snapshots "$LOG_DIR/snapshots-daily.out.log" "$LOG_DIR/snapshots-daily.err.log" \
         python -m stock_analyzer.snapshot_batch --batch
@@ -260,7 +272,7 @@ case "$job" in
     done
     ;;
   *)
-    echo "usage: scheduler_jobs.sh {intraday-light|daily-light|weekly-full|monthly-factor|snapshots|news-daily|news-annotation|all-a-meta|top10-eval|sentiment-model|rotate}" >&2
+    echo "usage: scheduler_jobs.sh {intraday-light|daily-light|weekly-full|monthly-factor|refresh-qfq|snapshots|news-daily|news-annotation|all-a-meta|top10-eval|sentiment-model|rotate}" >&2
     clog "ERROR  unknown job=$job"
     exit 2
     ;;

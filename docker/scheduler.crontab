@@ -19,6 +19,9 @@ PATH=/usr/local/bin:/usr/bin:/bin
 5 15 * * 5 root /app/docker/scheduler_jobs.sh weekly-full
 # 每月第一个周六 01:00：最近36个窗口滚动因子审计；前30个月选参数、后6个月验收，达标才升级
 0 1 * * 6 root [ "$(date '+\%d')" -le 7 ] && /app/docker/scheduler_jobs.sh monthly-factor
+# 每月第一个周六 05:23：qfq 口径维护——把最近约一个月内除权(因子跳变)的票整条重拉，
+# 抹平增量日更导致的除权票历史 qfq base 分裂。周末无日更，周一起例行任务即读到一致数据。
+23 5 * * 6 root [ "$(date '+\%d')" -le 7 ] && /app/docker/scheduler_jobs.sh refresh-qfq
 # 每天 17:00：读取白名单，积累多维快照（新闻/情绪周末也更新，保留每天）
 0 17 * * * root /app/docker/scheduler_jobs.sh snapshots
 # 每天 16:40（收盘后）：白名单新闻增量入库（公告/研报/个股新闻/市场要闻），日积月累建库

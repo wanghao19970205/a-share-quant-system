@@ -288,6 +288,258 @@ def _update_one_valuation(code: str, lookback_days: int = 5) -> tuple[str, str, 
         return code, type(e).__name__, 0
 
 
+def _update_prices_batched(codes, lookback_days: int = 5, workers: int = 12,
+                           batch_size: int = 200, batch_window_days: int = 45) -> dict:
+    """价格更新：券商批量 K 线做主路径 + 逐股缺口/兜底回退。
+
+    保留逐股路径的三个保护：①免费源兜底(批量缺票转单只)②列标准化(_standardize
+    补齐 amount/turnover/pct_change)③缺口恢复(本地缺口超批量窗口的票走单只全量)。
+    批量 65ms/只 vs 逐只 3.15s/只(实测 49x)，全市场拉数从 ~40min 压到 ~4min。
+    """
+    from stock_analyzer.data import _standardize
+    today = dt.date.today()
+    # 缺口在批量窗口内的走批量；无本地或缺口过大的票走单只(全量补齐)
+    batch_codes, gap_codes = [], []
+    for code in codes:
+        last = _last_date(warehouse.load_price(code))
+        if last is None or (today - last).days > batch_window_days - lookback_days:
+            gap_codes.append(code)
+        else:
+            batch_codes.append(code)
+    start = _yyyymmdd(max(today - dt.timedelta(days=batch_window_days), dt.date(2018, 1, 1)))
+    end = _yyyymmdd(today)
+    ok = rows = 0
+    fallback = list(gap_codes)
+    for i in range(0, len(batch_codes), batch_size):
+        chunk = batch_codes[i:i + batch_size]
+        try:
+            frames = datafeed.broker_daily_prices(chunk, start, end)
+        except Exception as e:  # noqa: BLE001 整块失败 -> 该块全部转单只兜底
+            print(f"[price] batch chunk={i // batch_size} failed={type(e).__name__}; per-stock fallback", flush=True)
+            fallback.extend(chunk)
+            continue
+        for code in chunk:
+            fr = frames.get(code)
+            if fr is None or getattr(fr, "empty", True):
+                fallback.append(code)
+                continue
+            try:
+                new = _standardize(fr.copy())
+                if "code" in new.columns:
+                    new = new.drop(columns=["code"])
+                new.insert(0, "code", code)
+                merged = _merge_time_series(warehouse.load_price(code), new, keys=["code", "date"])
+                if not merged.empty:
+                    warehouse.save_price(code, merged)
+                ok += 1
+                rows += len(new)
+            except Exception:  # noqa: BLE001 落盘/标准化异常 -> 转单只兜底重试
+                fallback.append(code)
+    failures: list[str] = []
+    if fallback:
+        print(f"[price] batch ok={ok}; per-stock fallback={len(fallback)}", flush=True)
+        fb = _run_batch(fallback, lambda c: _update_one_price(c, lookback_days), workers, "price-fallback")
+        ok += fb["ok"]
+        rows += fb["rows"]
+        failures = fb["failures"]
+    fail = len(codes) - ok
+    print(f"[price] ok={ok} fail={fail} fetched_rows={rows}" + (f" failures={failures}" if failures else ""))
+    return {"ok": ok, "fail": fail, "rows": rows, "failures": failures}
+
+
+def _update_prices_batched(codes, lookback_days: int = 5, workers: int = 12,
+                           batch_size: int = 200, gap_threshold_days: int = 45,
+                           batch_retries: int = 2) -> dict:
+    """价格更新：券商批量 K 线做主路径 + 逐股缺口/兜底回退。
+
+    保留逐股路径三个保护：①免费源兜底(批量缺票转单只)②列标准化(_standardize
+    补齐 amount/turnover/pct_change)③缺口恢复(缺口超阈值或无本地数据的票走单只全量)。
+    窗口数据驱动：批量起点 = 今天 -(本批最大缺口 + lookback_days 重叠)，平时缺口小
+    窗口自动收窄、长假后自动张开，不猜节假日。批量块超时/失败自动重试 batch_retries
+    次(重登录 + 退避)再降级逐股，命中券商连接瞬时抽风；实测批量 65ms/只 vs 逐只
+    3.15s/只(49x)，全市场拉数 ~40min 压到 ~4min。"""
+    import time as _time
+    from stock_analyzer import amazingdata_source
+    from stock_analyzer.data import _standardize
+    today = dt.date.today()
+    # 按本地最后日期分流：缺口在阈值内走批量(数据驱动窗口)；无本地数据或缺口过大走逐股全量补
+    batch_codes, gap_codes, max_gap = [], [], lookback_days
+    for code in codes:
+        last = _last_date(warehouse.load_price(code))
+        if last is None:
+            gap_codes.append(code)
+            continue
+        gap = (today - last).days
+        if gap > gap_threshold_days:
+            gap_codes.append(code)
+        else:
+            batch_codes.append(code)
+            if gap > max_gap:
+                max_gap = gap
+    # 窗口只需覆盖 max_gap + lookback_days 重叠(纠正盘中/复权)，平时自动收到 ~7 天
+    window = max_gap + lookback_days
+    start = _yyyymmdd(max(today - dt.timedelta(days=window), dt.date(2018, 1, 1)))
+    end = _yyyymmdd(today)
+    print(f"[price] batch codes={len(batch_codes)} gap_fallback={len(gap_codes)} "
+          f"window_days={window} start={start}", flush=True)
+    ok = rows = 0
+    fallback = list(gap_codes)
+    for i in range(0, len(batch_codes), batch_size):
+        chunk = batch_codes[i:i + batch_size]
+        frames = None
+        for attempt in range(batch_retries + 1):
+            try:
+                frames = datafeed.broker_daily_prices(chunk, start, end)
+                break
+            except Exception as e:  # noqa: BLE001 批量块失败 -> 退避+重登录重试，仍失败才逐股
+                if attempt < batch_retries:
+                    print(f"[price] batch chunk={i // batch_size} attempt={attempt + 1} "
+                          f"{type(e).__name__}; 重登录后重试", flush=True)
+                    amazingdata_source._logged_in = False  # 强制下次调用重新登录，冲掉卡死连接
+                    _time.sleep(2.0 * (attempt + 1))
+                else:
+                    print(f"[price] batch chunk={i // batch_size} failed={type(e).__name__} "
+                          f"after {batch_retries + 1} tries; per-stock fallback", flush=True)
+                    fallback.extend(chunk)
+        if frames is None:
+            continue
+        for code in chunk:
+            fr = frames.get(code)
+            if fr is None or getattr(fr, "empty", True):
+                fallback.append(code)
+                continue
+            try:
+                new = _standardize(fr.copy())
+                if "code" in new.columns:
+                    new = new.drop(columns=["code"])
+                new.insert(0, "code", code)
+                merged = _merge_time_series(warehouse.load_price(code), new, keys=["code", "date"])
+                if not merged.empty:
+                    warehouse.save_price(code, merged)
+                ok += 1
+                rows += len(new)
+            except Exception:  # noqa: BLE001 标准化/落盘异常 -> 转单只兜底重试
+                fallback.append(code)
+    failures: list[str] = []
+    if fallback:
+        print(f"[price] batch ok={ok}; per-stock fallback={len(fallback)}", flush=True)
+        fb = _run_batch(fallback, lambda c: _update_one_price(c, lookback_days), workers, "price-fallback")
+        ok += fb["ok"]
+        rows += fb["rows"]
+        failures = fb["failures"]
+    fail = len(codes) - ok
+    print(f"[price] ok={ok} fail={fail} fetched_rows={rows}" + (f" failures={failures}" if failures else ""))
+    return {"ok": ok, "fail": fail, "rows": rows, "failures": failures}
+
+
+def _warmup_broker(retries: int = 3) -> bool:
+    """批量前预热券商 TGW 连接：先用单只轻量 K 线把 push server 拉起来再发大批量。
+
+    诊断实测(7-23)：进程冷启动即发 200 只大批量会撞在连接未就绪上首发 TimeoutError，
+    重登录也救不回；而单只渐进调用能让连接就绪(单只 1.3s 成功后批量 30 只稳定 <3.4s，
+    逐股兜底能成也是同一个渐进预热机制)。预热失败(券商真不可用)返回 False，主路径照常
+    进批量循环并在失败时降级逐股免费源兜底(与不预热行为一致，零丢失)。"""
+    import time as _time
+    from stock_analyzer import amazingdata_source
+    end = _yyyymmdd(dt.date.today())
+    start = _yyyymmdd(dt.date.today() - dt.timedelta(days=10))
+    for attempt in range(retries):
+        try:
+            amazingdata_source.raw_kline("000001", start, end)
+            return True
+        except Exception:  # noqa: BLE001 未就绪 -> 重登录+退避再探，耗尽则让主路径降级
+            amazingdata_source._logged_in = False
+            _time.sleep(2.0 * (attempt + 1))
+    return False
+
+
+def _update_prices_batched(codes, lookback_days: int = 5, workers: int = 12,
+                           batch_size: int = 200, gap_threshold_days: int = 45,
+                           batch_retries: int = 2) -> dict:
+    """价格更新：券商批量 K 线做主路径 + 逐股缺口/兜底回退。
+
+    保留逐股路径三个保护：①免费源兜底(批量缺票转单只)②列标准化(_standardize
+    补齐 amount/turnover/pct_change)③缺口恢复(缺口超阈值或无本地数据的票走单只全量)。
+    窗口数据驱动：批量起点 = 今天 -(本批最大缺口 + lookback_days 重叠)，平时缺口小
+    窗口自动收窄、长假后自动张开，不猜节假日。批量前先 _warmup_broker 预热券商连接
+    (治冷启动竞态)，块超时/失败再重试 batch_retries 次(重登录 + 退避)后降级逐股。
+    实测批量 65ms/只 vs 逐只 3.15s/只(49x)，全市场拉数 ~40min 压到 ~4min。"""
+    import time as _time
+    from stock_analyzer import amazingdata_source
+    from stock_analyzer.data import _standardize
+    today = dt.date.today()
+    # 按本地最后日期分流：缺口在阈值内走批量(数据驱动窗口)；无本地数据或缺口过大走逐股全量补
+    batch_codes, gap_codes, max_gap = [], [], lookback_days
+    for code in codes:
+        last = _last_date(warehouse.load_price(code))
+        if last is None:
+            gap_codes.append(code)
+            continue
+        gap = (today - last).days
+        if gap > gap_threshold_days:
+            gap_codes.append(code)
+        else:
+            batch_codes.append(code)
+            if gap > max_gap:
+                max_gap = gap
+    # 窗口只需覆盖 max_gap + lookback_days 重叠(纠正盘中/复权)，平时自动收到 ~7 天
+    window = max_gap + lookback_days
+    start = _yyyymmdd(max(today - dt.timedelta(days=window), dt.date(2018, 1, 1)))
+    end = _yyyymmdd(today)
+    print(f"[price] batch codes={len(batch_codes)} gap_fallback={len(gap_codes)} "
+          f"window_days={window} start={start}", flush=True)
+    if batch_codes and not _warmup_broker():
+        print("[price] broker warmup failed; 批量可能整片降级逐股", flush=True)
+    ok = rows = 0
+    fallback = list(gap_codes)
+    for i in range(0, len(batch_codes), batch_size):
+        chunk = batch_codes[i:i + batch_size]
+        frames = None
+        for attempt in range(batch_retries + 1):
+            try:
+                frames = datafeed.broker_daily_prices(chunk, start, end)
+                break
+            except Exception as e:  # noqa: BLE001 批量块失败 -> 退避+重登录重试，仍失败才逐股
+                if attempt < batch_retries:
+                    print(f"[price] batch chunk={i // batch_size} attempt={attempt + 1} "
+                          f"{type(e).__name__}; 重登录后重试", flush=True)
+                    amazingdata_source._logged_in = False  # 强制下次调用重新登录，冲掉卡死连接
+                    _time.sleep(2.0 * (attempt + 1))
+                else:
+                    print(f"[price] batch chunk={i // batch_size} failed={type(e).__name__} "
+                          f"after {batch_retries + 1} tries; per-stock fallback", flush=True)
+                    fallback.extend(chunk)
+        if frames is None:
+            continue
+        for code in chunk:
+            fr = frames.get(code)
+            if fr is None or getattr(fr, "empty", True):
+                fallback.append(code)
+                continue
+            try:
+                new = _standardize(fr.copy())
+                if "code" in new.columns:
+                    new = new.drop(columns=["code"])
+                new.insert(0, "code", code)
+                merged = _merge_time_series(warehouse.load_price(code), new, keys=["code", "date"])
+                if not merged.empty:
+                    warehouse.save_price(code, merged)
+                ok += 1
+                rows += len(new)
+            except Exception:  # noqa: BLE001 标准化/落盘异常 -> 转单只兜底重试
+                fallback.append(code)
+    failures: list[str] = []
+    if fallback:
+        print(f"[price] batch ok={ok}; per-stock fallback={len(fallback)}", flush=True)
+        fb = _run_batch(fallback, lambda c: _update_one_price(c, lookback_days), workers, "price-fallback")
+        ok += fb["ok"]
+        rows += fb["rows"]
+        failures = fb["failures"]
+    fail = len(codes) - ok
+    print(f"[price] ok={ok} fail={fail} fetched_rows={rows}" + (f" failures={failures}" if failures else ""))
+    return {"ok": ok, "fail": fail, "rows": rows, "failures": failures}
+
+
 def _run_batch(codes: list[str], fn, workers: int, label: str) -> dict:
     ok = fail = rows = 0
     failures: list[str] = []
@@ -383,6 +635,32 @@ def run_snapshots(snapshot_dir: str, codes: list[str] | None = None) -> int:
     return int(res.returncode)
 
 
+def _refresh_mainboard_universe_isolated() -> None:
+    """在子进程里刷新主板股票池，隔离 akshare 抓表对 TGW 连接的进程级污染。
+
+    诊断坐实(券商连接诊断.txt 第3-5轮)：price 前 refresh_mainboard_universe() 调
+    akshare ak.stock_info_a_code_name() 抓全A代码表，会毒化本进程网络状态，之后
+    券商 TGW push server 再也 init 不起来，price 批量/单只全 15s 超时。socket 复位、
+    TGW 断开重连都救不回——唯一可靠修法是把抓表关进子进程，副作用随子进程回收，
+    主进程 TGW 永不被碰(第5轮 isolate_verify 已实测：子进程抓表后主进程 30/30 全成)。
+    子进程内 refresh_mainboard_universe() 把股票池写进 config.MAINBOARD_UNIVERSE_FILE，
+    主进程随后照常 datafeed.universe 读该文件，无需回传数据。抓表每轮仅一次(~10s)，
+    子进程额外启动开销 ~2s，对整轮日更(目标<10min)可忽略。子进程失败则沿用现有
+    universe 文件(股票池变化极慢，晚一轮无害)，不阻断日更。"""
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "from quant import datafeed; datafeed.refresh_mainboard_universe()"],
+            capture_output=True, text=True, timeout=180,
+        )
+    except Exception as e:  # noqa: BLE001 子进程异常(超时等) -> 沿用现有 universe 文件
+        print(f"[universe] 子进程刷新异常 {type(e).__name__}; 沿用现有 universe 文件", flush=True)
+        return
+    if r.returncode != 0:
+        tail = (r.stderr or "").strip().splitlines()[-3:]
+        print(f"[universe] 子进程刷新失败 rc={r.returncode}; 沿用现有 universe 文件. {tail}", flush=True)
+
+
 def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: int = 5,
         event_window_days: int = 30, snapshot_dir: str | None = None,
         skip_price: bool = False, skip_valuation: bool = False,
@@ -396,7 +674,7 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
             codes = sorted({line.strip() for line in fh if re.fullmatch(r"\\d{6}", line.strip())})
     else:
         if u["kind"] == "mainboard_active":
-            datafeed.refresh_mainboard_universe()
+            _refresh_mainboard_universe_isolated()
         codes = datafeed.universe(u["kind"], u["arg"])
     if limit:
         codes = codes[:limit]
@@ -415,7 +693,7 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
             price_latest = _probe_latest_price_date(codes, lookback_days)
             price_codes = _stale_codes(codes, warehouse.load_price, price_latest, "price",
                                        force_latest=force_latest)
-            summary["price"] = _run_batch(price_codes, lambda c: _update_one_price(c, lookback_days), workers, "price")
+            summary["price"] = _update_prices_batched(price_codes, lookback_days=lookback_days, workers=workers)
             summary["price"]["skipped_fresh"] = len(codes) - len(price_codes)
             summary["price"]["source_latest"] = str(price_latest or "")
     if not skip_valuation:

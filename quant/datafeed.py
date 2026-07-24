@@ -73,20 +73,97 @@ def _mainboard_active_universe() -> list[str]:
     return codes
 
 
-def refresh_mainboard_universe() -> list[str]:
-    """Refresh the quant-only active mainboard universe from the current A-share list."""
-    from quant import config
+def _broker_mainboard_records() -> "list[tuple[str, str]] | None":
+    """券商 SDK 取全 A 码表+名称，返回 [(6位code, name)]；不可用/失败返回 None（交由兜底）。
 
-    df = _retry(lambda: ak.stock_info_a_code_name())
-    if "code" not in df.columns:
-        raise RuntimeError("A-share code list has no code column")
-    name_col = next((c for c in ("name", "名称", "股票简称") if c in df.columns), None)
-    records = []
-    for _, row in df.iterrows():
-        code = _norm(row.get("code", ""))
-        name = str(row.get(name_col, "") or "") if name_col else ""
+    两次批量单请求：get_code_list 一次返回沪深北全 A 代码，get_stock_basic 一次批量
+    返回名称/上市状态；不逐票循环。用 IS_LISTED==1 排除退市（比"名称含退"更准），
+    再按主板前缀过滤。全程走券商 SDK、绝不碰 akshare，故不会毒化进程网络态。
+    """
+    from stock_analyzer import amazingdata_source as _ad_src
+
+    if not _ad_src.available() or not _ad_src._ensure_login():
+        return None
+    try:
+        base = _ad_src._base
+        broker_codes = _ad_src.sdk_call(base.get_code_list, "EXTRA_STOCK_A", timeout=60.0)
+        if not broker_codes:
+            return None
+        info = _ad_src._ad.InfoData()
+        basic = _ad_src.sdk_call(info.get_stock_basic, list(broker_codes), timeout=90.0)
+    except Exception:  # noqa: BLE001 券商取码表失败则回退 akshare 子进程
+        return None
+
+    if isinstance(basic, dict):
+        frames = [v for v in basic.values() if v is not None and len(v)]
+        basic = pd.concat(frames, ignore_index=True) if frames else None
+    if basic is None or len(basic) == 0:
+        return None
+
+    name_cols = ("SECURITY_NAME", "SEC_NAME", "NAME", "名称", "证券简称", "SECURITY_ABBR")
+    name_col = next((c for c in name_cols if c in basic.columns), None)
+    records: list[tuple[str, str]] = []
+    for _, row in basic.iterrows():
+        raw = str(row.get("MARKET_CODE", "") or "")
+        code = _norm(raw.split(".")[0])
+        name = str(row.get(name_col, "") or "").strip() if name_col else ""
+        is_listed = row.get("IS_LISTED", 1)
+        try:
+            listed_ok = int(is_listed) == 1
+        except (TypeError, ValueError):
+            listed_ok = True  # 字段缺失/异常时不误杀，保持与旧口径一致
+        if code.isdigit() and code.startswith(_MAINBOARD_PREFIXES) and listed_ok:
+            records.append((code, name))
+    return records or None
+
+
+def _akshare_subprocess_records() -> "list[tuple[str, str]]":
+    """兜底：在独立子进程内跑 akshare 取全 A 码表+名称，避免毒化本进程券商网络态。
+
+    子进程只 import akshare、拉一次 stock_info_a_code_name、以 JSON 吐回，父进程解析。
+    退市仍按"名称含退"排除（免费源无上市状态字段）。
+    """
+    import json
+    import subprocess
+    import sys as _sys
+
+    child = (
+        "import akshare as ak, json, sys\n"
+        "df = ak.stock_info_a_code_name()\n"
+        "cc = 'code' if 'code' in df.columns else df.columns[0]\n"
+        "nc = next((c for c in ('name','名称','股票简称') if c in df.columns), None)\n"
+        "out = [[str(r.get(cc,'')), (str(r.get(nc,'')) if nc else '')] "
+        "for _, r in df.iterrows()]\n"
+        "json.dump(out, sys.stdout, ensure_ascii=False)\n"
+    )
+    proc = subprocess.run(
+        [_sys.executable, "-c", child],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"akshare 子进程取码表失败 rc={proc.returncode}: {proc.stderr[-500:]}")
+    records: list[tuple[str, str]] = []
+    for raw_code, name in json.loads(proc.stdout):
+        code = _norm(str(raw_code))
+        name = str(name or "")
         if code.isdigit() and code.startswith(_MAINBOARD_PREFIXES) and "退" not in name:
             records.append((code, name))
+    return records
+
+
+def refresh_mainboard_universe() -> list[str]:
+    """Refresh the quant-only active mainboard universe.
+
+    券商优先（get_code_list + get_stock_basic，IS_LISTED 过滤，零 akshare 零毒化），
+    券商不可用/失败时回退 akshare 子进程（隔离，不毒化本进程）。
+    """
+    from quant import config
+
+    # 码表走 akshare 子进程：单次调用即得全量，简单快且已隔离防毒化；
+    # 不再先试券商 get_code_list/get_stock_basic(每次白等 ~24s+ 才回退)。
+    # 因子仍走券商(批量一次 vs akshare 逐票 3000+ 次，券商快几个数量级)。
+    records = _akshare_subprocess_records()
+    source = "akshare-subprocess"
     codes = sorted({code for code, _ in records})
     if not codes:
         raise RuntimeError("current A-share list produced no active mainboard codes")
@@ -94,9 +171,8 @@ def refresh_mainboard_universe() -> list[str]:
     with open(path, "w", encoding="utf-8") as f:
         f.write("# Quant-only active Shanghai/Shenzhen mainboard universe; UI watchlist is separate.\n")
         f.writelines(f"{code} {name}\n" for code, name in sorted(set(records)))
+    print(f"[universe] refreshed {len(codes)} mainboard codes via {source}", flush=True)
     return codes
-
-
 def universe(kind: str = "all", arg: str | None = None) -> list[str]:
     """返回 6 位代码列表。kind: 'all'=全A；'mainboard_active'=量化主板池；'csindex'=指数成分。"""
     if kind == "csindex":

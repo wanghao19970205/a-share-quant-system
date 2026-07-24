@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -304,6 +305,12 @@ def main() -> None:
     parser.add_argument("--base-url", default="")
     args = parser.parse_args()
     print(json.dumps(refresh(args.key, args.model, args.base_url), ensure_ascii=False), flush=True)
+    # 券商 tgw 原生库在解释器退出析构时可能段错误(SIGSEGV/rc=139)，此时结果已在
+    # refresh() 内 _atomic_write 落盘。用 os._exit(0) 跳过 native 析构干净退出，
+    # 避免非零退出码被上游 run_job 记为失败（与 quant/daily_update.py 同款处理）。
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

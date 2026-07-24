@@ -228,6 +228,32 @@ python3 -m py_compile \
   stock_analyzer/candidate_eval.py
 ```
 
+## 稳定性优化记录
+
+针对生产运行中暴露的券商数据源（AmazingData/TGW）稳定性问题的修复归档。
+
+### 券商批量接口超时与"进程中毒"
+
+- **现象**：日更价格拉取卡在第一批 `[price] batch chunk=0 ... TimeoutError; 重登录后重试`，随后长时间挂死不自愈。
+- **根因**：`query_kline` 首批（约 200 只）冷启动实测约 24s，超过默认 `_SDK_TIMEOUT=15s` 即超时；`sdk_call` 超时只放弃等待，底层原生线程仍在后台运行并崩溃，**污染整个进程**；紧接着同进程内"重登录重试"必然继续挂死，永远走不到逐股免费兜底。
+- **修复**：为批量接口单独放宽超时——新增 `_KLINE_TIMEOUT=90`（批量 `query_kline` 显式传入），`_BROKER_TIMEOUT` 25→90（基本面批量），`_FACTOR_TIMEOUT` 40→120（复权因子）。让首批不再超时中毒；真失败时靠"足够长超时→失败→逐股兜底"这条正常路径。均可用同名环境变量覆盖。
+- **数据源分工**：股票池码表走 akshare 子进程（全量券商 `get_stock_basic` 扛不住）；复权因子走券商 `get_backward_factor`，与券商 `query_kline` 原始价同源。
+
+### 独立入口脚本退出段错误（rc=139）
+
+- **现象**：`top10-eval` 例行任务长期 `rc=139`（`Segmentation fault`），被上游记为失败。
+- **根因**：TGW 原生库在解释器退出/析构阶段段错误。实测评估其实已跑完、结果已 `_atomic_write` 落盘、summary 也已打印——属"数据已写、仅退出崩"的假失败。
+- **修复**：在 `top10_eval.main()` 打印结果后 `flush` 并 `os._exit(0)`，跳过 native 析构干净退出（与 `quant/daily_update.py` 同款处理）。凡碰 TGW SDK 的独立入口脚本均应如此收尾。
+
+### 复权因子 HDF5 落地隔离
+
+- **现象**：多次 `get_backward_factor` 共用同一 `backward_factor.h5`，反复覆写导致文件损坏（`block0_items` 不一致 / already opened）。
+- **修复**：每次因子拉取使用独立临时子目录落地，避免并发/连续调用互相覆写。
+
+### 观测性
+
+- `fetch_daily_batch` 每批打印 `[kline_batch] i/n codes=.. kline=..s factor=..s(ok/miss/off) ...`，便于定位单批耗时与因子命中情况。
+
 ## 数据与安全边界
 
 仓库不包含：

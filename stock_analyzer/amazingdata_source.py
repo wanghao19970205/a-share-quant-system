@@ -24,6 +24,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 import threading
 from functools import lru_cache
 
@@ -41,7 +43,20 @@ _login_lock = threading.Lock()
 # 单次 SDK 调用超时（秒）：个别请求无返回时不再永久挂起 UI，可用环境变量覆盖。
 _SDK_TIMEOUT = float(os.environ.get("AMAZINGDATA_TIMEOUT", "15") or 15)
 # 券商基本面一次批量调用（多个 InfoData 接口串行）的整体超时。
-_BROKER_TIMEOUT = float(os.environ.get("AMAZINGDATA_BROKER_TIMEOUT", "25") or 25)
+_BROKER_TIMEOUT = float(os.environ.get("AMAZINGDATA_BROKER_TIMEOUT", "90") or 90)
+# 复权因子接口（get_backward_factor）从网络拉取后会用 HDF5 落地本地再读取。
+# local_path 必须是容器内可写目录；默认放到缓存目录下，避免每次都重新联网拉因子。
+_FACTOR_TIMEOUT = float(os.environ.get("AMAZINGDATA_FACTOR_TIMEOUT", "120") or 120)
+# 券商【批量】K线 query_kline 冷启动超时：200 只首批冷启动实测 ~24s，
+# 默认 15s(_SDK_TIMEOUT) 必超→同进程中毒→重试挂死，故单独放宽到 90s。
+_KLINE_TIMEOUT = float(os.environ.get("AMAZINGDATA_KLINE_TIMEOUT", "90") or 90)
+_FACTOR_LOCAL_PATH = os.environ.get(
+    "AMAZINGDATA_FACTOR_DIR",
+    os.path.join(os.environ.get("CACHE_DIR", ".cache"), "ad_factor"),
+)
+# 复权因子临时落地根目录：每次 get_backward_factor 用独立子目录，避免所有调用
+# 共用同一 backward_factor.h5 反复覆写致损（block0_items_variety / already opened）。
+_FACTOR_TMP_ROOT = os.path.dirname(_FACTOR_LOCAL_PATH.rstrip("/")) or "."
 _logged_in = False
 _login_failed = False
 _last_error = ""
@@ -230,37 +245,142 @@ def _normalize_kline(df: pd.DataFrame | None) -> pd.DataFrame | None:
     return out.sort_values("date").reset_index(drop=True)
 
 
-def fetch_daily_batch(symbols: list[str], start_date: str, end_date: str) -> dict[str, pd.DataFrame]:
-    """Fetch daily bars in bounded SDK requests and merge results by symbol."""
+def fetch_daily_batch(symbols: list[str], start_date: str, end_date: str,
+                      adjust: str = "qfq") -> dict[str, pd.DataFrame]:
+    """Fetch daily bars in bounded SDK requests and merge results by symbol.
+
+    与 fetch_daily 口径一致：原始价按 ``adjust`` 用后复权因子换算（默认前复权）。
+    因子逐票拉取并进程内缓存；某票取不到因子时该票回退不复权（不影响其它票）。
+    """
     if not _ensure_login():
         raise RuntimeError(f"AmazingData 不可用：{_last_error or '未安装 SDK 或账号未配置'}")
     mapping = {str(symbol).strip()[:6]: _to_broker_code(str(symbol)) for symbol in symbols}
     result: dict[str, pd.DataFrame] = {}
     batch_size = max(int(os.environ.get("AMAZINGDATA_KLINE_BATCH_SIZE", "200") or 200), 1)
     broker_items = list(mapping.items())
+    import time as _time  # 局部导入：模块未导入 time，避免动其它 import
+    n_batches = (len(broker_items) + batch_size - 1) // batch_size
+    loop_t0 = _time.perf_counter()
     for offset in range(0, len(broker_items), batch_size):
+        batch_idx = offset // batch_size
         chunk = broker_items[offset:offset + batch_size]
+        _k_t0 = _time.perf_counter()
         raw = sdk_call(
             _market.query_kline,
             [broker_code for _, broker_code in chunk],
             begin_date=int(start_date),
             end_date=int(end_date),
             period=_ad.constant.Period.day.value,
+            timeout=_KLINE_TIMEOUT,
         )
+        _k_el = _time.perf_counter() - _k_t0
         if not isinstance(raw, dict):
             raise TypeError(f"AmazingData 批量 K 线返回类型异常：{type(raw).__name__}")
+        # 复权因子对整批一次性拉取（一个请求覆盖 chunk 内全部代码），逐票 O(1) 取列
+        _f_t0 = _time.perf_counter()
+        factor_frame = _get_factor_frame(tuple(bc for _, bc in chunk)) if adjust else None
+        _f_el = _time.perf_counter() - _f_t0
+        _f_stat = "off" if not adjust else ("ok" if factor_frame is not None else "miss")
+        print(f"[kline_batch] {batch_idx + 1}/{n_batches} codes={len(chunk)} "
+              f"kline={_k_el:.1f}s factor={_f_el:.1f}s({_f_stat}) "
+              f"batch={_time.perf_counter() - _k_t0:.1f}s "
+              f"cum={_time.perf_counter() - loop_t0:.1f}s", flush=True)
         for code, broker_code in chunk:
             frame = _normalize_kline(raw.get(broker_code))
+            factor = _factor_series(factor_frame, broker_code) if adjust else None
+            frame = _apply_adjust(frame, factor, adjust)
             if frame is not None and not frame.empty:
                 result[code] = frame
     return result
+
+
+def _apply_adjust(frame: pd.DataFrame | None, factor: "pd.Series | None",
+                  adjust: str) -> pd.DataFrame | None:
+    """把原始 K 线按复权方式换算（qfq 前复权 / hfq 后复权 / 空=不复权）。
+
+    券商 query_kline 只返回原始价（手册确认无复权参数），复权走独立的
+    ``get_backward_factor`` 后复权因子（``factor``：index=交易日, 值=因子）：
+      - 后复权 hfq：raw * factor
+      - 前复权 qfq：raw * factor / factor[最新交易日]
+        （归一化到最新日 → 最新价保持真实，历史被连续缩放，符合前复权语义）
+    因子只作用于价格列（open/high/low/close），成交量/额不动。
+    factor 为空时回退原始价（宁可不复权也不返回错价）。
+    """
+    if frame is None or frame.empty or not adjust:
+        return frame
+    if factor is None or factor.empty:
+        return frame
+    out = frame.copy()
+    dates = pd.to_datetime(out["date"])
+    # 因子按交易日 ffill 对齐到 K 线日期（停牌日无因子则沿用前值）
+    aligned = factor.reindex(factor.index.union(dates.values)).ffill().reindex(dates.values)
+    aligned = aligned.to_numpy()
+    if pd.isna(aligned).all():
+        return frame
+    if adjust == "qfq":
+        # 归一化基准：因子表内最新交易日（而非本窗口末尾），保证不同起止窗口口径一致
+        base = float(factor.dropna().iloc[-1])
+        scale = aligned / base
+    else:  # hfq
+        scale = aligned
+    for col in ("open", "high", "low", "close"):
+        if col in out.columns:
+            out[col] = out[col].to_numpy() * scale
+    return out
+
+
+def _factor_series(frame: "pd.DataFrame | None", broker_code: str) -> "pd.Series | None":
+    """从 get_backward_factor 返回的宽表里取出单只股票的因子序列。"""
+    if frame is None or len(frame) == 0 or broker_code not in frame.columns:
+        return None
+    s = frame[broker_code].copy()
+    s.index = pd.to_datetime(s.index)
+    return s.sort_index().dropna()
+
+
+def _get_factor_frame(broker_codes: tuple[str, ...]) -> "pd.DataFrame | None":
+    """批量拉取后复权因子宽表（index=交易日, columns=券商代码）。
+
+    一次请求覆盖整批代码——务必批量，逐票单请求会把全市场日更拖垮。
+    is_local=False：联网取最新并落地 HDF5（当日新除权也能反映）。
+    失败记录 _last_error 返回 None（调用方回退不复权）。
+    """
+    if _base is None or not broker_codes:
+        return None
+    global _last_error
+    # 参考 AmazingData-main：get_backward_factor(is_local=False) 直接返回内存宽表，
+    # HDF5 落地只是 SDK 的副作用缓存，本函数用其内存返回值、从不 pd.read_hdf 读回。
+    # 旧实现所有调用共用同一 _FACTOR_LOCAL_PATH：SDK 写完 h5 不释放句柄，同进程下一
+    # chunk / 下一轮再往同一 backward_factor.h5 写就撞 already opened、或写出半截 pandas
+    # fixed 格式，读回报 block0_items_variety。改为每次落到独立临时目录，调用间互不
+    # 干扰，用完即删；只依赖内存返回值，磁盘 h5 读回与否都不影响结果。
+    os.makedirs(_FACTOR_TMP_ROOT, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="ad_factor_", dir=_FACTOR_TMP_ROOT)
+    try:
+        return sdk_call(_base.get_backward_factor, list(broker_codes),
+                        local_path=tmp.rstrip("/") + "/", is_local=False,
+                        timeout=_FACTOR_TIMEOUT)
+    except Exception as e:  # noqa: BLE001 因子拉取失败不阻断行情，回退不复权
+        _last_error = f"复权因子获取失败({len(broker_codes)}只): {type(e).__name__}: {e}"
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@lru_cache(maxsize=8192)
+def _backward_factor(broker_code: str) -> "pd.Series | None":
+    """单只股票的后复权因子序列（供 fetch_daily 单票路径用，进程内缓存）。"""
+    return _factor_series(_get_factor_frame((broker_code,)), broker_code)
 
 
 def fetch_daily(symbol: str, start_date: str, end_date: str,
                 adjust: str = "qfq") -> pd.DataFrame | None:
     """拉取日线并标准化为项目通用列（date/open/high/low/close/volume/...）。
 
-    注：复权在 SDK 中为独立的复权因子接口，这里先取原始行情；adjust 暂忽略。
+    券商 query_kline 返回原始价；这里按 ``adjust`` 用后复权因子换算：
+    qfq=前复权（默认，与免费源口径一致）/ hfq=后复权 / ""=不复权。
     列名做了容错映射，首次联调后如有出入可据 raw_kline() 结果微调。
     """
-    return _normalize_kline(raw_kline(symbol, start_date, end_date))
+    frame = _normalize_kline(raw_kline(symbol, start_date, end_date))
+    factor = _backward_factor(_to_broker_code(symbol)) if adjust else None
+    return _apply_adjust(frame, factor, adjust)
