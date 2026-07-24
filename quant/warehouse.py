@@ -57,6 +57,10 @@ def upsert(name: str, df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
 # ------------------------- 每股时序 -------------------------
 def save_price(code: str, df: pd.DataFrame) -> None:
     config.ensure_dirs()
+    # 统一 date 列精度为 ns：新版 pandas 解析日期可能产出 us，下游 merge_asof 要求一致。
+    if "date" in df.columns:
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").astype("datetime64[ns]")
     _atomic_parquet(df, os.path.join(config.PRICE_DIR, f"{code}.parquet"), row_group_size=256)
 
 

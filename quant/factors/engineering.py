@@ -142,7 +142,9 @@ def _price_factors(
     if df.empty:
         return df
     df = df.copy().sort_values("date")
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    # qfq 全量重建写出的 parquet date 列可能是 datetime64[us]，与财报/估值 ns 精度不一致，
+    # merge_asof 要求 join key 精度相同，混用会抛 MergeError。统一归一到 ns。
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").astype("datetime64[ns]")
     for c in _PRICE_COLS:
         if c in df.columns:
             df[c] = _num(df[c])

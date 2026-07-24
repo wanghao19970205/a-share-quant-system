@@ -297,17 +297,52 @@ def load() -> dict:
     return _read_cache()
 
 
+def _run_worker(key: str, model: str, base_url: str) -> None:
+    """子进程：TGW 全量模式跑 refresh，print JSON 后 os._exit(0) 干净退出。
+
+    券商 tgw 原生库在解释器退出析构时可能段错误(SIGSEGV/rc=139)，此时结果已在
+    refresh() 内 _atomic_write 落盘。用 os._exit(0) 跳过 native 析构干净退出。
+    但若段错误发生在 refresh() 【运行中途】（拉券商基本面/融资融券时），本进程会
+    在 print 之前就崩、走不到这里——那种情况由父进程的免费源兜底接住（见 main）。
+    """
+    print(json.dumps(refresh(key, model, base_url), ensure_ascii=False), flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
+
 def main() -> None:
     import argparse
+    import subprocess
     parser = argparse.ArgumentParser(description="Refresh persisted LLM rankings for fixed Top10 groups")
+    parser.add_argument("--worker", action="store_true", help="内部标志：TGW 全量模式子进程，勿手工传")
     parser.add_argument("--key", default="")
     parser.add_argument("--model", default="")
     parser.add_argument("--base-url", default="")
     args = parser.parse_args()
+
+    if args.worker:
+        _run_worker(args.key, args.model, args.base_url)
+        return  # os._exit 已退出，不可达
+
+    # 父进程编排：先在子进程里跑 TGW 全量模式（券商权威数据、最高质量）。
+    # 子进程若因 TGW 原生库段错误(rc=139，退出析构或运行中途)崩溃，父进程存活，
+    # 强制禁用券商、转免费源兜底重跑——免费源不碰 TGW 原生库，不会段错误，
+    # 保证 top10 结果必然落盘、必然发布到手机 UI（杜绝“例行任务成功但 top10 空”）。
+    cmd = [sys.executable, "-m", "stock_analyzer.top10_eval", "--worker",
+           "--key", args.key, "--model", args.model, "--base-url", args.base_url]
+    child = subprocess.run(cmd)  # 继承 stdout/stderr：子进程 JSON 直接进 out.log
+    if child.returncode == 0:
+        # 子进程已 print JSON + _atomic_write 落盘 + 写手机快照，干净退出即可。
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
+    # 子进程异常退出（多为 TGW 段错误 rc=139）：本进程从未登录券商，是干净进程，
+    # 强制关闭自动登录后走免费源重跑 refresh，必然跑完并发布。
+    print(f"[top10-eval] 子进程异常退出 rc={child.returncode}，转免费源兜底重跑", flush=True)
+    os.environ["AMAZINGDATA_AUTO_LOGIN"] = "0"
     print(json.dumps(refresh(args.key, args.model, args.base_url), ensure_ascii=False), flush=True)
-    # 券商 tgw 原生库在解释器退出析构时可能段错误(SIGSEGV/rc=139)，此时结果已在
-    # refresh() 内 _atomic_write 落盘。用 os._exit(0) 跳过 native 析构干净退出，
-    # 避免非零退出码被上游 run_job 记为失败（与 quant/daily_update.py 同款处理）。
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
