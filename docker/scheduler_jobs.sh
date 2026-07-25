@@ -30,7 +30,7 @@ format_duration() {
 # 月度面板缓存：内存越大可设越大（缓存命中率高、训练更快）。
 # 12GB 内存 + 36 月训练窗口下：一个窗口本身常驻 36 个月，cache 只需再留几个月供
 # 相邻窗口复用即可；设过大（如 52）会白占 ~280MB 峰值内存。故降到 40。
-MONTH_CACHE_SIZE="${MONTH_CACHE_SIZE:-40}"
+MONTH_CACHE_SIZE="${MONTH_CACHE_SIZE:-64}"
 
 # 滚动训练窗口长度（月）：每个独立模型看多少历史。峰值内存只由单个窗口决定，
 # 相邻窗口串行且共享 month cache，故加长窗口在 12GB 下仍安全（全量扩张才会 OOM）。
@@ -197,7 +197,7 @@ case "$job" in
         env CACHE_TTL_KLINE=0 \
         python -m quant.refresh_qfq \
             --mode ex-div --universe mainboard_active \
-            --workers 12 --window-days "$QFQ_WINDOW_DAYS"
+            --workers 4 --window-days "$QFQ_WINDOW_DAYS"
     ;;
   snapshots)
     run_job snapshots "$LOG_DIR/snapshots-daily.out.log" "$LOG_DIR/snapshots-daily.err.log" \

@@ -72,6 +72,33 @@ def _load_predictions(path: Path, watchlist: set[str]) -> pd.DataFrame:
     return df
 
 
+def _sell_roll_max_days() -> int:
+    """跌停顺延卖出的上限交易日数（含预定卖出日）。单一真源在 backtest.bt_sell_roll_max_days()。"""
+    return backtest.bt_sell_roll_max_days()
+
+
+def _rolled_sell_close(close: np.ndarray, sell_blocked: np.ndarray, horizon: int, cap: int) -> np.ndarray:
+    """对每个买入日 i，预定 T+horizon 收盘卖出；若卖出日被封(sell_blocked)则顺延到下一可卖日收盘，
+    最多顺延到 T+horizon+cap-1（含预定日共 cap 个交易日窗口），窗口内均封则取窗口末日收盘强制平仓。
+    返回与 close 等长的实际卖出价数组；末尾越界(无足够未来数据)置 NaN，与 close.shift(-h) 丢尾一致。"""
+    n = close.shape[0]
+    out = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        base = i + horizon
+        if base >= n:
+            continue  # 未来数据不足，丢尾
+        sell_idx = None
+        last = min(base + cap - 1, n - 1)
+        for j in range(base, last + 1):
+            if not bool(sell_blocked[j]):
+                sell_idx = j
+                break
+        if sell_idx is None:
+            sell_idx = last  # 窗口内均封，末日强制平仓
+        out[i] = close[sell_idx]
+    return out
+
+
 def _price_targets(codes: list[str], horizons: list[int]) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for code in codes:
@@ -99,6 +126,19 @@ def _price_targets(codes: list[str], horizons: list[int]) -> pd.DataFrame:
             continue
         out = px[["code", "date"]].copy()
         has_open = "open" in px.columns and px["open"].notna().any()
+        has_hl = "high" in px.columns and "low" in px.columns
+        close_arr = px["close"].to_numpy(dtype=float)
+        # 收盘封板判定（±10% 主板口径；一字板是其子集）。ST(±5%) 为已知盲区。
+        limit_down_seal = None
+        if has_hl:
+            high_arr = px["high"].to_numpy(dtype=float)
+            low_arr = px["low"].to_numpy(dtype=float)
+            prev_close = px["close"].shift(1).to_numpy(dtype=float)
+            with np.errstate(all="ignore"):
+                ret1 = close_arr / prev_close - 1
+            limit_up_seal = (close_arr == high_arr) & (ret1 >= 0.095)
+            limit_down_seal = (close_arr == low_arr) & (ret1 <= -0.095)
+        cap = _sell_roll_max_days()
         for horizon in horizons:
             # 收盘口径（保留，供方向统计/兜底）
             out[f"target_ret_{horizon}d"] = px["close"].shift(-horizon) / px["close"] - 1
@@ -107,8 +147,14 @@ def _price_targets(codes: list[str], horizons: list[int]) -> pd.DataFrame:
                 entry = px["open"].shift(-1)
                 exit_ = px["open"].shift(-(1 + horizon))
                 out[f"open_ret_{horizon}d"] = exit_ / entry - 1
-        # 次日是否可买入：一字涨停(high==low 且上涨)当日买不进
-        if has_open and "high" in px.columns and "low" in px.columns:
+            # 尾盘 T 买入、T+horizon 收盘卖出；若卖出日一字/收盘跌停封板，顺延到下一可卖日收盘，
+            # 上限 cap 个交易日，仍封则第 cap 日强制平仓。收益 = 实际卖出日收盘 / 买入日收盘 - 1。
+            if limit_down_seal is not None:
+                sell_close = _rolled_sell_close(close_arr, limit_down_seal, horizon, cap)
+                with np.errstate(all="ignore"):
+                    out[f"tradable_ret_{horizon}d"] = sell_close / close_arr - 1
+        # 次日是否可买入(次日开盘口径)：一字涨停(high==low 且上涨)当日买不进
+        if has_open and has_hl:
             nxt_high = px["high"].shift(-1)
             nxt_low = px["low"].shift(-1)
             nxt_close = px["close"].shift(-1)
@@ -117,6 +163,11 @@ def _price_targets(codes: list[str], horizons: list[int]) -> pd.DataFrame:
             out["buyable_next"] = (~one_word_up.fillna(False)) & entry.notna()
         else:
             out["buyable_next"] = True
+        # 当日是否可买入(尾盘收盘口径)：涨停封板(含一字涨停)当天尾盘买不进
+        if limit_down_seal is not None:
+            out["buyable_close"] = ~limit_up_seal
+        else:
+            out["buyable_close"] = True
         frames.append(out)
     if not frames:
         return pd.DataFrame()
@@ -126,9 +177,12 @@ def _price_targets(codes: list[str], horizons: list[int]) -> pd.DataFrame:
 def _ensure_targets(pred: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
     need_open = [h for h in horizons if f"open_ret_{h}d" not in pred.columns]
     need_close = [h for h in horizons if f"target_ret_{h}d" not in pred.columns]
-    if not need_open and not need_close and "buyable_next" in pred.columns:
+    need_tradable = [h for h in horizons if f"tradable_ret_{h}d" not in pred.columns]
+    if not need_open and not need_close and not need_tradable \
+            and "buyable_next" in pred.columns and "buyable_close" in pred.columns:
         return pred
-    targets = _price_targets(sorted(pred["code"].dropna().unique()), sorted(set(need_open) | set(need_close) | set(horizons)))
+    targets = _price_targets(sorted(pred["code"].dropna().unique()),
+                             sorted(set(need_open) | set(need_close) | set(need_tradable) | set(horizons)))
     if targets.empty:
         return pred
     # 避免重复列冲突：只并入 pred 中尚未存在的列
@@ -262,22 +316,33 @@ def _prepare_fast_grid(pred: pd.DataFrame, horizons: list[int]) -> dict:
     dates = pd.Index(sorted(pred["date"].dropna().unique()))
     codes = pd.Index(sorted(pred["code"].dropna().unique()))
     use_open = backtest.bt_use_open_fill()
-    # 成交口径：默认收盘(target_ret)，设 QUANT_BT_FILL=next_open 时用次日开盘(open_ret)
+    filter_untradable = backtest.bt_filter_untradable()
+    # 成交口径：默认收盘。QUANT_BT_FILL=next_open→次日开盘(open_ret)；
+    # 收盘口径且开启可交易性(QUANT_BT_FILTER_UNTRADABLE=1,默认开)→用跌停顺延后的 tradable_ret；
+    # 关闭可交易性→乐观 target_ret（信号日收盘→h日后收盘，不理会涨跌停）。
     target_mats = {}
     for h in horizons:
         col = None
         if use_open and f"open_ret_{h}d" in pred.columns:
             col = f"open_ret_{h}d"
+        elif (not use_open) and filter_untradable and f"tradable_ret_{h}d" in pred.columns:
+            col = f"tradable_ret_{h}d"
         elif f"target_ret_{h}d" in pred.columns:
             col = f"target_ret_{h}d"
         elif f"open_ret_{h}d" in pred.columns:
             col = f"open_ret_{h}d"
         if col:
             target_mats[h] = _to_matrix(pred, dates, codes, col)
+    # 买入端可交易性：next_open 口径用 buyable_next(次日一字涨停买不进)；
+    # 收盘口径用 buyable_close(当日涨停封板/一字涨停尾盘买不进)。
     buyable = None
-    if backtest.bt_filter_untradable() and "buyable_next" in pred.columns:
-        bm = _to_matrix(pred, dates, codes, "buyable_next")
-        buyable = np.nan_to_num(bm, nan=0.0) > 0.5
+    if filter_untradable:
+        buy_col = "buyable_next" if use_open else "buyable_close"
+        if buy_col not in pred.columns and "buyable_next" in pred.columns:
+            buy_col = "buyable_next"
+        if buy_col in pred.columns:
+            bm = _to_matrix(pred, dates, codes, buy_col)
+            buyable = np.nan_to_num(bm, nan=0.0) > 0.5
     ridge = _to_matrix(pred, dates, codes, "ridge_pred")
     lgbm = _to_matrix(pred, dates, codes, "lgbm_pred")
 

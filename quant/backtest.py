@@ -13,17 +13,26 @@ from quant import model as qmodel
 
 
 # ------------------------- 回测成交口径（可用环境变量切换） -------------------------
-# 默认口径：按当日收盘价成交、忽略成本、不剔除涨停/停牌（乐观口径）。
-# 如需更贴近实盘，设置环境变量：
-#   QUANT_BT_FILL=next_open          # 次日开盘成交
+# 默认口径：按当日收盘价成交、忽略成本、含可交易性摩擦（涨停封板当日买不进、
+# 跌停封板顺延到下一可卖日收盘卖出）。这是「尾盘 T 买、T+1 卖」的贴近实盘口径。
+# 如需复现旧的乐观口径（不理会涨跌停），设 QUANT_BT_FILTER_UNTRADABLE=0。
+# 其它开关：
+#   QUANT_BT_FILL=next_open          # 次日开盘成交（此时用 open_ret + buyable_next）
 #   QUANT_BT_COST_ROUNDTRIP=0.003    # 双边综合成本(佣金+印花税+滑点)
-#   QUANT_BT_FILTER_UNTRADABLE=1     # 剔除次日一字涨停/停牌不可买入
+#   QUANT_BT_SELL_ROLL_MAX_DAYS=3    # 跌停顺延卖出的上限交易日数
 def bt_use_open_fill() -> bool:
     return os.environ.get("QUANT_BT_FILL", "close").strip().lower() == "next_open"
 
 
 def bt_filter_untradable() -> bool:
-    return os.environ.get("QUANT_BT_FILTER_UNTRADABLE", "0").strip().lower() in ("1", "true", "yes", "on")
+    return os.environ.get("QUANT_BT_FILTER_UNTRADABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def bt_sell_roll_max_days() -> int:
+    try:
+        return max(int(os.environ.get("QUANT_BT_SELL_ROLL_MAX_DAYS", "3") or 3), 1)
+    except Exception:  # noqa: BLE001
+        return 3
 
 
 def bt_cost_roundtrip() -> float:
@@ -80,9 +89,11 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
     """由每日预测构建组合并计算收益。
 
     成交口径由参数或环境变量决定（默认：当日收盘成交、无成本、不过滤涨停/停牌）：
-    - use_open_fill=True 且存在 ``open_ret_{h}d`` 列时，用「T+1 开盘买入、T+1+h 开盘卖出」的收益，
-      否则用 ``target_ret_{h}d``（信号日收盘→h日后收盘）。
-    - filter_untradable=True 且存在 ``buyable_next`` 列时，剔除次日一字涨停/停牌不可买入的候选。
+    - use_open_fill=True 且存在 ``open_ret_{h}d`` 列时，用「T+1 开盘买入、T+1+h 开盘卖出」的收益；
+      收盘口径下若 filter_untradable=True 且存在 ``tradable_ret_{h}d`` 列，用跌停顺延后的实现收益，
+      否则用 ``target_ret_{h}d``（信号日收盘→h日后收盘，乐观口径）。
+    - filter_untradable=True 时剔除买不进的候选：next_open 口径看 ``buyable_next``（次日一字涨停），
+      收盘口径看 ``buyable_close``（当日涨停封板/一字涨停）。
     - cost_roundtrip：单次调仓双边综合成本，按当期换手比例计提；0 表示忽略成本。
     """
     if use_open_fill is None:
@@ -93,7 +104,16 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
         cost_roundtrip = bt_cost_roundtrip()
     target = f"target_ret_{horizon}d"
     open_col = f"open_ret_{horizon}d"
-    ret_col = open_col if (use_open_fill and open_col in pred.columns) else target
+    tradable_col = f"tradable_ret_{horizon}d"
+    if use_open_fill and open_col in pred.columns:
+        ret_col = open_col
+    elif filter_untradable and tradable_col in pred.columns:
+        ret_col = tradable_col
+    else:
+        ret_col = target
+    buy_col = "buyable_next" if use_open_fill else "buyable_close"
+    if buy_col not in pred.columns and "buyable_next" in pred.columns:
+        buy_col = "buyable_next"
     holdings = []
     returns = []
     last_codes: set[str] = set()
@@ -101,8 +121,8 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
         return pd.DataFrame(), pd.DataFrame()
     for date, g in pred.dropna(subset=["pred", ret_col]).groupby("date"):
         pool = g.copy()
-        if filter_untradable and "buyable_next" in pool.columns:
-            pool = pool[pool["buyable_next"].fillna(False).astype(bool)]
+        if filter_untradable and buy_col in pool.columns:
+            pool = pool[pool[buy_col].fillna(False).astype(bool)]
         if positive_only:
             pool = pool[pool["pred"] > 0]
         if pred_quantile is not None and len(pool) >= 5:
@@ -245,7 +265,8 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
 
     pred = pd.concat(preds, ignore_index=True) if preds else pd.DataFrame()
     side_cols = [c for c in ("volatility_10", "turnover", "rule_score",
-                             f"open_ret_{horizon}d", "buyable_next") if c in df.columns]
+                             f"open_ret_{horizon}d", f"tradable_ret_{horizon}d",
+                             "buyable_next", "buyable_close") if c in df.columns]
     if not pred.empty and side_cols:
         pred = pred.merge(df[["code", "date"] + side_cols].drop_duplicates(["code", "date"]), on=["code", "date"], how="left")
     returns, holdings = portfolio_from_predictions(pred, horizon=horizon, top_n=top_n, max_weight=max_weight,
@@ -297,8 +318,8 @@ def main():
     ap.add_argument("--learning-rate", type=float, default=None, help="树模型学习率；默认按模型内部设置")
     ap.add_argument("--early-stopping-rounds", type=int, default=40, help="验证集早停轮数；<=0 关闭")
     ap.add_argument("--fill", choices=["next_open", "close"], default=("next_open" if bt_use_open_fill() else "close"),
-                    help="回测成交口径：close=信号日收盘(默认/乐观)；next_open=T+1开盘买/卖(更贴近实盘)。也可用环境变量 QUANT_BT_FILL")
-    ap.add_argument("--no-tradable-filter", action="store_true", help="不剔除次日一字涨停/停牌不可买入的候选")
+                    help="回测成交口径：close=尾盘T买(默认,含可交易性摩擦)；next_open=T+1开盘买/卖。也可用环境变量 QUANT_BT_FILL")
+    ap.add_argument("--no-tradable-filter", action="store_true", help="关闭可交易性口径(还原乐观：不理会涨停买不进/跌停顺延卖出)")
     ap.add_argument("--cost-roundtrip", type=float, default=bt_cost_roundtrip(),
                     help="单次调仓双边综合成本(佣金+印花税+滑点)，按换手计提；默认0=忽略。也可用环境变量 QUANT_BT_COST_ROUNDTRIP")
     ap.add_argument("--output-prefix", default="", help="实验输出前缀，避免覆盖默认 bt_* 产物")

@@ -40,9 +40,9 @@ FINAL_TRADE_STYLE_ORDER = ["short_1_3", "swing_7_15"]
 FINAL_TRADE_STYLES = {
     "short_1_3": {
         "label": "短线",
-        "holding_days": "1-3天",
+        "holding_days": "1天",
         "profile": "short_stable",
-        "horizons": [1, 2, 3],
+        "horizons": [1, 2],
         "score_params": {
             "ic_weight": 0.03,
             "top_n": 2,
@@ -51,8 +51,8 @@ FINAL_TRADE_STYLES = {
             "pred_quantile": None,
         },
         "target_price": "take_profit_1",
-        "evaluation_file": "scheduled_dual_short_swing_ne200_es40_short_h3_watchlist_grid.parquet",
-        "note": "短线最终口径：1-3天，白名单top2优先，按1/2/3日网格选择。",
+        "evaluation_file": "scheduled_dual_short_swing_ne200_es40_short_h1_watchlist_grid.parquet",
+        "note": "短线最终口径：训练目标1日(尾盘T买、T+1卖)，白名单top2优先，按1/2日网格选参(稳健性缓冲)。",
     },
     "swing_7_15": {
         "label": "波段",
@@ -84,8 +84,8 @@ TRAIN_STYLE_ORDER = [s for s in FINAL_TRADE_STYLE_ORDER if s not in DERIVE_FROM]
 
 # 派生风格（波段）在短线预测之上做白名单网格搜索，挑选最优参数以提升效果。
 SWING_GRID_HORIZONS = [7, 10, 15]
-# 短线自身也在短线预测上做白名单网格搜索（1/2/3日），在当前评估口径下重选最优参数。
-SHORT_GRID_HORIZONS = [1, 2, 3]
+# 短线自身也在短线预测上做白名单网格搜索（1/2日），在当前评估口径下重选最优参数。
+SHORT_GRID_HORIZONS = [1, 2]
 
 
 def _watchlist_file(args: argparse.Namespace) -> Path:
@@ -421,7 +421,9 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
         if candidate_start >= holdout_start:
             reports[style] = {"promote": False, "reason": "insufficient_selection_period"}
             continue
-        horizons = [int(x) for x in (cfg.get("horizons") or ([1, 2, 3] if style == "short_1_3" else [7, 10, 15]))]
+        # horizons 以代码 FINAL_TRADE_STYLES 为真源，避免读到 manifest 里的陈旧口径([1,2,3])。
+        horizons = [int(x) for x in (FINAL_TRADE_STYLES.get(style, {}).get("horizons")
+                                     or ([1, 2] if style == "short_1_3" else [7, 10, 15]))]
         kind = "short" if style == "short_1_3" else "swing"
         incumbent_params = dict(cfg.get("champion_score_params") or cfg.get("score_params") or {})
 
@@ -489,7 +491,9 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
             )
             candidate_returns = watchlist_grid.evaluate_prepared_returns(
                 candidate_pred, candidate_params, horizons, kind, True)
-            stability = watchlist_grid.stability_decision(candidate_returns, baseline_returns)
+            stability = watchlist_grid.stability_decision(
+                candidate_returns, baseline_returns,
+                min_monthly_win_rate=args.promotion_min_monthly_win_rate)
             decision["daily_gate_passed"] = bool(decision.get("promote"))
             decision["stability_gate"] = stability
             decision["promote"] = bool(decision.get("promote") and stability.get("passed"))
@@ -581,12 +585,13 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
         else short_cfg.get("champion_score_params") or short_score_params
     )
     short_cfg["predictions_file"] = short_active.name
-    short_cfg["prediction_horizon"] = 3
+    short_cfg["prediction_horizon"] = int(training_params.get("short_horizon", 1))
+    short_cfg["horizons"] = list(FINAL_TRADE_STYLES["short_1_3"]["horizons"])
     styles["short_1_3"] = short_cfg
     artifacts = deepcopy(manifest.get("style_artifacts") or {})
     short_artifact = deepcopy(artifacts.get("short_1_3") or {})
     short_artifact.update({
-        "horizon": 3,
+        "horizon": int(training_params.get("short_horizon", 1)),
         "predictions_file": short_active.name,
         "source_predictions_file": source_predictions.name,
         "summary_file": f"{source_prefix}_bt_{MODEL_NAME}_summary.parquet",
@@ -695,7 +700,7 @@ def publish_active_models(output_prefixes: dict[str, str], horizons: dict[str, i
             "predictions_file": LEGACY_ACTIVE_FILE,
             "style_artifacts": style_artifacts,
             "published_at": dt.datetime.now().isoformat(timespec="seconds"),
-            "prediction_horizon": horizons.get("short_1_3", 3),
+            "prediction_horizon": horizons.get("short_1_3", 1),
             "prediction_horizons": horizons,
             "prediction_latest_date": min(latest_dates) if latest_dates else "",
             "price_latest_date": price_latest.strftime("%Y-%m-%d") if price_latest is not None else "",
@@ -1058,11 +1063,13 @@ def main() -> None:
     ap.add_argument("--promotion-holdout-months", type=int, default=6)
     ap.add_argument("--promotion-min-sharpe-gain", type=float, default=0.10)
     ap.add_argument("--promotion-max-drawdown-worsening", type=float, default=0.02)
+    ap.add_argument("--promotion-min-monthly-win-rate", type=float, default=0.40,
+                    help="stability soft-gate monthly win-rate floor")
     ap.add_argument("--skip-swing-grid", action="store_true", help="跳过波段白名单网格搜索（默认在发布前执行）")
     ap.add_argument("--skip-short-grid", action="store_true", help="跳过短线白名单网格搜索（默认在发布前执行）")
 
     ap.add_argument("--output-prefix", default=DEFAULT_OUTPUT_PREFIX)
-    ap.add_argument("--horizon", type=int, default=3, help="legacy alias for --short-horizon")
+    ap.add_argument("--horizon", type=int, default=1, help="legacy alias for --short-horizon")
     ap.add_argument("--short-horizon", type=int, default=None, help="短线训练目标天数；默认沿用 --horizon")
     ap.add_argument("--swing-horizon", type=int, default=10, help="波段训练目标天数")
     ap.add_argument("--refresh-months", type=int, default=1)
