@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from threadpoolctl import threadpool_limits
 
-from quant import backtest, config
+from quant import backtest, config, tradability
 
 # 回测成交口径由 backtest 的环境变量开关决定（默认：当日收盘成交、无成本、不过滤涨停/停牌）。
 
@@ -73,105 +73,18 @@ def _load_predictions(path: Path, watchlist: set[str]) -> pd.DataFrame:
 
 
 def _sell_roll_max_days() -> int:
-    """跌停顺延卖出的上限交易日数（含预定卖出日）。单一真源在 backtest.bt_sell_roll_max_days()。"""
-    return backtest.bt_sell_roll_max_days()
+    """跌停顺延卖出的上限交易日数（含预定卖出日）。单一真源在 tradability.sell_roll_max_days()。"""
+    return tradability.sell_roll_max_days()
 
 
 def _rolled_sell_close(close: np.ndarray, sell_blocked: np.ndarray, horizon: int, cap: int) -> np.ndarray:
-    """对每个买入日 i，预定 T+horizon 收盘卖出；若卖出日被封(sell_blocked)则顺延到下一可卖日收盘，
-    最多顺延到 T+horizon+cap-1（含预定日共 cap 个交易日窗口），窗口内均封则取窗口末日收盘强制平仓。
-    返回与 close 等长的实际卖出价数组；末尾越界(无足够未来数据)置 NaN，与 close.shift(-h) 丢尾一致。"""
-    n = close.shape[0]
-    out = np.full(n, np.nan, dtype=float)
-    for i in range(n):
-        base = i + horizon
-        if base >= n:
-            continue  # 未来数据不足，丢尾
-        sell_idx = None
-        last = min(base + cap - 1, n - 1)
-        for j in range(base, last + 1):
-            if not bool(sell_blocked[j]):
-                sell_idx = j
-                break
-        if sell_idx is None:
-            sell_idx = last  # 窗口内均封，末日强制平仓
-        out[i] = close[sell_idx]
-    return out
+    """跌停顺延卖出实现价。单一真源在 quant.tradability.rolled_sell_close()。"""
+    return tradability.rolled_sell_close(close, sell_blocked, horizon, cap)
 
 
 def _price_targets(codes: list[str], horizons: list[int]) -> pd.DataFrame:
-    frames: list[pd.DataFrame] = []
-    for code in codes:
-        path = _quant_dir() / "price" / f"{code}.parquet"
-        if not path.exists():
-            continue
-        try:
-            px = pd.read_parquet(path, columns=["code", "date", "open", "high", "low", "close"])
-        except Exception:  # noqa: BLE001
-            # 老价格文件可能没有 open/high/low，退回仅 close
-            try:
-                px = pd.read_parquet(path, columns=["code", "date", "close"])
-            except Exception:  # noqa: BLE001
-                continue
-        if px.empty:
-            continue
-        px = px.copy()
-        px["code"] = px["code"].astype(str).str.zfill(6)
-        px["date"] = pd.to_datetime(px["date"], errors="coerce")
-        for c in ("open", "high", "low", "close"):
-            if c in px.columns:
-                px[c] = pd.to_numeric(px[c], errors="coerce")
-        px = px.dropna(subset=["code", "date", "close"]).sort_values("date")
-        if px.empty:
-            continue
-        out = px[["code", "date"]].copy()
-        has_open = "open" in px.columns and px["open"].notna().any()
-        has_hl = "high" in px.columns and "low" in px.columns
-        close_arr = px["close"].to_numpy(dtype=float)
-        # 收盘封板判定（±10% 主板口径；一字板是其子集）。ST(±5%) 为已知盲区。
-        limit_down_seal = None
-        if has_hl:
-            high_arr = px["high"].to_numpy(dtype=float)
-            low_arr = px["low"].to_numpy(dtype=float)
-            prev_close = px["close"].shift(1).to_numpy(dtype=float)
-            with np.errstate(all="ignore"):
-                ret1 = close_arr / prev_close - 1
-            limit_up_seal = (close_arr == high_arr) & (ret1 >= 0.095)
-            limit_down_seal = (close_arr == low_arr) & (ret1 <= -0.095)
-        cap = _sell_roll_max_days()
-        for horizon in horizons:
-            # 收盘口径（保留，供方向统计/兜底）
-            out[f"target_ret_{horizon}d"] = px["close"].shift(-horizon) / px["close"] - 1
-            # 次日开盘买入、持有 horizon 日后开盘卖出（更贴近实盘）
-            if has_open:
-                entry = px["open"].shift(-1)
-                exit_ = px["open"].shift(-(1 + horizon))
-                out[f"open_ret_{horizon}d"] = exit_ / entry - 1
-            # 尾盘 T 买入、T+horizon 收盘卖出；若卖出日一字/收盘跌停封板，顺延到下一可卖日收盘，
-            # 上限 cap 个交易日，仍封则第 cap 日强制平仓。收益 = 实际卖出日收盘 / 买入日收盘 - 1。
-            if limit_down_seal is not None:
-                sell_close = _rolled_sell_close(close_arr, limit_down_seal, horizon, cap)
-                with np.errstate(all="ignore"):
-                    out[f"tradable_ret_{horizon}d"] = sell_close / close_arr - 1
-        # 次日是否可买入(次日开盘口径)：一字涨停(high==low 且上涨)当日买不进
-        if has_open and has_hl:
-            nxt_high = px["high"].shift(-1)
-            nxt_low = px["low"].shift(-1)
-            nxt_close = px["close"].shift(-1)
-            entry = px["open"].shift(-1)
-            one_word_up = (nxt_high == nxt_low) & (nxt_close > px["close"])
-            out["buyable_next"] = (~one_word_up.fillna(False)) & entry.notna()
-        else:
-            out["buyable_next"] = True
-        # 当日是否可买入(尾盘收盘口径)：涨停封板(含一字涨停)当天尾盘买不进
-        if limit_down_seal is not None:
-            out["buyable_close"] = ~limit_up_seal
-        else:
-            out["buyable_close"] = True
-        frames.append(out)
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True).replace([np.inf, -np.inf], np.nan)
+    """可交易口径的价目标/掩码。单一真源在 quant.tradability.price_tradability()。"""
+    return tradability.price_tradability(codes, horizons, quant_dir=_quant_dir())
 
 
 def _ensure_targets(pred: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:

@@ -64,6 +64,19 @@ def _split_train_valid_predict(panel: pd.DataFrame, train_end: str | None = None
     return train, valid, predict
 
 
+def _apply_train_mask(train: pd.DataFrame, mask_col: str | None) -> pd.DataFrame:
+    """A/B 变体A：仅对训练段剔除买入日封涨停(buyable_close==False)的行。
+
+    mask_col=None（默认）时原样返回 → baseline 路径零行为变更。mask 只作用于**训练样本**，
+    valid/predict 段不受影响（预测仍覆盖全票）。掩码只看**买入日 T 当天**是否可买入，
+    与 T+h 无关，因此不会误伤「T 买、T+1 涨停」这类正样本。"""
+    if not mask_col or mask_col not in train.columns:
+        return train
+    keep = train[mask_col].fillna(True) != False  # noqa: E712 — 显式区分 False 与 NaN
+    return train[keep]
+
+
+
 def _xy(df: pd.DataFrame, features: list[str], target: str):
     sub = df[["code", "date", target] + features].replace([np.inf, -np.inf], np.nan).dropna(subset=[target])
     x = sub[features].fillna(0.0).to_numpy(dtype=float)
@@ -220,9 +233,11 @@ def _ic_weights(train: pd.DataFrame, features: list[str], target: str, min_obs: 
 def train_ridge(panel: pd.DataFrame, features: list[str], horizon: int = 5, alpha: float = 10.0,
                 train_end: str | None = None, valid_end: str | None = None,
                 predict_start: str | None = None, decay_half_life_days: float | None = 90.0,
-                min_weight: float = 0.05) -> TrainResult:
-    target = f"target_ret_{horizon}d"
+                min_weight: float = 0.05,
+                label_col: str | None = None, train_mask_col: str | None = None) -> TrainResult:
+    target = label_col or f"target_ret_{horizon}d"
     train, valid, predict_df = _split_train_valid_predict(panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
+    train = _apply_train_mask(train, train_mask_col)
     train_sub, x, y = _xy(train, features, target)
     valid_sub, xv, yv = _xy(valid, features, target)
     pred_sub, xp, _ = _predict_x(predict_df, features, target)
@@ -255,10 +270,12 @@ def train_elastic_net(panel: pd.DataFrame, features: list[str], horizon: int = 5
                       alpha: float = 0.001, l1_ratio: float = 0.5,
                       train_end: str | None = None, valid_end: str | None = None,
                       predict_start: str | None = None, decay_half_life_days: float | None = 90.0,
-                      min_weight: float = 0.05) -> TrainResult:
-    target = f"target_ret_{horizon}d"
+                      min_weight: float = 0.05,
+                      label_col: str | None = None, train_mask_col: str | None = None) -> TrainResult:
+    target = label_col or f"target_ret_{horizon}d"
     train, valid, predict_df = _split_train_valid_predict(
         panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
+    train = _apply_train_mask(train, train_mask_col)
     train_sub, x, y = _xy(train, features, target)
     valid_sub, xv, yv = _xy(valid, features, target)
     pred_sub, xp, _ = _predict_x(predict_df, features, target)
@@ -286,9 +303,11 @@ def train_elastic_net(panel: pd.DataFrame, features: list[str], horizon: int = 5
 def train_ic_weighted(panel: pd.DataFrame, features: list[str], horizon: int = 5,
                       train_end: str | None = None, valid_end: str | None = None,
                       predict_start: str | None = None, decay_half_life_days: float | None = 90.0,
-                      min_weight: float = 0.05) -> TrainResult:
-    target = f"target_ret_{horizon}d"
+                      min_weight: float = 0.05,
+                      label_col: str | None = None, train_mask_col: str | None = None) -> TrainResult:
+    target = label_col or f"target_ret_{horizon}d"
     train, valid, predict_df = _split_train_valid_predict(panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
+    train = _apply_train_mask(train, train_mask_col)
     train_sub, _, y = _xy(train, features, target)
     valid_sub, _, yv = _xy(valid, features, target)
     pred_sub, _, _ = _predict_x(predict_df, features, target)
@@ -314,9 +333,11 @@ def train_ic_weighted(panel: pd.DataFrame, features: list[str], horizon: int = 5
 def train_rank_vote(panel: pd.DataFrame, features: list[str], horizon: int = 5,
                     train_end: str | None = None, valid_end: str | None = None,
                     predict_start: str | None = None, decay_half_life_days: float | None = 90.0,
-                    min_weight: float = 0.05) -> TrainResult:
-    target = f"target_ret_{horizon}d"
+                    min_weight: float = 0.05,
+                    label_col: str | None = None, train_mask_col: str | None = None) -> TrainResult:
+    target = label_col or f"target_ret_{horizon}d"
     train, valid, predict_df = _split_train_valid_predict(panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
+    train = _apply_train_mask(train, train_mask_col)
     train_sub, _, y = _xy(train, features, target)
     valid_sub, _, yv = _xy(valid, features, target)
     pred_sub, _, _ = _predict_x(predict_df, features, target)
@@ -424,13 +445,15 @@ def train_lightgbm_ranker(panel: pd.DataFrame, features: list[str], horizon: int
                           decay_half_life_days: float | None = 90.0, min_weight: float = 0.05,
                           n_estimators: int = 800, learning_rate: float | None = None,
                           early_stopping_rounds: int = 50, n_jobs: int | None = None,
-                          rank_bins: int = 5, eval_at: tuple[int, ...] = (3,)) -> TrainResult:
+                          rank_bins: int = 5, eval_at: tuple[int, ...] = (3,),
+                          label_col: str | None = None, train_mask_col: str | None = None) -> TrainResult:
     try:
         import lightgbm as lgb
     except Exception as e:  # noqa: BLE001
         return TrainResult("lightgbm_ranker", False, f"缺少 lightgbm：{e}", {}, pd.DataFrame())
-    target = f"target_ret_{horizon}d"
+    target = label_col or f"target_ret_{horizon}d"
     train, valid, predict_df = _split_train_valid_predict(panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
+    train = _apply_train_mask(train, train_mask_col)
     train_sub, x, y, group, _, _ = _rank_xy(train, features, target, n_bins=rank_bins)
     valid_sub, xv, yv, valid_group, _, yv_raw = _rank_xy(
         valid, features, target, n_bins=rank_bins
@@ -468,14 +491,16 @@ def train_extra_trees(panel: pd.DataFrame, features: list[str], horizon: int = 5
                       train_end: str | None = None, valid_end: str | None = None,
                       predict_start: str | None = None,
                       decay_half_life_days: float | None = 90.0, min_weight: float = 0.05,
-                      n_estimators: int = 120, max_train_rows: int = 300_000) -> TrainResult:
+                      n_estimators: int = 120, max_train_rows: int = 300_000,
+                      label_col: str | None = None, train_mask_col: str | None = None) -> TrainResult:
     try:
         from sklearn.ensemble import ExtraTreesRegressor
     except Exception as e:  # noqa: BLE001
         return TrainResult("extra_trees", False, f"缺少 scikit-learn：{e}", {}, pd.DataFrame())
-    target = f"target_ret_{horizon}d"
+    target = label_col or f"target_ret_{horizon}d"
     train, valid, predict_df = _split_train_valid_predict(
         panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
+    train = _apply_train_mask(train, train_mask_col)
     train_sub, x, y = _xy(train, features, target)
     valid_sub, xv, yv = _xy(valid, features, target)
     pred_sub, xp, yp = _predict_x(predict_df, features, target)

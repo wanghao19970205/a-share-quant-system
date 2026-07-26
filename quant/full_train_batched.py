@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from quant import backtest, config, model as qmodel, select as factor_select, warehouse
+from quant import backtest, config, model as qmodel, select as factor_select, tradability, warehouse
 from quant.factors import engineering
 
 
@@ -499,6 +499,67 @@ def _load_window(prepared_dir: Path, start: pd.Timestamp, end: pd.Timestamp,
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
+# 跨窗口 per-code 可交易口径缓存：price_tradability 读的是整段 price 历史，
+# 对同一 code+horizon 其产出与窗口无关（不变量）。walk-forward 36 个窗口本会
+# 逐窗重复读 ~2000 个 price 文件 + 跑 rolled_sell_close 纯 Python 循环（36× 冗余，
+# 全部计入 factor_select 计时段 → 变体腿虚高 ~188s）。这里按 code 记忆化：
+# 首窗为缺失 code 调一次 price_tradability，其后各窗只从内存切片，命中即零 IO。
+# 仅进程内、仅非 baseline 腿会用到；键含 horizon 以隔离不同 h 的口径。
+_TRAD_CACHE: "dict[tuple[str, int], pd.DataFrame]" = {}
+
+
+def _cached_price_tradability(codes: list[str], horizon: int) -> pd.DataFrame:
+    """返回 codes 的可交易口径，仅对未缓存的 code 调用 price_tradability。
+
+    与直接 tradability.price_tradability(codes, [horizon]) 等价（同一批 code 的并集），
+    差别仅是把 per-code 结果记忆化，跨窗口复用。空结果的 code 也缓存（存空帧），
+    避免对不存在 price 文件的 code 反复触发磁盘 stat。"""
+    missing = [c for c in codes if (c, horizon) not in _TRAD_CACHE]
+    if missing:
+        fresh = tradability.price_tradability(missing, [horizon])
+        if not fresh.empty:
+            fresh["code"] = fresh["code"].astype(str).str.zfill(6)
+            for code, grp in fresh.groupby("code", sort=False):
+                _TRAD_CACHE[(code, horizon)] = grp.reset_index(drop=True)
+        # 没产出行的 code 也落一个空帧占位，防下窗重复读盘。
+        for code in missing:
+            _TRAD_CACHE.setdefault((code, horizon), pd.DataFrame())
+    parts = [_TRAD_CACHE[(c, horizon)] for c in codes
+             if not _TRAD_CACHE[(c, horizon)].empty]
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
+def _join_tradability(window: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """为窗口 join 可交易口径列（tradable_ret_{h}d / buyable_close），供 A/B 变体使用。
+
+    仅新增标签/掩码列，不新增特征列（buyable_close 只用当日 OHLC、因果安全；
+    tradable_ret 含 shift(-h) 未来价，是标签本就该含未来，非泄漏）。
+    join 键：code(str, zfill6) + date(datetime64[ns])，与 tradability.price_tradability 输出一致。
+    join 后断言 tradable_ret 命中率，防 code/date 规范化不一致导致静默丢样本。"""
+    codes = sorted(window["code"].astype(str).str.zfill(6).unique())
+    trad = _cached_price_tradability(codes, horizon)
+    keep = ["code", "date", f"tradable_ret_{horizon}d", "buyable_close"]
+    keep = [c for c in keep if c in trad.columns]
+    if trad.empty or len(keep) <= 2:
+        raise RuntimeError(
+            f"tradability join produced no usable columns for horizon={horizon}; "
+            f"cannot run A/B variant without buyable_close/tradable_ret"
+        )
+    out = window.copy()
+    out["code"] = out["code"].astype(str).str.zfill(6)
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    trad = trad[keep].drop_duplicates(["code", "date"])
+    out = out.merge(trad, on=["code", "date"], how="left")
+    # 命中率自检：tradable_ret 尾部丢尾会有正常 NaN，但整体 NaN 率异常高说明键没对上。
+    tret = f"tradable_ret_{horizon}d"
+    if tret in out.columns and len(out):
+        na_rate = float(out[tret].isna().mean())
+        # 尾部 horizon 天 + 停牌等正常缺失，给到 20% 冗余；超过即视为键不匹配。
+        if na_rate > 0.20:
+            print(f"[train:ab] WARN tradable_ret NaN rate={na_rate:.3f} (>0.20) — 检查 code/date join 键", flush=True)
+    return out
+
+
 def _selected_factors(selection_name: str, prepared_dir: Path, horizon: int) -> list[str]:
     sel = warehouse.load(selection_name)
     selected = sel["factor"].astype(str).tolist() if not sel.empty and "factor" in sel.columns else []
@@ -534,8 +595,15 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                   extra_trees: bool = False, extra_trees_estimators: int = 120,
                   extra_trees_max_train_rows: int = 300_000,
                   window_cache_dir: str | None = None,
-                  universe_file: str | None = None) -> pd.DataFrame:
+                  universe_file: str | None = None,
+                  train_target_mode: str = "baseline") -> pd.DataFrame:
     _, _, prepared_dir = _panel_dirs(name)
+    if train_target_mode not in ("baseline", "buyin-mask", "tradable-label"):
+        raise ValueError(f"unknown train_target_mode: {train_target_mode}")
+    # A/B 训练口径：baseline=现役（target_ret 标签、全样本）；
+    #   buyin-mask=剔训练段封涨停买入日；tradable-label=用跌停顺延后的可实现收益作标签。
+    ab_label_col = f"tradable_ret_{horizon}d" if train_target_mode == "tradable-label" else None
+    ab_mask_col = "buyable_close" if train_target_mode == "buyin-mask" else None
     universe_codes: set[str] | None = None
     if universe_file:
         with open(universe_file, encoding="utf-8") as f:
@@ -593,6 +661,9 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             max_factor_ic_corr=max_factor_ic_corr,
             universe_codes=sorted(universe_codes) if universe_codes is not None else [],
         )
+        # 仅当非 baseline 时才注入 A/B 字段，保证 baseline 腿 recipe 哈希与现役完全一致（复用既有缓存）。
+        if train_target_mode != "baseline":
+            recipe_params["train_target_mode"] = train_target_mode
         recipe_sig = _recipe_signature(**recipe_params)
         legacy_recipe_sig = _legacy_recipe_signature(**recipe_params)
         cache_dir = Path(window_cache_dir)
@@ -670,6 +741,10 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         stage_started = time.perf_counter()
         if universe_codes is not None and not window.empty:
             window = window[window["code"].astype(str).isin(universe_codes)].copy()
+        # A/B：非 baseline 时，从 price 文件为本窗口 codes join 可交易列（tradable_ret_{h}d / buyable_close）。
+        # prepared 面板本就没有这两列；仅新增标签/掩码列，不引入任何特征列（因果安全）。
+        if train_target_mode != "baseline" and not window.empty:
+            window = _join_tradability(window, horizon)
         factors_in_window = [f for f in factors if f in window.columns]
         train_end_ts = _purged_end(window["date"], valid_start, horizon) if purge_horizon else valid_start - pd.Timedelta(days=1)
         valid_end_ts = _purged_end(window["date"], current, horizon) if purge_horizon else current - pd.Timedelta(days=1)
@@ -720,6 +795,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             predict_start=current.strftime("%Y-%m-%d"),
             decay_half_life_days=decay_half_life_days,
             min_weight=min_weight,
+            label_col=ab_label_col,
+            train_mask_col=ab_mask_col,
         )
         print(f"[train:timing] window={windows} stage=ridge "
               f"seconds={time.perf_counter() - stage_started:.2f} ok={ridge_res.ok}", flush=True)
@@ -737,6 +814,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             learning_rate=learning_rate,
             early_stopping_rounds=early_stopping_rounds,
             n_jobs=model_threads or None,
+            label_col=ab_label_col,
+            train_mask_col=ab_mask_col,
         )
         print(f"[train:timing] window={windows} stage=lightgbm_ranker "
               f"seconds={time.perf_counter() - stage_started:.2f} ok={lgbm_res.ok}", flush=True)
@@ -756,6 +835,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                     predict_start=current.strftime("%Y-%m-%d"),
                     decay_half_life_days=decay_half_life_days,
                     min_weight=min_weight,
+                    label_col=ab_label_col,
+                    train_mask_col=ab_mask_col,
                 )
                 elastic_future = executor.submit(
                     qmodel.train_elastic_net,
@@ -769,6 +850,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                     predict_start=current.strftime("%Y-%m-%d"),
                     decay_half_life_days=decay_half_life_days,
                     min_weight=min_weight,
+                    label_col=ab_label_col,
+                    train_mask_col=ab_mask_col,
                 )
                 ic_res = ic_future.result()
                 elastic_res = elastic_future.result()
@@ -786,6 +869,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                     predict_start=current.strftime("%Y-%m-%d"),
                     decay_half_life_days=decay_half_life_days,
                     min_weight=min_weight,
+                    label_col=ab_label_col,
+                    train_mask_col=ab_mask_col,
                 )
                 print(f"[train:timing] window={windows} stage=ic_weighted "
                       f"seconds={time.perf_counter() - model_pair_started:.2f} ok={ic_res.ok}", flush=True)
@@ -801,6 +886,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                     predict_start=current.strftime("%Y-%m-%d"),
                     decay_half_life_days=decay_half_life_days,
                     min_weight=min_weight,
+                    label_col=ab_label_col,
+                    train_mask_col=ab_mask_col,
                 )
                 print(f"[train:timing] window={windows} stage=elastic_net "
                       f"seconds={time.perf_counter() - model_pair_started:.2f} ok={elastic_res.ok}", flush=True)
@@ -818,6 +905,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                 min_weight=min_weight,
                 n_estimators=extra_trees_estimators,
                 max_train_rows=extra_trees_max_train_rows,
+                label_col=ab_label_col,
+                train_mask_col=ab_mask_col,
             )
             print(f"[train:timing] window={windows} stage=extra_trees "
                   f"seconds={time.perf_counter() - stage_started:.2f} ok={extra_trees_res.ok}", flush=True)
@@ -853,6 +942,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                 predict_start=current.strftime("%Y-%m-%d"),
                 decay_half_life_days=decay_half_life_days,
                 min_weight=min_weight,
+                label_col=ab_label_col,
+                train_mask_col=ab_mask_col,
             )
             print(f"[train:timing] window={windows} stage=rank_vote "
                   f"seconds={time.perf_counter() - stage_started:.2f} ok={rank_vote_res.ok}", flush=True)
@@ -922,9 +1013,22 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                 side_present = [c for c in side_cols if c in model_window.columns]
                 if side_present:
                     p = p.merge(model_window[["code", "date"] + side_present].drop_duplicates(["code", "date"]), on=["code", "date"], how="left")
-                keep_cols = ["code", "date", target, "pred", "model", "ridge_pred", "lgbm_pred"]
+                # A/B：把可交易列并进预测输出，令训练内 portfolio 与统一评测同口径（baseline 无这些列，自动跳过）。
+                # 关键：tradable-label 腿的标签列名就是 tradable_ret_{h}d，此时 p 已带该列（来自模型预测输出）。
+                # 若不排除，merge 会因列名撞车加 _x/_y 后缀，导致下游 p[keep_cols] 找不到 tradable_ret_{h}d 而 KeyError。
+                ab_cols = [c for c in (f"tradable_ret_{horizon}d", "buyable_close")
+                           if c in model_window.columns and c not in p.columns]
+                if ab_cols:
+                    p = p.merge(model_window[["code", "date"] + ab_cols].drop_duplicates(["code", "date"]), on=["code", "date"], how="left")
+                # tradable-label 腿的标签列被改名为 tradable_ret_{h}d（model.py 用 label_col 命名输出列），
+                # 此时预测输出里没有 target_ret_{h}d。这里用该腿实际的标签列名，避免 KeyError。
+                label_out_col = ab_label_col or target
+                keep_cols = ["code", "date", label_out_col, "pred", "model", "ridge_pred", "lgbm_pred"]
                 keep_cols.extend([c for c in ("ic_pred", "base_pred", "ic_z", "elastic_pred", "elastic_z", "extra_trees_pred", "extra_trees_z", "catboost_pred", "catboost_z", "rank_vote_pred", "rank_vote_z") if c in p.columns])
                 keep_cols.extend([c for c in side_cols if c in p.columns])
+                keep_cols.extend([c for c in ab_cols if c in p.columns])
+                # 去重保序：tradable-label 模式下 label_out_col 就是 tradable_ret_{h}d，与 ab_cols 重列时去重。
+                keep_cols = list(dict.fromkeys(keep_cols))
                 pred_out = p[keep_cols]
                 pred_parts.append(pred_out)
                 print(f"[train:timing] window={windows} stage=prediction_merge "
@@ -1061,6 +1165,10 @@ def main() -> None:
     ap.add_argument("--window-cache-dir", default=None,
                     help="cache per-window predictions keyed by recipe + month-file signature; "
                          "unchanged historical windows are reused so only the refreshed tail is recomputed")
+    ap.add_argument("--train-target-mode", default="baseline",
+                    choices=["baseline", "buyin-mask", "tradable-label"],
+                    help="A/B 训练目标口径：baseline=现役(target_ret 标签、全样本)；"
+                         "buyin-mask=剔训练段封涨停买入日；tradable-label=用跌停顺延可实现收益作标签")
     args = ap.parse_args()
 
     config.ensure_dirs()
@@ -1119,6 +1227,7 @@ def main() -> None:
         extra_trees_max_train_rows=args.extra_trees_max_train_rows,
         window_cache_dir=args.window_cache_dir,
         universe_file=args.universe_file or None,
+        train_target_mode=args.train_target_mode,
     )
 
 
