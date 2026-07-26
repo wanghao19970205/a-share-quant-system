@@ -158,12 +158,19 @@ def build_residual_shadow(
     industry_history: Path | None = None,
     industry_shrinkage: float = 0.0,
     rank_bins: int = 5,
+    horizon: int = 3,
     eval_at: tuple[int, ...] = (3,),
 ) -> dict:
-    """Build a shadow residual leg with explicit PIT publication boundaries."""
+    """Build a shadow residual leg with explicit PIT publication boundaries.
+
+    horizon 决定训练标签(target_ret_{horizon}d)、purge 间隔与 ranker 训练窗口；
+    默认 3 保持既有 h3 实验可复现，短线腿传 horizon=1 对齐现役冠军(h1)。
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     window_dir = output_dir / "windows"
     window_dir.mkdir(exist_ok=True)
+    horizon = int(horizon)
+    target = f"target_ret_{horizon}d"
     exposure_columns = ("log_mv_total", "volatility_20", "ret_20d")
     mode, publishable, industry_by_code, industry_history_frame, industry_updated_at = (
         _load_industry_metadata(industry_meta, industry_history)
@@ -174,7 +181,8 @@ def build_residual_shadow(
         "audit": str(factor_audit),
         "prepared_dir": str(prepared_dir),
         "model": "lightgbm_ranker",
-        "target": "target_ret_3d",
+        "target": target,
+        "horizon": horizon,
         "exposure_columns": list(exposure_columns),
         "threads": int(threads),
         "n_estimators": int(n_estimators),
@@ -204,7 +212,6 @@ def build_residual_shadow(
     starts = sorted(audit["test_start"].dropna().unique())
     parts: list[pd.DataFrame] = []
     windows: list[dict] = []
-    target = "target_ret_3d"
 
     for index, raw_start in enumerate(starts):
         current = pd.Timestamp(raw_start)
@@ -248,7 +255,7 @@ def build_residual_shadow(
         valid_dates = frame.loc[
             (frame["date"] >= valid_start) & (frame["date"] < current), "date"
         ]
-        valid_end = batched._purged_end(valid_dates, current, 3)  # noqa: SLF001
+        valid_end = batched._purged_end(valid_dates, current, horizon)  # noqa: SLF001
         if valid_end is None:
             raise RuntimeError(f"validation boundary is empty: {current.date()}")
 
@@ -270,7 +277,7 @@ def build_residual_shadow(
         result = model.train_lightgbm_ranker(
             frame,
             factors,
-            horizon=3,
+            horizon=horizon,
             train_end=str(train_end.date()),
             valid_end=str(valid_end.date()),
             predict_start=str(current.date()),
@@ -1661,8 +1668,12 @@ def main() -> None:
     parser.add_argument("--industry-history", default="")
     parser.add_argument("--industry-shrinkage", type=float, default=0.0)
     parser.add_argument("--rank-bins", type=int, default=5)
-    parser.add_argument("--eval-at", type=int, nargs="+", default=[3])
+    parser.add_argument("--horizon", type=int, default=3,
+                        help="训练标签/purge/窗口的持有期(天)。短线腿对齐 h1 传 1；默认 3 复现旧 h3 实验")
+    parser.add_argument("--eval-at", type=int, nargs="+", default=None,
+                        help="评估持有期(天)，可多值；缺省时回落为 [--horizon]")
     args = parser.parse_args()
+    eval_at = tuple(args.eval_at) if args.eval_at else (int(args.horizon),)
     report = build_residual_shadow(
         Path(args.source),
         Path(args.audit),
@@ -1676,7 +1687,8 @@ def main() -> None:
         industry_history=Path(args.industry_history) if args.industry_history else None,
         industry_shrinkage=args.industry_shrinkage,
         rank_bins=args.rank_bins,
-        eval_at=tuple(args.eval_at),
+        horizon=args.horizon,
+        eval_at=eval_at,
     )
     print(
         json.dumps(
