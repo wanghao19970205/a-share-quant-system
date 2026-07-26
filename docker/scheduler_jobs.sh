@@ -259,6 +259,40 @@ case "$job" in
     run_job sentiment-model "$LOG_DIR/sentiment-model.out.log" "$LOG_DIR/sentiment-model.err.log" \
         python -m stock_analyzer.sentiment_signal --months 12
     ;;
+  realtime)
+    # 交易日盘中实时层：常驻 python -m realtime.engine，订阅选股清单∪持仓的 Level-1 快照，
+    # 异动/买卖点/持仓到期 → 推送(Bark/Server酱/PushDeer) + 独立账本(logs/realtime)。
+    # 引擎自管时段：<session_start 休眠、午休静默、>session_end(15:05) 自动退出，故每交易日
+    # 一拉起、收盘自然结束。这里【只负责幂等拉起 + 后台运行】，不阻塞 cron。
+    #
+    # 防重复：engine 是长驻进程，cron 若补跑重复触发绝不能起第二个（会双份推送 + 抢券商连接）。
+    # 扫 /proc 找已在跑的 realtime.engine（先按 comm=python* 过滤，再匹配 cmdline），有则跳过。
+    RT_LOG="$LOG_DIR/realtime/engine.$(date '+%Y%m%d').log"
+    mkdir -p "$LOG_DIR/realtime"
+    # 账本 + 推送凭证 env 文件都落到已挂载的 /app/logs/realtime（宿主机 ./logs/realtime，持久化）。
+    # 否则 config 默认推导出 /app/quant_data/logs/realtime —— 该路径不在任何挂载卷，docker rm 即丢，
+    # 且与已测通的推送配置(notify.env)所在处不一致。显式 export 覆盖，指向挂载盘。
+    REALTIME_LEDGER_DIR="${REALTIME_LEDGER_DIR:-$LOG_DIR/realtime}"
+    REALTIME_ENV_FILE="${REALTIME_ENV_FILE:-$LOG_DIR/realtime/notify.env}"
+    export REALTIME_LEDGER_DIR REALTIME_ENV_FILE
+    RT_BUSY=""
+    for d in /proc/[0-9]*; do
+        comm=$(cat "$d/comm" 2>/dev/null) || continue
+        case "$comm" in python*) ;; *) continue ;; esac
+        cl=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+        case "$cl" in
+          *realtime.engine*) RT_BUSY="PID=$(basename "$d") $RT_BUSY" ;;
+        esac
+    done
+    if [ -n "$RT_BUSY" ]; then
+        clog "SKIP   job=realtime reason=already-running $RT_BUSY"
+    else
+        clog "START  job=realtime -> nohup python -m realtime.engine (log=$RT_LOG)"
+        # 后台常驻；日志按天落 logs/realtime/。SDK 退出期偶发 SIGSEGV 不影响当日已完成的推送。
+        nohup python -m realtime.engine >> "$RT_LOG" 2>&1 &
+        clog "STAGE  job=realtime stage=launch pid=$! rc=0"
+    fi
+    ;;
   rotate)
     # 日志自动清理：超过阈值大小的 .log 只保留末尾 N 行，避免无限增长。
     # 阈值可用环境变量覆盖：LOG_MAX_BYTES(默认2MB)、LOG_KEEP_LINES(默认3000)。
@@ -279,7 +313,7 @@ case "$job" in
     done
     ;;
   *)
-    echo "usage: scheduler_jobs.sh {intraday-light|daily-light|weekly-full|monthly-factor|refresh-qfq|snapshots|news-daily|news-annotation|all-a-meta|top10-eval|sentiment-model|rotate}" >&2
+    echo "usage: scheduler_jobs.sh {intraday-light|daily-light|weekly-full|monthly-factor|refresh-qfq|snapshots|news-daily|news-annotation|all-a-meta|top10-eval|sentiment-model|realtime|rotate}" >&2
     clog "ERROR  unknown job=$job"
     exit 2
     ;;

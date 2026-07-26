@@ -4,6 +4,10 @@
 SHELL=/bin/sh
 PATH=/usr/local/bin:/usr/bin:/bin
 
+# 交易日 09:20：拉起实时层常驻进程，订阅选股清单∪持仓的 Level-1 快照做盘中异动/买卖点提示，
+# 引擎自身按时段管理（<9:25 休眠、11:32-13:00 静默、>15:05 自动退出），收盘即自然结束当日进程。
+# 幂等：job 内先扫 /proc 防重复拉起（cron 若因补跑重复触发不会起第二个 engine）。
+20 9 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh realtime
 # 心跳：每 10 分钟写一行到中心日志，用于确认 cron 调度存活。
 # 若某天任务没跑：有心跳=cron活着(任务条目/执行有问题)；无心跳=cron本身没在调度。
 */10 * * * * root date '+\%Y-\%m-\%d \%H:\%M:\%S cron-heartbeat' >> /app/logs/cron.log 2>&1
