@@ -10,6 +10,13 @@ set -u
 if [ -f /app/cron.env ]; then
     . /app/cron.env
 fi
+
+# 真实交易成本（roundtrip）：佣金双边 万5×2=0.001 + 印花税卖出 千1=0.001 = 0.002。
+# 接入选参/晋级门/训练内回测，使指标反映真实可交易成本（此前默认 0=乐观口径）。
+# 2026-07-25 实证：成本进来后月度候选逐月胜率 0.4286→~0.30，晋级判定 True→False，确认成本影响结果。
+# 用 ${VAR:-0.002} 形式：默认 0.002，运行时可用 -e QUANT_BT_COST_ROUNDTRIP=0 复现乐观基线、
+# 或 =0.0025 跑含滑点的悲观口径。一处生效，覆盖 monthly-factor/daily-light/intraday-light/weekly-full。
+export QUANT_BT_COST_ROUNDTRIP="${QUANT_BT_COST_ROUNDTRIP:-0.002}"
 cd /app
 
 LOG_DIR="${LOG_DIR:-/app/logs}"
