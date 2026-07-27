@@ -176,6 +176,15 @@ def _price_factors(
         df["turnover_chg_5"] = df["turnover"].pct_change(5)
     if "amount" in df.columns:
         df["amount_chg_5"] = df["amount"].pct_change(5)
+    # 隔夜跳空因子（factor family C，2026-07 并入）：close[D-1]->open[D] 的隔夜跳空，
+    # 在 close[D] 收盘前决策时已实现（生产口径=当日收盘前买入、T+1 卖出），PIT 安全、无前视。
+    # 仅并入去前视诊断确认携带信号的 3 个"干净"因子（不含 close[D]，与 target 无共享价格）；
+    # 含 close[D] 的日内/背离因子诊断显示 IC≈0，剔除以免引入噪声。
+    if "open" in df.columns:
+        ovn_gap = (df["open"] / close.shift(1) - 1.0)
+        df["ovn_gap"] = ovn_gap
+        df["ovn_gap_5d"] = ovn_gap.rolling(5, min_periods=2).mean()
+        df["ovn_gap_vol_20d"] = ovn_gap.rolling(20, min_periods=5).std()
     df["rule_score"] = _technical_rule_score(df)
     df["rule_score_chg_5"] = df["rule_score"] - df["rule_score"].shift(5)
     if start_date is not None:
@@ -520,6 +529,8 @@ def _feature_kind(name: str) -> str:
         return "technical_rule_score"
     if name.startswith(("ret_", "ma_gap_", "volatility_", "volume_ratio_", "drawdown_", "range_pos_", "ret_vol_adj_", "macd_")) or name in {"intraday_range", "turnover_chg_5", "amount_chg_5"}:
         return "price_volume_continuous"
+    if name.startswith("ovn_"):
+        return "overnight_gap_continuous"
     if name in {"pe_ttm", "pe_static", "pb", "ps", "peg", "pcf", "mv_total", "mv_float", "log_mv_total", "log_mv_float"}:
         return "valuation_continuous"
     if name.startswith(("yjbb_", "income_", "cashflow_", "balance_")):

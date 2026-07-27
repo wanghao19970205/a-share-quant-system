@@ -105,6 +105,7 @@ def _ensure_targets(pred: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
 
 def _base_combos(path: Path, kind: str) -> pd.DataFrame:
     template = pd.DataFrame()
+    path = Path(path)  # 容错：调用方可能传 str，统一成 Path
     if path.exists():
         loaded = pd.read_parquet(path)
         if kind == "short":
@@ -694,6 +695,8 @@ def run_grid(predictions: Path, template: Path, output: Path, best_output: Path,
              fixed_params: dict | None = None,
              catboost_weights: list[float] | None = None,
              neighborhood: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    predictions, template, output, best_output = (
+        Path(predictions), Path(template), Path(output), Path(best_output))
     pred = _load_predictions(predictions, watchlist)
     if start_date is not None:
         pred = pred[pred["date"] >= pd.Timestamp(start_date)].copy()

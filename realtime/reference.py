@@ -22,7 +22,9 @@ from .config import RealtimeConfig
 class RefRow:
     atr: Optional[float] = None          # ATR(14) 绝对值（元）
     atr_pct: Optional[float] = None      # ATR / 昨收，便于缺 ATR 时按比例兜底
-    expected_return: Optional[float] = None  # 模型预期收益（ridge_pred，小数）
+    expected_return: Optional[float] = None  # 模型预期收益（ridge_pred 原始小数，供 GapCalibrate 等）
+    calibrated_return: Optional[float] = None  # ridge_pred 按历史分档重标定的实际兑现均值（仅展示用）
+    win_rate: Optional[float] = None     # 该分档历史 (target>0) 胜率（仅展示用）
     hold_days: Optional[int] = None      # 已持有交易日数（仅持仓票有值；供 HoldingExpiry）
 
 
@@ -82,7 +84,13 @@ def _load_atr_map(cfg: RealtimeConfig, codes: list[str]) -> dict[str, tuple]:
 
 
 def _load_expected_return(cfg: RealtimeConfig) -> dict[str, float]:
-    """从最新一期预测取每票预期收益（优先 ridge_pred，退回 pred）。"""
+    """从最新一期预测取每票预期收益，只认 ridge_pred（Ridge 对未来收益率的回归预测，有量纲小数）。
+
+    注意：绝不退回融合分 `pred`。`pred` 是各腿 z-score 的加权排序分（无量纲），
+    与「预期收益率」量纲不同；GapCalibrate 用 expected_return 算 gap/exp 与判 exp<=0，
+    若拿排序分冒充收益率会产生错误的跳空纠偏告警。缺 ridge_pred 时返回空 map
+    → expected_return=None → 相关策略自动降级不触发。
+    """
     path = cfg.predictions_file
     if not path.exists():
         return {}
@@ -91,23 +99,20 @@ def _load_expected_return(cfg: RealtimeConfig) -> dict[str, float]:
     except Exception:  # noqa: BLE001
         return {}
     try:
-        df = pd.read_parquet(path, columns=["code", "date", "ridge_pred", "pred"])
+        df = pd.read_parquet(path, columns=["code", "date", "ridge_pred"])
     except Exception:  # noqa: BLE001
+        # 列裁剪失败（老/变体文件无 ridge_pred 列）→ 退回读全表，但仍只认 ridge_pred。
         try:
             df = pd.read_parquet(path)
         except Exception:  # noqa: BLE001
             return {}
-    if "code" not in df.columns:
+    if "code" not in df.columns or "ridge_pred" not in df.columns:
         return {}
     if "date" in df.columns:
         d = pd.to_datetime(df["date"], errors="coerce")
         df = df[d == d.max()]
-    col = "ridge_pred" if "ridge_pred" in df.columns else (
-        "pred" if "pred" in df.columns else None)
-    if col is None:
-        return {}
     out: dict[str, float] = {}
-    for code, val in zip(df["code"].astype(str).str.zfill(6), df[col]):
+    for code, val in zip(df["code"].astype(str).str.zfill(6), df["ridge_pred"]):
         try:
             f = float(val)
         except (TypeError, ValueError):
@@ -198,15 +203,100 @@ def _trading_days_between(start, end) -> int:
     return n
 
 
+def _build_calibration(cfg: RealtimeConfig):
+    """从历史预测表建 ridge_pred → 实际兑现（均值/胜率）的分档查找函数。
+
+    背景：ridge_pred 是 Ridge 对 T+N 收益率小数的回归拟合，强正则收缩 + 短线实现分布
+    右偏厚尾 → 点估计系统性偏保守（展示「预期+1%」的票日内常涨更多）。这里用同一份
+    预测文件的历史行（含已实现 target_ret_{h}d）按 ridge_pred 等频分档，求每档实际
+    兑现的平均收益与胜率，把裸 ridge_pred 重标定成「该档历史真实兑现」用于展示。
+
+    数据源 = cfg.predictions_file（即 _load_expected_return 读的同一份，零新增依赖）。
+    只读两列，丢最新未实现日（target NaN）。样本不足/无 target 列 → 返回 None（优雅降级，
+    展示回退原始 ridge_pred）。返回 lookup(ridge)->(cal_return, win_rate)。
+    """
+    if not getattr(cfg, "calib_enabled", True):
+        return None
+    path = cfg.predictions_file
+    if not path.exists():
+        return None
+    try:
+        import numpy as np
+        import pandas as pd
+    except Exception:  # noqa: BLE001
+        return None
+    horizon = max(1, int(getattr(cfg, "sell_horizon", 1)))
+    # 与实盘卖点口径一致：优先 close→close 的 target_ret_{h}d，退回可交易口径。
+    candidates = [f"target_ret_{horizon}d", f"tradable_ret_{horizon}d", f"open_ret_{horizon}d"]
+    try:
+        head = pd.read_parquet(path, columns=None).head(0)
+        cols = set(head.columns)
+    except Exception:  # noqa: BLE001
+        return None
+    if "ridge_pred" not in cols:
+        return None
+    target_col = next((c for c in candidates if c in cols), None)
+    if target_col is None:
+        return None
+    try:
+        df = pd.read_parquet(path, columns=["ridge_pred", target_col])
+    except Exception:  # noqa: BLE001
+        return None
+    df = df.dropna(subset=["ridge_pred", target_col])
+    if len(df) < 500:  # 样本太少，校准不稳，降级
+        return None
+    bins = max(4, int(getattr(cfg, "calib_bins", 20)))
+    try:
+        # 等频分位分档；重复边界（ridge_pred 大量并列）时 duplicates="drop" 自动减档。
+        codes, edges = pd.qcut(df["ridge_pred"], q=bins, labels=False,
+                               retbins=True, duplicates="drop")
+    except Exception:  # noqa: BLE001
+        return None
+    df = df.assign(_bin=codes)
+    grp = df.groupby("_bin")[target_col]
+    means = grp.mean()
+    wins = df.assign(_w=(df[target_col] > 0)).groupby("_bin")["_w"].mean()
+    # 按分档序号排序后对均值做累积最大值 → 保证「ridge 越高，校准收益不降」的单调性
+    # （零依赖替代保序回归；短线个别档因样本噪声反转时抹平）。
+    idx = sorted(means.index)
+    mono = np.maximum.accumulate([float(means[i]) for i in idx])
+    cal_by_bin = {b: mono[k] for k, b in enumerate(idx)}
+    wr_by_bin = {b: float(wins[b]) for b in idx}
+    inner_edges = list(edges[1:-1])  # 用于 np.searchsorted 定位分档
+
+    def lookup(ridge):
+        if ridge is None or ridge != ridge:  # None/NaN
+            return None, None
+        b = int(np.searchsorted(inner_edges, float(ridge), side="right"))
+        b = min(b, idx[-1])  # 落在最右开区间外时归入最高档
+        return cal_by_bin.get(b), wr_by_bin.get(b)
+
+    lookup.n_bins = len(idx)  # type: ignore[attr-defined]
+    lookup.n_rows = int(len(df))  # type: ignore[attr-defined]
+    lookup.target_col = target_col  # type: ignore[attr-defined]
+    return lookup
+
+
 def build(cfg: RealtimeConfig, codes: list[str]) -> dict[str, RefRow]:
     """构建 {code: RefRow}。任何来源缺失都优雅返回可用子集，不抛异常。"""
     atr_map = _load_atr_map(cfg, codes)
     ret_map = _load_expected_return(cfg)
     hold_map = _load_hold_days(cfg)
+    calib = None
+    try:
+        calib = _build_calibration(cfg)
+    except Exception as e:  # noqa: BLE001 - 校准失败只降级展示，不拦启动
+        print(f"[reference] 校准表构建失败(展示回退原始 ridge_pred)：{type(e).__name__}", flush=True)
+    if calib is not None:
+        print(f"[reference] 预期收益校准就绪：{calib.n_bins} 档 / {calib.n_rows} 行历史 "
+              f"（口径 {calib.target_col}）", flush=True)
     ref: dict[str, RefRow] = {}
     for code in codes:
         atr, atr_pct = atr_map.get(code, (None, None))
+        exp = ret_map.get(code)
+        cal, wr = (calib(exp) if calib is not None else (None, None))
         ref[code] = RefRow(atr=atr, atr_pct=atr_pct,
-                           expected_return=ret_map.get(code),
+                           expected_return=exp,
+                           calibrated_return=cal, win_rate=wr,
                            hold_days=hold_map.get(code))
     return ref

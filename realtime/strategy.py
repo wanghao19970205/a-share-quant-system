@@ -66,6 +66,11 @@ class _CodeState:
             return None
 
 
+def _digits(code) -> str:
+    """把任意口径代码规范成 6 位纯数字（剥券商后缀）：603956.SH -> 603956。"""
+    return str(code or "").split(".", 1)[0].strip().zfill(6)
+
+
 class StrategyContext:
     """跨快照的轻量状态容器（单进程内存，日内有效）。
 
@@ -78,16 +83,39 @@ class StrategyContext:
 
     def __init__(self, ref: Optional[dict] = None) -> None:
         self._by_code: dict[str, _CodeState] = {}
+        self._by_digits: dict[str, _CodeState] = {}  # 6 位纯代码 -> 同一 state（供无后缀口径反查）
         self._ref = ref or {}
 
     def ref_of(self, code: str):
         return self._ref.get(code)
+
+    def all_refs(self) -> dict:
+        """全部 {code: RefRow} 只读视图；供 RankBoard 按 expected_return 排名。"""
+        return self._ref
+
+    def _state(self, code):
+        """按原始 code 查，未命中再按 6 位纯代码反查（吸收带/不带后缀口径差异）。"""
+        st = self._by_code.get(code or "?")
+        if st is None:
+            st = self._by_digits.get(_digits(code))
+        return st
+
+    def snapshot_of(self, code):
+        """该票最新一条快照（无则 None）；供 RankBoard 只读取盘中量。"""
+        st = self._state(code)
+        return st.last_snap if st is not None else None
+
+    def vwap_of(self, code):
+        """该票当日 VWAP（累计额/累计量，无则 None）；供 RankBoard 只读。"""
+        st = self._state(code)
+        return st.vwap if st is not None else None
 
     def state_of(self, code: str) -> _CodeState:
         return self._by_code.setdefault(code or "?", _CodeState())
 
     def update(self, snap: Snapshot) -> _CodeState:
         st = self._by_code.setdefault(snap.code or "?", _CodeState())
+        self._by_digits[_digits(snap.code)] = st  # 维护 6 位索引，供 RankBoard 无后缀口径反查
         now = time.time()
         old = st.last_snap
         # 先把「上一条」的值滚存进 prev_*（务必在覆盖 last_snap 之前）

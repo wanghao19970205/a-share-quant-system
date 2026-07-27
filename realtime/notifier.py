@@ -16,9 +16,24 @@ from .strategy import Signal
 
 
 class Notifier:
-    def __init__(self, cfg: RealtimeConfig):
+    def __init__(self, cfg: RealtimeConfig, name_map: dict[str, str] | None = None):
         self._cfg = cfg
+        self._name_map = name_map or {}
         self._last_sent: dict[tuple[str, str], float] = {}
+
+    # ---- 展示 ----------------------------------------------------------------
+    def _label(self, code: str) -> str:
+        """代码 + 中文简称（如 "600519 贵州茅台"）；无名称则退回纯代码。
+
+        name_map 以 6 位纯代码为 key，但信号里的 code 是券商回调的 broker 格式
+        （带交易所后缀，如 "603956.SH"）。故先按原样查，miss 再退回规范化的 6 位
+        （去后缀、zfill）查一次，两种口径都能命中。
+        """
+        name = self._name_map.get(code)
+        if name is None:
+            digits = str(code).split(".", 1)[0].strip().zfill(6)
+            name = self._name_map.get(digits)
+        return f"{code} {name}" if name else code
 
     # ---- 节流 ----------------------------------------------------------------
     def _cooled(self, sig: Signal) -> bool:
@@ -32,11 +47,22 @@ class Notifier:
 
     # ---- 对外 ----------------------------------------------------------------
     def notify(self, sig: Signal) -> bool:
-        """推送一条信号。返回是否实际发出（被节流/干跑则 False）。"""
+        """推送一条信号。返回是否实际发出（被白名单过滤/节流/干跑则 False）。"""
+        # 白名单过滤：只推 notify_kinds 内的 kind（空集=不过滤）。被挡的仍会记账。
+        if self._cfg.notify_kinds and sig.kind not in self._cfg.notify_kinds:
+            return False
         if not self._cooled(sig):
             return False
-        title = f"[{sig.level}] {sig.code} {sig.kind}"
+        title = f"[{sig.level}] {self._label(sig.code)} {sig.kind}"
         body = sig.reason or sig.kind
+        return self.push(title, body)
+
+    def push(self, title: str, body: str) -> bool:
+        """低层推送：把 (title, body) 派发到所有已配置通道，任一成功即 True。
+
+        不过白名单、不做 (code, kind) 冷却——供 RankBoard 等主动汇总类推送直接调用。
+        无凭证则干跑打印。
+        """
         sent = False
         if self._cfg.bark_key:
             sent = self._send_bark(title, body) or sent
