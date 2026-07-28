@@ -211,13 +211,13 @@ case "$job" in
         python -m stock_analyzer.snapshot_batch --batch
     ;;
   news-daily)
-    # 先增量入库，再用 Qwen 实时标注最新未标注新闻，17:00 快照可读取当日结构化结果。
-    # 日更只优先处理最新入库新闻，防止历史回溯队列抢占当天调用额度。
+    # 仅做新闻增量入库（纯 akshare 抓取，不费 token）。
+    # [停用 Qwen 标注 2026-07-28] 舆情/新闻因子经 ablation 判负(sentiment-factor-ablation-negative)，
+    #   不进综合分、不改选股，故日更后的 news_annotation --newest（Qwen 标注最新新闻）取消，省 LLM token。
+    #   入库仍保留：建库/UI 即时 news.analyze 用户触发时可读原始新闻，不受影响。
     run_job news-daily "$LOG_DIR/news-daily.out.log" "$LOG_DIR/news-daily.err.log" \
         python -m stock_analyzer.news_ingest \
             --mode daily --lookback-days 7 --workers 12
-    run_job news-daily-qwen "$LOG_DIR/news-annotation.out.log" "$LOG_DIR/news-annotation.err.log" \
-        python -m stock_analyzer.news_annotation --mode realtime --newest --limit 30
     ;;
   news-annotation)
     # 历史回填必须单实例运行：手工触发、cron 与日更不能并发消耗 Qwen 额度或抢同一批记录。

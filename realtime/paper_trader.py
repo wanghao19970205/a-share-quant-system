@@ -212,14 +212,19 @@ class PaperTrader:
         return None
 
     def _run_sells(self) -> None:
-        """全时段评估每个持仓的出场；命中即按实时价平仓，缺实时价则保留待下轮/次日。"""
+        """全时段评估每个持仓的出场；命中即按实时价平仓，缺实时价则保留待下轮/次日。
+
+        A股 T+1：当日买入（held<1）的持仓【不可卖】，跳过全部出场评估（仍持有、仍刷 peak），
+        次日 held>=1 起才进出场逻辑——否则会出现 14:50 建仓后价格触止损/破位即当日平仓的 T+0 违规。
+
+        迭代持仓列表的副本，成交时【先从持仓移除再把所得计入现金】，使 _equity()/summary()
+        在写流水/推送那一刻即自洽（否则已卖出持仓仍留在列表里被重复计市值 → 净值虚高一份）。
+        """
         today = _dt.date.today()
-        kept: list[dict] = []
         changed = False
-        for pos in self._state.get("positions", []):
+        for pos in list(self._state.get("positions", [])):  # 迭代副本，循环内可安全移除
             px = self._price_of(pos["code"])
             if px is None:  # 无实时价 → 无法评估/成交，保留，下轮再来
-                kept.append(pos)
                 continue
             # 刷持仓期最高价（移动止盈锚点），持久化跨日/跨 execv 重启。
             prev_peak = pos.get("peak") or pos.get("buy_price", 0.0)
@@ -228,10 +233,17 @@ class PaperTrader:
                 changed = True
             buy_d = self._parse_date(pos.get("buy_date"))
             held = _trading_days_between(buy_d, today) if buy_d else 0
+            # A股 T+1：当日买入不可卖出，跳过出场评估（time_cap 也自然要到 held>=horizon 才触发）。
+            if held < 1:
+                continue
             reason = self._exit_decision(pos, px, held)
             if reason is None:
-                kept.append(pos)
                 continue
+            # 先移除持仓、再把所得入现金 → _equity()/summary() 立即反映平仓后的正确净值。
+            try:
+                self._state["positions"].remove(pos)
+            except ValueError:
+                pass
             proceeds = px * pos["shares"] * (1 - self._cost / 2.0)
             cost_basis = pos.get("cost_basis", pos["buy_price"] * pos["shares"])
             pnl = proceeds - cost_basis
@@ -252,7 +264,6 @@ class PaperTrader:
                 f"[模拟盘] 卖出 {self._label(pos['code'])} @{px:.2f} {_EXIT_LABEL.get(reason, reason)}",
                 f"持有T+{held} 收益{ret:+.2%} 盈亏¥{pnl:,.0f}\n{self.summary()}")
         if changed:
-            self._state["positions"] = kept
             self._save_state()
 
     def _run_buys(self) -> None:

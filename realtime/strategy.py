@@ -57,13 +57,21 @@ class _CodeState:
 
     @property
     def vwap(self) -> Optional[float]:
+        """当日 VWAP=累计成交额/累计成交量。带量纲护栏：真实 VWAP 与现价之比恒在
+        [0.5,2.0] 内（A股日内涨跌停封顶±10~20%），越界即判 amount/volume 量纲不一致
+        （如 SDK volume 回「手」而 amount 回「元」→ VWAP≈真实均价×100），返回 None 让
+        上层跳过 VWAP 类判定（破位/便宜贵），绝不据坏值误卖。护栏对合法 VWAP 完全透明。"""
         s = self.last_snap
         if s is None or not s.amount or not s.volume:
             return None
         try:
-            return s.amount / s.volume
+            v = s.amount / s.volume
         except ZeroDivisionError:
             return None
+        last = s.last
+        if last and last > 0 and not (0.5 <= v / last <= 2.0):
+            return None  # 量纲异常（多半是 手/股 或 元/千元 不一致），不返回坏 VWAP
+        return v
 
 
 def _digits(code) -> str:

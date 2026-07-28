@@ -234,17 +234,17 @@ def _compute_context(symbol: str, key: str, model: str, base_url: str, force: bo
 
 def run_batched(codes, key: str = "", model: str = "", base_url: str = "", max_workers: int = 4,
                 force: bool = False, poll_interval: float = 60.0, max_wait: float = 90000.0) -> dict:
-    """离线批量版：本地信号并发算好后，把“次日预估”的 Qwen 调用合并成一个 DashScope Batch 提交，
-    等待完成后统一落盘。省 token（batch 约半价）、抗限流；异步、耗时更长，适合夜间定时。
+    """离线批量版（cron `snapshots` 走这条）：本地信号并发算好后落盘。
 
-    说明：新闻/板块联动的 Qwen 仍走实时（有磁盘缓存，重复成本低）；本阶段先把最大且未缓存的
-    “次日预估”调用改为 batch。无 key 或 batch 失败时，自动回退到规则法预估（不阻塞落盘）。
+    [停用 Qwen 标注 2026-07-28] 舆情/新闻因子经 ablation 判负(sentiment-factor-ablation-negative)，
+      不进综合分、不改选股，故多维快照不再发起任何 Qwen 调用（次日预估 batch / 个股新闻 / 板块联动
+      全部走无 key 的规则法兜底），省 LLM token。技术面/外围/资金流/量化分/情绪分等非 LLM 维度照常积累。
+      UI 用户手动触发的 run()（同步路径）仍可带 key 走 Qwen，不受此停用影响。
     """
-    key = llm.get_key(key)
+    key = ""  # 强制无 key：下游 news.analyze/sectors.analyze_linkage/prediction 全部降级规则法，不触 Qwen
     model = llm.get_model(model) if model else llm.get_random_model()
     base_url = llm.get_base_url(base_url)
-    batch_base_url = llm.get_batch_base_url()
-    print(f"[snapshots:batch] qwen_model={model} force={force} batch_base={batch_base_url}", flush=True)
+    print(f"[snapshots:batch] qwen_disabled model={model} force={force}（舆情判负，纯规则法积累多维快照）", flush=True)
     seen, uniq = set(), []
     for c in codes:
         c = data._normalize_symbol(c)
@@ -256,7 +256,7 @@ def run_batched(codes, key: str = "", model: str = "", base_url: str = "", max_w
 
     _safe(overseas.analyze)
     _safe(sectors.analyze_sectors)
-    _safe(lambda: news.analyze_sector_news(key, model, base_url))
+    # news.analyze_sector_news 预热省略：无 key 时该调用只会走规则法，无预热收益
 
     workers = min(max_workers, len(uniq))
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -265,44 +265,23 @@ def run_batched(codes, key: str = "", model: str = "", base_url: str = "", max_w
     skipped = sum(1 for x in ctxs if x.get("skip"))
     fail = [x["code"] for x in ctxs if x.get("fail")]
     todo = [x for x in ctxs if not x.get("skip") and not x.get("fail")]
-    print(f"[snapshots:batch] 本地信号完成：待预估 {len(todo)}，当日已存在跳过 {skipped}，失败 {len(fail)}", flush=True)
+    print(f"[snapshots:batch] 本地信号完成：待落盘 {len(todo)}，当日已存在跳过 {skipped}，失败 {len(fail)}", flush=True)
 
-    # 组一个 batch：每只票一条“次日预估”请求
-    items = [{"custom_id": x["code"], "system": prediction._SYSTEM, "user": x["summary"]}  # noqa: SLF001
-             for x in todo]
-    contents: dict[str, str] = {}
-    if items:
-        print(f"[snapshots:batch] 提交 DashScope Batch，共 {len(items)} 条，轮询中…", flush=True)
-        contents = llm.run_chat_batch(
-            items, key=key, model=model, base_url=batch_base_url,
-            metadata={"ds_name": "daily_snapshot_pred", "ds_description": f"{len(items)} preds"},
-            poll_interval=poll_interval, max_wait=max_wait,
-            on_progress=lambda b: print(f"[snapshots:batch] status={b.get('status')}", flush=True))
-        print(f"[snapshots:batch] Batch 返回 {len(contents)}/{len(items)} 条", flush=True)
-
+    # 不再提交 DashScope Batch：次日预估直接用规则法兜底（省 token）。
     ok = []
     for x in todo:
-        code = x["code"]
         comp, r_dir, r_level = x["rule"]
-        content = contents.get(code, "")
-        data_json = llm._extract_json(content) if content else None  # noqa: SLF001
-        if data_json and data_json.get("direction"):
-            d = str(data_json["direction"])
-            level = "bullish" if "多" in d else ("bearish" if "空" in d else "neutral")
-            engine = "Qwen大模型(batch)"
-        else:
-            level, engine = r_level, "本地规则"  # batch 缺失/解析失败 → 规则法兜底
         rec = dict(x["record"])
         rec["pred_composite"] = comp
-        rec["pred_level"] = level
-        rec["engine"] = engine
+        rec["pred_level"] = r_level
+        rec["engine"] = "本地规则"
         try:
-            snapshot.save(code, rec)
-            ok.append(code)
+            snapshot.save(x["code"], rec)
+            ok.append(x["code"])
         except Exception:  # noqa: BLE001
-            fail.append(code)
+            fail.append(x["code"])
     return {"ok": ok, "fail": fail, "count": len(ok), "skipped": skipped,
-            "batched": len(items), "batch_returned": len(contents)}
+            "batched": 0, "batch_returned": 0}
 
 
 def _watchlist() -> list:
