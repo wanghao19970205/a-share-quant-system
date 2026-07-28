@@ -171,6 +171,9 @@ class RealtimeConfig:
     paper_entry_gap_eaten: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_GAP_EATEN", 0.6))
     paper_entry_rich: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_RICH", 0.01))
     paper_entry_ask_strong: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_ASK_STRONG", 0.2))
+    # 盘口价差流动性门槛：买一/卖一价差率超阈值即跳过（宽价差=薄盘口，14:50 建仓滑点吃 alpha）。
+    # 默认 0.006(0.6%)；设 0 关闭。缺盘口价(spread_pct=None)不拦，不误跳。
+    paper_entry_spread: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_SPREAD", 0.006))
 
     # ---- 预期收益历史校准（Top-N 展示重标定）------------------------------
     # ridge_pred 强正则收缩偏保守，按历史同档实际兑现(target_ret_{h}d)重标定展示值 + 胜率。

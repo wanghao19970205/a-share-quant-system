@@ -124,12 +124,8 @@ class RankBoard:
         经 RerankScorer 盘中微调后按 score 降序，取前 rank_top_n 展示。
 
         排序主序 = 重排后 score（模型分锚定 + 盘中有界微调），展示预期%仍用校准值。
-
-        与 PaperTrader 买入腿同口径 drop_limit_up=True：封涨停/一字板当下买不进，
-        摆在榜首无意义（且 last 顶死涨停价恒定 → 指纹不变 → 榜单假性「不更新」）。
-        剔掉后榜单由真正可买候选填充，随盘中量刷新；炸板则自然回榜。
         """
-        rows = self._scorer.ranked(drop_limit_up=True)
+        rows = self._scorer.ranked()
         return rows[: self._top_n]
 
     def _exp_str(self, code: str, exp: float) -> str:
