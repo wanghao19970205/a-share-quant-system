@@ -4,12 +4,12 @@
 过白名单+冷却；RankBoard 是【跨票汇总】，主动按模型预期收益排名并配盘中量标注，走
 notifier.push 低层派发（不过白名单），自带节奏控制 + 指纹去重防刷屏。
 
-排序主序 = 模型 expected_return（ridge_pred，启动期已由 reference 加载进 ctx.ref）；
-盘中信号（VWAP 偏离 / 买盘失衡 / 距涨停 / 当日涨幅）只做【标注】，不改排序、不造新 alpha
+排序主序 = 盘中重排后 score（RerankScorer：模型 expected_return 锚定 + 盘中有界微调）；
+候选池恒 = 模型 expected_return>0 的 Top-rank_pool_n，重排只在池内微调名次、不造新 alpha
 ——守 strategy 既定原则「模型选强票入池，盘中只做纠偏」。
 
 只读 ctx 内存状态（最新快照 + VWAP + ref），盘中绝不碰 quant_data。缺 expected_return
-的票自动落榜。仅当 Top-N 榜单指纹（代码序 + 标注）变化才推。
+的票自动落榜。仅当 Top-N 榜单指纹（代码序 + 重排幅度 + 标注）变化才推。
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import time
 from typing import Optional
 
 from .notifier import Notifier
+from .rerank import RerankScorer
 from .strategy import StrategyContext
 
 
@@ -31,6 +32,7 @@ class RankBoard:
         self._interval = max(30, getattr(cfg, "rank_interval_sec", 300))
         self._last_emit = 0.0
         self._last_fingerprint: Optional[str] = None
+        self._scorer = RerankScorer(cfg, ctx)  # 与 PaperTrader 共用的盘中重排打分器
 
     # ---- 展示辅助 ------------------------------------------------------------
     def _label(self, code: str) -> str:
@@ -117,19 +119,13 @@ class RankBoard:
         self._notifier.push(title, body)
         return True
 
-    def _rank(self) -> list[tuple[str, float]]:
-        """取 expected_return>0 的票，按预期降序 Top-N。缺 ref/预期的票落榜。
+    def _rank(self) -> list:
+        """盘中重排后取 Top-N。候选池 = 模型 expected_return>0 的 Top-rank_pool_n，
+        经 RerankScorer 盘中微调后按 score 降序，取前 rank_top_n 展示。
 
-        排序主序恒为原始 ridge_pred（expected_return），校准只改展示不改序。
+        排序主序 = 重排后 score（模型分锚定 + 盘中有界微调），展示预期%仍用校准值。
         """
-        ref = self._ctx.all_refs() or {}
-        rows: list[tuple[str, float]] = []
-        for code, r in ref.items():
-            exp = getattr(r, "expected_return", None)
-            if exp is None or exp <= 0:
-                continue
-            rows.append((code, float(exp)))
-        rows.sort(key=lambda kv: kv[1], reverse=True)
+        rows = self._scorer.ranked()
         return rows[: self._top_n]
 
     def _exp_str(self, code: str, exp: float) -> str:
@@ -142,20 +138,38 @@ class RankBoard:
             return f"预期{cal:+.1%}{wr_str}"
         return f"预期{exp:+.1%}"
 
-    def _render(self, ranked: list[tuple[str, float]]) -> tuple[str, str, str]:
-        """把 Top-N 拼成 (title, body, fingerprint)。"""
+    def _rerank_str(self, row) -> str:
+        """把重排原因拼成短串（▲加分项 / ▼减分项），无调整则空串。"""
+        if not getattr(row, "reasons", None) or abs(getattr(row, "adj", 0.0)) < 1e-4:
+            return ""
+        ups = [name for name, c in row.reasons if c > 0]
+        downs = [name for name, c in row.reasons if c < 0]
+        parts = []
+        if ups:
+            parts.append("▲" + "+".join(dict.fromkeys(ups)))
+        if downs:
+            parts.append("▼" + "+".join(dict.fromkeys(downs)))
+        return (" " + " ".join(parts)) if parts else ""
+
+    def _render(self, ranked: list) -> tuple[str, str, str]:
+        """把重排后 Top-N（RankRow 列表）拼成 (title, body, fingerprint)。"""
         from datetime import datetime
 
         marks = "①②③④⑤⑥⑦⑧⑨⑩"
         lines: list[str] = []
         fp_rows: list[str] = []
-        for i, (code, exp) in enumerate(ranked):
+        for i, row in enumerate(ranked):
+            code, exp = row.code, row.exp
             tags, fp = self._tags(code, exp)
             mark = marks[i] if i < len(marks) else f"{i + 1}."
             tag_str = (" " + " ".join(tags)) if tags else ""
-            lines.append(f"{mark} {self._label(code)} {self._exp_str(code, exp)}{tag_str}")
-            fp_rows.append(f"{code}:{round(exp, 3)}:{fp}")
-        title = f"[实时榜] 模型Top{len(ranked)}买入候选 {datetime.now():%H:%M}"
+            lines.append(f"{mark} {self._label(code)} {self._exp_str(code, exp)}"
+                         f"{self._rerank_str(row)}{tag_str}")
+            # 指纹并入 adj 粗分桶（0.05 一档），使盘中重排变化能触发推送但不因微抖动刷屏。
+            adj_bucket = round(getattr(row, "adj", 0.0) / 0.05)
+            fp_rows.append(f"{code}:{round(exp, 3)}:a{adj_bucket}:{fp}")
+        pool_n = getattr(self._cfg, "rank_pool_n", 30)
+        title = f"[实时榜] 重排Top{len(ranked)}（模型Top{pool_n}池） {datetime.now():%H:%M}"
         body = "\n".join(lines)
         fingerprint = ";".join(fp_rows)
         return title, body, fingerprint

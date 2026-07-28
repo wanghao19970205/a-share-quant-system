@@ -32,7 +32,8 @@ PATH=/usr/local/bin:/usr/bin:/bin
 40 16 * * * root /app/docker/scheduler_jobs.sh news-daily
 # 每10分钟：Qwen 实时结构化标注历史新闻（20 条/轮，内容哈希幂等、可断点续跑）。
 # 与日更最新新闻标注分开：该任务按历史待标注顺序逐步回溯，不影响 16:40->17:00 快照链路。
-*/10 * * * * root /app/docker/scheduler_jobs.sh news-annotation
+# [停用 2026-07-28] 舆情判负,每10分钟Qwen标注是最大token漏斗,停用(UI即时news.analyze不受影响)
+# */10 * * * * root /app/docker/scheduler_jobs.sh news-annotation
 # 每周日 00:30：刷新全 A 东财行业/概念板块映射；失败板块沿用上次成功快照
 30 0 * * 0 root /app/docker/scheduler_jobs.sh all-a-meta
 # 每月第一个周日 02:30：用已积累的一年舆情重选衰减/类别权重；留出验证不过则不加分

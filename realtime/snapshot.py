@@ -98,6 +98,21 @@ class Snapshot:
             return None
         return (b - a) / (b + a)
 
+    @property
+    def spread_pct(self) -> Optional[float]:
+        """盘口价差率：(卖一价 - 买一价) / 中间价。越小流动性越好（供盘中重排微调）。
+
+        缺买一/卖一价、或价格非正、或买一>卖一（异常/穿价）时返回 None，上层跳过该分项。
+        注：仅用 Level-1 一档；5 档字段 SDK 真实名待确认后可在 _FIELD_ALIASES 扩展（见文件顶部）。
+        """
+        b, a = self.bid_price1, self.ask_price1
+        if b is None or a is None or b <= 0 or a <= 0 or a < b:
+            return None
+        mid = (a + b) / 2.0
+        if mid <= 0:
+            return None
+        return (a - b) / mid
+
 
 _NUMERIC_FIELDS = {
     "last", "pre_close", "open", "high", "low", "volume", "amount",

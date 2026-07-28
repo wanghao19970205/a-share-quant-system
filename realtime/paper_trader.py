@@ -2,7 +2,7 @@
 验证「收盘前买入 + 完整出场策略」在真实盘中价上的累计收益。
 
 与 RankBoard（只推送不下单）的区别：PaperTrader 真正维护一个虚拟账户
-（现金 + 持仓），每交易日在收盘前 10 分钟按模型预期收益 Top-N 买入，持仓则在
+（现金 + 持仓），每交易日在收盘前 10 分钟按重排后 score 降序买 Top-N，持仓则在
 【全交易时段】每轮按完整出场策略评估卖出，全部按【触发时的实时价】成交，逐笔落盘复盘。
 
 出场策略（先触发先走，缺某项数据即跳过该项、绝不误卖）：
@@ -11,7 +11,8 @@
   3. 移动止盈   last <= peak - k*ATR（吊灯，k=3.0）     → 回撤保护，随高点上移
   4. 破位       last < vwap*(1 - vwap_break)（默认 -2%） → 跌破日内均价走弱
   5. 时间上限   持有达 T+sell_horizon（默认 T+1）        → 最终兜底，恒可用
-排序主序仍 = 模型 expected_return（ridge_pred），盘中信号只做出场择时、不造新 alpha。
+排序主序 = 盘中重排后 score（RerankScorer：模型 expected_return 锚定 + 盘中有界微调），
+候选池恒 = 模型 Top-N 池，盘中信号只做择时/择序/出场，不造新 alpha。
 
 设计原则（与 strategy/RankBoard 一致）：
   - 只读 ctx 内存态（最新快照 + VWAP + ref），绝不碰 quant_data。
@@ -33,6 +34,7 @@ from typing import Optional
 
 from .notifier import Notifier
 from .reference import _trading_days_between
+from .rerank import RerankScorer
 from .strategy import StrategyContext, _digits
 
 
@@ -67,6 +69,11 @@ class PaperTrader:
         self._take_profit = float(getattr(cfg, "paper_take_profit", 0.09))
         self._trail_k = float(getattr(cfg, "paper_trail_k", 3.0))
         self._vwap_break = float(getattr(cfg, "paper_vwap_break", 0.02))
+        # 买入择时过滤阈值（方向2；0 即关闭该项）。
+        self._entry_gap_eaten = float(getattr(cfg, "paper_entry_gap_eaten", 0.6))
+        self._entry_rich = float(getattr(cfg, "paper_entry_rich", 0.01))
+        self._entry_ask_strong = float(getattr(cfg, "paper_entry_ask_strong", 0.2))
+        self._scorer = RerankScorer(cfg, ctx)  # 与 RankBoard 共用的盘中重排打分器
         self._state_file = Path(getattr(cfg, "paper_state_file", "")
                                 or (Path(getattr(cfg, "ledger_dir", ".")) / "paper_state.json"))
         self._trades_file = self._state_file.with_name("paper_trades.jsonl")
@@ -237,7 +244,7 @@ class PaperTrader:
                 "code": pos["code"], "name": self._name_map.get(_digits(pos["code"]), ""),
                 "buy_date": pos.get("buy_date"), "buy_price": pos["buy_price"],
                 "sell_date": _today(), "sell_price": round(px, 3), "held_days": held,
-                "exit_reason": reason, "peak": pos.get("peak"),
+                "exit_reason": reason, "peak": pos.get("peak"), "exp": pos.get("exp"),
                 "shares": pos["shares"], "pnl": round(pnl, 2), "return": round(ret, 4),
                 "equity_after": round(self._equity(), 2),
             })
@@ -249,7 +256,7 @@ class PaperTrader:
             self._save_state()
 
     def _run_buys(self) -> None:
-        """当日尚未建仓则按模型 expected_return>0 降序买 Top-N，均分现金。"""
+        """当日尚未建仓则按【重排后 score】降序买 Top-N，买前过滤追高票，均分现金。"""
         if self._state.get("last_buy_date") == _today():
             return
         held_codes = {_digits(p["code"]) for p in self._state.get("positions", [])}
@@ -258,10 +265,15 @@ class PaperTrader:
             self._state["last_buy_date"] = _today()  # 无候选也标记，避免反复重算
             self._save_state()
             return
-        picks = ranked[: self._buy_n]
         alloc = self._state.get("cash", 0.0) / self._buy_n  # 按目标只数均分（留现金给不足的腿）
         bought: list[str] = []
-        for code, exp, px in picks:
+        for code, exp, px in ranked:
+            if len(bought) >= self._buy_n:
+                break
+            skip = self._entry_skip(code, exp, px)  # 入场择时过滤：追高/偏贵/卖盘强则跳过
+            if skip:
+                print(f"[paper] 跳过追高候选 {code}：{skip}", flush=True)
+                continue
             budget = min(alloc, self._state.get("cash", 0.0))
             shares = int(budget / (px * (1 + self._cost / 2.0)) // 100) * 100  # A股整百手
             if shares <= 0:
@@ -284,6 +296,32 @@ class PaperTrader:
                 "\n".join(f"{'①②③④⑤'[i] if i < 5 else i + 1} {b}"
                           for i, b in enumerate(bought)) + f"\n{self.summary()}")
 
+    def _entry_skip(self, code: str, exp: float, px: float) -> Optional[str]:
+        """买入择时过滤：命中任一追高信号则返回原因串（跳过该票），否则 None。
+
+        缺某项数据即不拦（不误跳）。全 env 可关（阈值设 0）。
+        """
+        snap = self._ctx.snapshot_of(code)
+        # 1) 高开已吃掉模型预期太多 → 追高
+        if self._entry_gap_eaten > 0 and snap is not None and exp and exp > 0:
+            open_px = getattr(snap, "open", None)
+            pre_close = getattr(snap, "pre_close", None)
+            if open_px and pre_close:
+                eaten = (open_px / pre_close - 1.0) / exp
+                if eaten >= self._entry_gap_eaten:
+                    return f"高开已吃预期{eaten:.0%}"
+        # 2) 现价高于 VWAP 太多 → 偏贵
+        if self._entry_rich > 0:
+            vwap = self._ctx.vwap_of(code)
+            if vwap and vwap > 0 and px > vwap * (1 + self._entry_rich):
+                return f"高于VWAP{(px / vwap - 1):.1%}"
+        # 3) 卖盘明显强 → 抛压大
+        if self._entry_ask_strong > 0 and snap is not None:
+            imb = getattr(snap, "bid_ask_imbalance", None)
+            if imb is not None and imb <= -self._entry_ask_strong:
+                return f"卖盘强{imb:.2f}"
+        return None
+
     def _exp_str(self, code: str, exp: float) -> str:
         """展示用预期字符串：优先历史校准值 + 胜率，缺校准回退原始 ridge_pred。"""
         r = self._ctx.ref_of(code) or self._ctx.ref_of(_digits(code))
@@ -295,29 +333,15 @@ class PaperTrader:
         return f"预期{exp:+.1%}"
 
     def _rank(self, exclude: Optional[set] = None) -> list:
-        """取 expected_return>0 且有实时价、未封涨停、不在持仓的票，按预期降序。
+        """按【重排后 score】降序返回可买候选 [(code, exp, price)]。
 
-        返回 [(code, exp, price)]。排序主序恒为原始 ridge_pred（expected_return）。
-        封涨停（is_limit_up）14:50 买不进，跳过。
+        候选池 = 模型 expected_return>0 的 Top-rank_pool_n，经 RerankScorer 盘中微调
+        （模型分锚定 + 盘中有界纠偏），并要求有实时价、剔除封涨停、排除已持仓。
+        返回三元组兼容 _run_buys；exp 恒为原始 ridge_pred（记账/展示用）。
         """
-        exclude = exclude or set()
-        ref = self._ctx.all_refs() or {}
-        rows: list = []
-        for code, r in ref.items():
-            if _digits(code) in exclude:
-                continue
-            exp = getattr(r, "expected_return", None)
-            if exp is None or exp <= 0:
-                continue
-            snap = self._ctx.snapshot_of(code)
-            px = self._price_of(code)
-            if px is None:  # 无实时价，买不了
-                continue
-            if snap is not None and getattr(snap, "is_limit_up", False):
-                continue  # 封涨停买不进
-            rows.append((code, float(exp), px))
-        rows.sort(key=lambda kv: kv[1], reverse=True)
-        return rows
+        rows = self._scorer.ranked(exclude=exclude or set(),
+                                   require_price=True, drop_limit_up=True)
+        return [(r.code, r.exp, r.px) for r in rows]
 
     @staticmethod
     def _parse_date(txt) -> Optional[_dt.date]:

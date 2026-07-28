@@ -54,12 +54,24 @@ def _parse_notify_kinds() -> frozenset:
     return frozenset(k.strip() for k in raw.replace("，", ",").split(",") if k.strip())
 
 
-def _default_env_file() -> Path:
-    """凭证 env 文件默认路径：与账本同在 logs/realtime（容器已挂载 + git 排除）。
+def _realtime_dir() -> Path:
+    """实时态持久目录：项目根 /logs/realtime。
 
-    放在这里而非 /app 下，是为了不让密钥文件混进代码仓库（logs/ 已被 git 忽略）。
+    必须基于 _qconfig._ROOT（= 项目根，容器内 /app）而非 QUANT_DIR.parent：
+    容器里 QUANT_DATA_DIR 指到子目录 /app/quant_data/full_a_2018_wide，其 .parent
+    是 /app/quant_data（非挂载层，rebuild 即失），只有 _ROOT/logs（= /app/logs，
+    docker 挂载 /www/A/logs）才是持久盘。notify.env / paper_state / 账本全落这里，
+    才能扛住 rebuild。本地无 QUANT_DATA_DIR 时 _ROOT 即项目根，行为不变。
     """
-    return Path(_qconfig.QUANT_DIR).parent / "logs" / "realtime" / "notify.env"
+    return Path(_qconfig._ROOT) / "logs" / "realtime"
+
+
+def _default_env_file() -> Path:
+    """凭证 env 文件默认路径：与账本同在 logs/realtime（容器挂载盘 + git 排除）。
+
+    放在这里而非代码目录，是为了不让密钥文件混进代码仓库（logs/ 已被 git 忽略）。
+    """
+    return _realtime_dir() / "notify.env"
 
 
 def _load_env_file() -> None:
@@ -107,8 +119,7 @@ class RealtimeConfig:
     holdings_file: Path = field(
         default_factory=lambda: Path(
             os.environ.get("REALTIME_HOLDINGS_FILE",
-                           str(Path(_qconfig.QUANT_DIR).parent / "logs" / "realtime"
-                               / "realtime_holdings.txt"))))
+                           str(_realtime_dir() / "realtime_holdings.txt"))))
     # 兜底股票池文件（预测清单也缺失时用）。
     universe_file: Path = field(
         default_factory=lambda: Path(_qconfig.MAINBOARD_UNIVERSE_FILE))
@@ -125,6 +136,18 @@ class RealtimeConfig:
     rank_interval_sec: int = field(default_factory=lambda: _env_int("REALTIME_RANK_INTERVAL", 300))
     rank_top_n: int = field(default_factory=lambda: _env_int("REALTIME_RANK_TOP_N", 5))
 
+    # ---- 盘中动态重排（RerankScorer，RankBoard + PaperTrader 共用）----------
+    # 候选池恒 = 模型 expected_return>0 的 Top-rank_pool_n（重排作用域，绝不拉池外票）；
+    # score = exp*(1+clamp(adj,±rerank_cap))：模型分为主序，盘中信号只在 ±cap 内微调名次。
+    # 分项权重（VWAP位置/买卖失衡/高开吃预期/盘口价差）全 env 可调；关闭则退化纯模型序。
+    rerank_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_RERANK", True))
+    rank_pool_n: int = field(default_factory=lambda: _env_int("REALTIME_RANK_POOL_N", 30))
+    rerank_cap: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_CAP", 0.30))
+    rerank_w_vwap: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_W_VWAP", 0.35))
+    rerank_w_imb: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_W_IMB", 0.30))
+    rerank_w_gap: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_W_GAP", 0.20))
+    rerank_w_spread: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_W_SPREAD", 0.15))
+
     # ---- 实时模拟盘（PaperTrader）------------------------------------------
     # 收盘前 paper_buy_start(默认1450)按模型 expected_return>0 降序买 Top-N(实时价成交)，
     # 持有到 T+sell_horizon 到期卖出，落 logs/realtime/paper_state.json + paper_trades.jsonl。
@@ -136,14 +159,18 @@ class RealtimeConfig:
     paper_state_file: Path = field(
         default_factory=lambda: Path(
             os.environ.get("REALTIME_PAPER_STATE_FILE",
-                           str(Path(_qconfig.QUANT_DIR).parent / "logs" / "realtime"
-                               / "paper_state.json"))))
+                           str(_realtime_dir() / "paper_state.json"))))
     # 出场策略（先触发先走）：硬止损 / 止盈上限 / 移动止盈(ATR吊灯) / 破位(跌破VWAP) / T+N时间上限。
     # 卖出腿全交易时段每轮评估；买入腿仍只在收盘前窗口。全 env 可调，实盘复盘后按流水再调。
     paper_stop_loss: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_STOP_LOSS", 0.05))
     paper_take_profit: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_TAKE_PROFIT", 0.09))
     paper_trail_k: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_TRAIL_K", 3.0))
     paper_vwap_break: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_VWAP_BREAK", 0.02))
+    # 买入择时过滤（方向2）：买入腿按重排后 score 降序取 Top-N，买前逐票查以下项，命中即跳过（顺延下一名）。
+    # 全 env 可关（设 0 即不过滤该项）；全部候选被过滤则当日不建仓。
+    paper_entry_gap_eaten: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_GAP_EATEN", 0.6))
+    paper_entry_rich: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_RICH", 0.01))
+    paper_entry_ask_strong: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_ASK_STRONG", 0.2))
 
     # ---- 预期收益历史校准（Top-N 展示重标定）------------------------------
     # ridge_pred 强正则收缩偏保守，按历史同档实际兑现(target_ret_{h}d)重标定展示值 + 胜率。
@@ -154,8 +181,7 @@ class RealtimeConfig:
     # ---- 账本 ----------------------------------------------------------------
     ledger_dir: Path = field(
         default_factory=lambda: Path(
-            os.environ.get("REALTIME_LEDGER_DIR",
-                           str(Path(_qconfig.QUANT_DIR).parent / "logs" / "realtime"))))
+            os.environ.get("REALTIME_LEDGER_DIR", str(_realtime_dir()))))
 
     # ---- 推送（Bark / Server酱 / PushDeer）---------------------------------
     bark_key: str = field(default_factory=lambda: os.environ.get("BARK_KEY", "").strip())
