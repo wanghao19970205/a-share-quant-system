@@ -233,18 +233,39 @@ sdk/AmazingData-1.1.7-cp312-none-any.whl
 
 ## 🧠 量化工作流
 
-生产总入口：
+> ⚠️ **务必在容器内执行**：pandas / lightgbm 等量化依赖只装在 `stock-scheduler` 镜像里（Python 3.12）。
+> 宿主机的系统 Python 没有这些包，直接跑会报 `ModuleNotFoundError: No module named 'pandas'`。
+
+**生产总入口**（查看全部参数）：
 
 ```bash
-python -m quant.scheduled_workflow --help
+# ✅ 容器内执行（-it 交互查看帮助）
+docker exec -it a-scheduler-1 sh -lc 'cd /app && PYTHONPATH=/app python -m quant.scheduled_workflow --help'
+
+# ❌ 不要在宿主机直接跑 python -m quant.scheduled_workflow —— 宿主机无 pandas
+```
+
+**日常无需直接调它**——`docker/scheduler_jobs.sh` 已把各任务的参数组合封装好，用 `restart.sh` 触发即可：
+
+```bash
+./restart.sh run daily-light      # = scheduled_workflow incumbent-refresh（快速日更）
+./restart.sh run weekly-full      # 完整周更
+./restart.sh run intraday-light   # 盘中轻量刷新
 ```
 
 **两种策略模式**：
 
 | 模式 | 用途 |
 |---|---|
-| `incumbent-refresh` | 用当前生产参数刷新最新滚动窗口、发布 active 预测（日常） |
-| `candidate-upgrade` | 选择期选参 + 留出期验证，**过晋级门槛才允许升级**（审计） |
+| `incumbent-refresh` | 用当前生产参数刷新最新滚动窗口、发布 active 预测（日常，`daily-light`/`weekly-full` 走它） |
+| `candidate-upgrade` | 选择期选参 + 留出期验证，**过晋级门槛才允许升级**（审计，`monthly-factor` 走它） |
+
+**手动跑一次完整日更**（等价 `./restart.sh run daily-light`，展开为容器内命令）：
+
+```bash
+docker exec -d a-scheduler-1 /app/docker/scheduler_jobs.sh daily-light
+# 看进度：./restart.sh logs scheduler   或   docker exec a-scheduler-1 tail -f /app/logs/daily-light.out.log
+```
 
 **训练特性**：walk-forward 分窗训练，带 PIT 边界、标签 purge、窗口缓存、原子发布。生产模型默认融合 Ridge + LightGBM Ranker + ElasticNet + ExtraTrees。CatBoost 等候选模型须先作为**影子模型**通过独立 RankIC / 相关性 / 留出期收益 / 稳定性评估，才考虑接入生产。
 
@@ -271,20 +292,24 @@ python -m quant.scheduled_workflow --help
 
 ## 🧪 测试
 
+> 同样**需在容器内跑**（依赖 pandas 等）。宿主机直接跑会 `ModuleNotFoundError`。
+
 ```bash
 # 单元测试（按包名运行，避免 quant/select.py 与标准库 select 冲突）
-python3 -m unittest \
+docker exec -it a-scheduler-1 sh -lc 'cd /app && PYTHONPATH=/app python -m unittest \
   quant.test_model_expansion_experiment \
   quant.test_sentiment_ablation_experiment \
   quant.test_sentiment_feature_experiment \
   stock_analyzer.test_candidate_eval \
-  stock_analyzer.test_top10_eval
+  stock_analyzer.test_top10_eval'
 
 # 核心模块编译检查
-python3 -m py_compile \
+docker exec -it a-scheduler-1 sh -lc 'cd /app && python -m py_compile \
   quant/model.py quant/full_train_batched.py \
-  quant/scheduled_workflow.py stock_analyzer/candidate_eval.py
+  quant/scheduled_workflow.py stock_analyzer/candidate_eval.py'
 ```
+
+> 若在**宿主机**做纯本地开发（非容器），需先 `pip install -r requirements-scheduler.txt` 装齐依赖，且宿主机 Python 版本需与镜像一致（3.12）方能完全对齐。
 
 ---
 
