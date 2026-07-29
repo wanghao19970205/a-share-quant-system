@@ -8,6 +8,10 @@ PATH=/usr/local/bin:/usr/bin:/bin
 # 引擎自身按时段管理（<9:25 休眠、11:32-13:00 静默、>15:05 自动退出），收盘即自然结束当日进程。
 # 幂等：job 内先扫 /proc 防重复拉起（cron 若因补跑重复触发不会起第二个 engine）。
 20 9 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh realtime
+# watchdog：交易时段每 10 分钟自愈——引擎活着则 job 内 /proc 扫描自动 SKIP(零副作用)，
+# 死了(如被 10:30/13:30 盘中重训 OOM 挤爆)则 10 分钟内自动重拉，赶在 14:50 买入窗前恢复。
+# 分钟取 :05/:15/.../:55 错开 :20，避免与上面 09:20 首拉同刻并发起双引擎(抢券商连接+双推送)。
+5-59/10 9,10,11,13,14 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh realtime
 # 心跳：每 10 分钟写一行到中心日志，用于确认 cron 调度存活。
 # 若某天任务没跑：有心跳=cron活着(任务条目/执行有问题)；无心跳=cron本身没在调度。
 */10 * * * * root date '+\%Y-\%m-\%d \%H:\%M:\%S cron-heartbeat' >> /app/logs/cron.log 2>&1
@@ -32,7 +36,9 @@ PATH=/usr/local/bin:/usr/bin:/bin
 40 16 * * * root /app/docker/scheduler_jobs.sh news-daily
 # 每10分钟：Qwen 实时结构化标注历史新闻（20 条/轮，内容哈希幂等、可断点续跑）。
 # 与日更最新新闻标注分开：该任务按历史待标注顺序逐步回溯，不影响 16:40->17:00 快照链路。
-# [停用 2026-07-28] 舆情判负,每10分钟Qwen标注是最大token漏斗,停用(UI即时news.analyze不受影响)
+# [停用 2026-07-28] 舆情/新闻因子经 ablation 判负(sentiment-factor-ablation-negative)，enabled=False
+#   不进综合分、不改选股，而此任务每 10 分钟走 Qwen 批量标注是最大 LLM token 漏斗 → 停。
+#   UI 点开个股的即时 news.analyze 是用户触发、不吃 cron，照常工作，不受此停用影响。
 # */10 * * * * root /app/docker/scheduler_jobs.sh news-annotation
 # 每周日 00:30：刷新全 A 东财行业/概念板块映射；失败板块沿用上次成功快照
 30 0 * * 0 root /app/docker/scheduler_jobs.sh all-a-meta
@@ -40,3 +46,4 @@ PATH=/usr/local/bin:/usr/bin:/bin
 30 2 * * 0 root [ "$(date '+\%d')" -le 7 ] && /app/docker/scheduler_jobs.sh sentiment-model
 # 每天 03:10：日志清理，超过阈值大小的 .log 仅保留末尾若干行，避免无限增长
 10 3 * * * root /app/docker/scheduler_jobs.sh rotate
+
