@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -47,7 +48,7 @@ def main() -> int:
 
     from realtime.config import load
     from realtime.snapshot import Snapshot, from_mapping
-    from realtime.strategy import (LimitMoveWatch, SurgeWatch, VolumeSurge,
+    from realtime.strategy import (LimitMoveWatch, Signal, SurgeWatch, VolumeSurge,
                                     VWAPDeviation, ChandelierStop, GapCalibrate,
                                     HoldingExpiry, StrategyContext, default_strategies)
     from realtime.reference import RefRow
@@ -82,7 +83,9 @@ def main() -> int:
                           bid_price1=10.99, ask_price1=11.0,
                           bid_volume1=500, ask_volume1=0)
     eng._on_snapshot(limit_snap)  # noqa: SLF001 - 自测直连内部处理链
-    time.sleep(0.1)
+    if not eng._drain_effects(timeout=1.0):  # noqa: SLF001
+        _fail("信号副作用队列未在 1 秒内排空")
+        errors += 1
 
     files = list(tmp.glob("signals_*.jsonl"))
     if not files:
@@ -97,6 +100,40 @@ def main() -> int:
         else:
             _fail(f"未产出 limit_up 信号，账本内容={recs}")
             errors += 1
+    eng._shutdown_effect_dispatcher("自测")  # noqa: SLF001
+
+    # 5a) 慢通知必须脱离行情回调，且通知完成后仍按顺序记账。
+    gate = threading.Event()
+    started = threading.Event()
+    recorded: list[tuple[str, bool]] = []
+
+    class _SlowNotifier:
+        def notify(self, sig: Signal) -> bool:
+            started.set()
+            gate.wait(timeout=1.0)
+            return True
+
+    class _CaptureLedger:
+        def record(self, sig: Signal, notified: bool) -> None:
+            recorded.append((sig.kind, notified))
+
+    async_eng = Engine(cfg, strategies=[LimitMoveWatch()])
+    async_eng._notifier = _SlowNotifier()  # noqa: SLF001
+    async_eng._ledger = _CaptureLedger()  # noqa: SLF001
+    begin = time.monotonic()
+    async_eng._on_snapshot(limit_snap)  # noqa: SLF001
+    callback_elapsed = time.monotonic() - begin
+    worker_started = started.wait(timeout=0.5)
+    not_blocked = callback_elapsed < 0.1 and worker_started and not recorded
+    gate.set()
+    drained = async_eng._drain_effects(timeout=1.0)  # noqa: SLF001
+    async_eng._shutdown_effect_dispatcher("异步自测")  # noqa: SLF001
+    if not_blocked and drained and recorded == [("limit_up", True)]:
+        _ok(f"慢通知已脱离行情回调（callback={callback_elapsed:.4f}s）")
+    else:
+        _fail(f"异步副作用异常：callback={callback_elapsed:.4f}s "
+              f"started={worker_started} drained={drained} recorded={recorded}")
+        errors += 1
 
     # 5b) 各实时策略单测：构造能触发的快照序列，验证 kind 产出
     def _check(label: str, kinds: list, want: str) -> int:

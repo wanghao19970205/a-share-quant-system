@@ -27,6 +27,7 @@ class RefRow:
     calibrated_net_return: Optional[float] = None  # 按模拟盘成交成本扣费后的历史净收益
     win_rate: Optional[float] = None     # 该分档历史 (target>0) 胜率（仅展示用）
     hold_days: Optional[int] = None      # 已持有交易日数（仅持仓票有值；供 HoldingExpiry）
+    prediction_date: Optional[str] = None  # 当前 expected_return 对应预测日期（YYYY-MM-DD）
 
 
 def net_return_after_cost(gross_return: float, roundtrip_cost: float) -> float:
@@ -102,8 +103,8 @@ def _load_atr_map(cfg: RealtimeConfig, codes: list[str]) -> dict[str, tuple]:
     return out
 
 
-def _load_expected_return(cfg: RealtimeConfig) -> dict[str, float]:
-    """从最新一期预测取每票预期收益，只认 ridge_pred（Ridge 对未来收益率的回归预测，有量纲小数）。
+def _load_expected_return(cfg: RealtimeConfig) -> tuple[dict[str, float], Optional[str]]:
+    """从最新一期预测取每票预期收益和预测日期，只认 ridge_pred。
 
     注意：绝不退回融合分 `pred`。`pred` 是各腿 z-score 的加权排序分（无量纲），
     与「预期收益率」量纲不同；GapCalibrate 用 expected_return 算 gap/exp 与判 exp<=0，
@@ -112,24 +113,28 @@ def _load_expected_return(cfg: RealtimeConfig) -> dict[str, float]:
     """
     path = cfg.predictions_file
     if not path.exists():
-        return {}
+        return {}, None
     try:
         import pandas as pd
     except Exception:  # noqa: BLE001
-        return {}
+        return {}, None
     try:
         df = pd.read_parquet(path, columns=["code", "date", "ridge_pred"])
     except Exception:  # noqa: BLE001
-        # 列裁剪失败（老/变体文件无 ridge_pred 列）→ 退回读全表，但仍只认 ridge_pred。
+        # 列裁剪失败（老/变体文件无 ridge_pred/date 列）→ 退回读全表，仍只认 ridge_pred。
         try:
             df = pd.read_parquet(path)
         except Exception:  # noqa: BLE001
-            return {}
+            return {}, None
     if "code" not in df.columns or "ridge_pred" not in df.columns:
-        return {}
+        return {}, None
+    prediction_date = None
     if "date" in df.columns:
         d = pd.to_datetime(df["date"], errors="coerce")
-        df = df[d == d.max()]
+        latest = d.max()
+        if latest == latest:
+            prediction_date = latest.strftime("%Y-%m-%d")
+            df = df[d == latest]
     out: dict[str, float] = {}
     for code, val in zip(df["code"].astype(str).str.zfill(6), df["ridge_pred"]):
         try:
@@ -138,7 +143,7 @@ def _load_expected_return(cfg: RealtimeConfig) -> dict[str, float]:
             continue
         if f == f:  # not NaN
             out[code] = f
-    return out
+    return out, prediction_date
 
 
 def _load_hold_days(cfg: RealtimeConfig) -> dict[str, int]:
@@ -299,7 +304,7 @@ def _build_calibration(cfg: RealtimeConfig):
 def build(cfg: RealtimeConfig, codes: list[str]) -> dict[str, RefRow]:
     """构建 {code: RefRow}。任何来源缺失都优雅返回可用子集，不抛异常。"""
     atr_map = _load_atr_map(cfg, codes)
-    ret_map = _load_expected_return(cfg)
+    ret_map, prediction_date = _load_expected_return(cfg)
     hold_map = _load_hold_days(cfg)
     calib = None
     try:
@@ -318,5 +323,6 @@ def build(cfg: RealtimeConfig, codes: list[str]) -> dict[str, RefRow]:
         ref[code] = RefRow(atr=atr, atr_pct=atr_pct,
                            expected_return=exp,
                            calibrated_return=cal, calibrated_net_return=net,
-                           win_rate=wr, hold_days=hold_map.get(code))
+                           win_rate=wr, hold_days=hold_map.get(code),
+                           prediction_date=prediction_date)
     return ref

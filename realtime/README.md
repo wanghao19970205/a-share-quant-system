@@ -167,6 +167,17 @@ REALTIME_PAPER_VWAP_BREAK=0.02
 
 信号策略负责账本和通知，不直接替代 `PaperTrader` 的成交判断。
 
+### V1-V4 赛马总览
+
+| 版本 | 买卖成交价 | 入场增强 | 出场与风险 | 独立文件 |
+|---|---|---|---|---|
+| **V1** | `last / last` | 模型池 + 盘中重排 | 固定止损止盈、ATR吊灯、VWAP破位、T+N | 无后缀 |
+| **V2** | `last / last` | V1 + 动态资金与持仓上限 | 保护止盈、炸板、跌停顺延、时间加权止盈 | `_v2` |
+| **V3** | `ask1 / bid1` | 当日预测、新鲜度、盘口确认 | 入场锁定ATR、硬止损/止盈/移动止盈、T+N | `_v3` |
+| **V4** | `ask1 / bid1` | V3 + 精确主行业ETF弱势回避 | 完整继承V3，暂不叠加板块卖出 | `_v4` |
+
+四个账户共享模型候选池和交易成本，任一版本装配或交易异常均独立降级，不影响其他版本。比较时不能只看绝对净值，应联合成本后收益、最大回撤、可成交率、过滤率、执行滑点和退出后反事实。
+
 ## 8.1 V2 赛马账户
 
 `realtime/v2.py` 的 `V2PaperTrader` 与 V1 在同一引擎内并行，共享 ctx、模型候选池和通知通道，但账户状态、流水和审计写入 `_v2` 独立副本。V1 现役策略不受任何影响。
@@ -195,7 +206,61 @@ REALTIME_PAPER_TAKE_PROFIT_TIGHTEN=0.03
 REALTIME_PAPER_LIMIT_DOWN_ROLL_MAX=3
 ```
 
-两个账户的持仓都进入保护性订阅，`config.paper_state_files()` 是订阅清单与热重载的统一口径。V2 装配异常会降级跳过并保留 V1 运行。
+V1/V2 的持仓都进入保护性订阅。V2 装配异常会降级跳过并保留 V1 运行。
+
+## 8.2 V3 赛马账户
+
+V3 与 V1/V2 并行运行，使用独立的 `_v3` 状态、流水、买入决策和卖出反事实文件。候选池、初始资金、交易成本、动态资金分配、买入窗口、持仓上限和 T+1 口径与 V2 一致，只测试两组可归因变化。
+
+买入规则：
+
+1. 最新预测日期必须是当日，旧预测只允许管理已有持仓，不建立新仓。
+2. 本进程收到行情快照的时间不超过 `paper_v3_quote_max_age_sec`。
+3. 买一、卖一和一档挂单量必须有效，买一挂单量不低于卖一挂单量。
+4. 保留 V2 的 VWAP 偏贵和宽价差过滤，命中后向下顺延候选。
+5. 按卖一价 `ask1` 买入，不再按最新成交价 `last` 假设成交。
+
+卖出规则：
+
+1. T+0 始终禁止卖出。
+2. 无有效买一、买一量为零或行情过期时保留持仓并记录阻塞；跌停价仍有买一承接时允许按 `bid1` 卖出。
+3. 按买入时锁定的 ATR 风险单位退出：跌破入场价 `2ATR` 止损；上涨 `4ATR` 止盈；盈利达到 `2ATR` 后从最高有效买一价回撤 `2ATR` 移动止盈。
+4. ATR 缺失时只保留 T+N 到期退出，不混入固定百分比阈值。
+5. 所有卖出按买一价 `bid1` 结算。
+
+关键参数：
+
+```text
+REALTIME_PAPER_V3=true
+REALTIME_PAPER_V3_QUOTE_MAX_AGE_SEC=90
+REALTIME_PAPER_V3_ATR_K=2.0
+```
+
+V3 使用更保守的可成交报价，绝对净值可能低于按 `last` 结算的 V1/V2。赛马应联合比较成本后收益、最大回撤、可成交率、卖出阻塞、滑点和退出后反事实，不能只按净值高低晋级。
+
+## 8.3 V4 赛马账户
+
+V4 完整继承 V3 的候选池、当日预测、盘口确认、`ask1/bid1` 成交、T+1 和 ATR 出场，使用独立 `_v4` 文件。第一版只增加一个策略变量：读取本地 `all_a_stock_meta.parquet` 的申万三级主行业 `a_industry`，按版本化精确表映射行业 ETF，并用其相对沪深300 ETF 的当日收益确认入场环境。`a_industries` 只进审计，不参与匹配；概念和模糊关键词均不参与。
+
+- 映射必须为 `exact_primary` 且置信度不低于 `0.8`，同时 `行业ETF收益 - 沪深300ETF收益 <= -0.3%` 时才判为弱势并拒绝候选；
+- 强势和中性均按 V3 原规则处理，不加仓、不改排序、不改卖点；
+- 个股未映射、ETF或基准行情缺失/超过90秒时标记 `unavailable` 并放行，数据故障不当作利空；
+- ETF 与个股使用同一个 `SubscribeData` 登录会话，完整保留 `.SH/.SZ` 后缀；ETF回调只进入板块上下文，不进入个股策略；
+- ETF强弱状态切换写入 `signals_YYYYMMDD.jsonl`，V4买入审计记录映射版本、来源、置信度、主行业、完整行业层级、ETF、基准、超额收益、行情年龄和过滤原因。
+
+默认精确覆盖半导体、证券、银行、医药、军工、锂电/新能源车、光伏、有色、食品饮料、计算机和通信的指定申万三级行业。可用 `REALTIME_SECTOR_ETFS` 按 `名称=完整ETF代码:精确主行业1|精确主行业2;...` 覆盖；同一主行业出现多次时冲突项会被拒绝，防止配置顺序决定归属。关键参数：
+
+```text
+REALTIME_PAPER_V4=true
+REALTIME_SECTOR_ETF=true
+REALTIME_SECTOR_ETF_BENCHMARK=510300.SH
+REALTIME_SECTOR_ETF_QUOTE_MAX_AGE_SEC=90
+REALTIME_PAPER_V4_SECTOR_WEAK_EXCESS=-0.003
+REALTIME_PAPER_V4_SECTOR_STRONG_EXCESS=0.003
+REALTIME_PAPER_V4_SECTOR_MAPPING_MIN_CONFIDENCE=0.8
+```
+
+V1/V2/V3/V4 的持仓都由 `config.paper_state_files()` 纳入保护性订阅和热重载。V3 对 V4 的主要差异为“是否回避相对弱势行业”，赛马时应重点比较 V4 过滤候选的后续收益反事实、交易覆盖率和回撤。
 
 ## 9. 持久化与决策审计
 
@@ -208,7 +273,9 @@ REALTIME_PAPER_LIMIT_DOWN_ROLL_MAX=3
 | `paper_buy_decisions.jsonl` | 每日模型池、重排、过滤和成交快照 |
 | `paper_sell_counterfactuals.jsonl` | 卖出日及后续 3 个交易日反事实 |
 | `paper_*_v2.json(l)` | V2 赛马账户的同名独立副本 |
-| `signals_YYYYMMDD.jsonl` | 实时信号账本 |
+| `paper_*_v3.json(l)` | V3 可成交报价与 ATR 规则账户的同名独立副本 |
+| `paper_*_v4.json(l)` | V4 行业ETF弱势回避账户的同名独立副本 |
+| `signals_YYYYMMDD.jsonl` | 实时信号账本（含ETF强弱状态切换） |
 | `engine.YYYYMMDD.log` | 引擎运行日志 |
 
 买入决策审计记录：
@@ -220,9 +287,31 @@ REALTIME_PAPER_LIMIT_DOWN_ROLL_MAX=3
 - 入场过滤、未进入 Top2、资金不足或实际成交；
 - 成交股数、价格、成本和账户前后状态。
 
+### 零成交也是有效样本
+
+买入窗口正常执行但没有成交时，各版本仍会写入每日唯一的决策事件。`decision_status` 用于区分：
+
+| 状态 | 含义 |
+|---|---|
+| `bought` / `partial_fill` | 完成全部或部分目标建仓 |
+| `all_candidates_filtered` | 有可排名候选，但全部被盘口、预测或板块规则过滤 |
+| `no_ranked_candidate` | 模型池、涨停或成本后净收益门之后没有候选 |
+| `insufficient_cash_or_lot` | 候选有效，但现金或整手约束无法成交 |
+
+因此赛马的有效样本包括“成交结果”和“过滤反事实”两部分。若零成交日没有对应版本的 `paper_buy_decisions*.jsonl` 事件，才应判断为运行或审计链路异常。
+
 卖出反事实按稳定 `trade_id` 幂等更新，记录 sell-day、D+1、D+2、D+3 的收盘价、最高价、继续持有收益和机会损益。日线尚未到达时保留空 markout，后续引擎启动自动补齐。
 
 审计写入使用文件锁、临时文件、`fsync` 和原子替换。审计失败只写日志，不阻断交易。
+
+策略信号的 HTTP 通知和 `signals_YYYYMMDD.jsonl` 记账由单消费者按 FIFO 顺序异步执行，行情回调只做状态更新、策略计算和非阻塞入队。默认队列容量为 1000，退出时最多等待 3 秒排空：
+
+```text
+REALTIME_EFFECT_QUEUE_SIZE=1000
+REALTIME_EFFECT_SHUTDOWN_GRACE_SEC=3
+```
+
+心跳中的 `effects_pending`、`effects_done`、`effects_dropped` 分别表示待处理、已处理和因队列满而丢弃的副作用任务。`effects_dropped` 非零通常表示通知服务持续超时，需要先检查推送通道，再决定是否调整队列容量。
 
 ## 10. 运行与验证
 
@@ -246,7 +335,19 @@ bash run_sim_streams.sh
 docker compose exec -T scheduler python -c "from realtime.config import load; c=load(); print(c.paper_time_cap_start, c.paper_buy_start, c.sell_horizon, c.paper_cost)"
 ```
 
-当前虚拟数据流覆盖：模型池封闭、重排有界、A 股 T+1、五级卖出、保护性订阅、成本后净收益门、高开惩罚关闭、14:50 到期卖出、14:55 买入、决策 trace、反事实幂等补齐，以及 V2 的账户隔离、文件命名、跌停按日顺延、名额收缩和保护性止盈。
+### 每日盘后有效性核对
+
+| 检查项 | 正常标准 | 异常时的含义 |
+|---|---|---|
+| 当日预测 | 14:55前预测最大日期等于交易日 | V3/V4会记录 `预测非当日` 并拒绝新仓 |
+| 实时行情 | 14:55附近心跳 `active=True` 且 `recv` 持续增长 | 买入窗口可能未获得有效盘口 |
+| 四版决策 | 每版当日各有一个 `paper_buy_decision*` 事件 | 缺失版本未执行买入腿或审计写入失败 |
+| ETF行情 | `sector_recv > 0`，ETF强/中/弱分布可见 | V4标记 `sector_quote_unavailable` 并安全退化为V3 |
+| 异步副作用 | `effects_dropped=0` | 非零表示通知/账本队列持续拥塞 |
+
+`paper_state_v3.json` 和 `paper_state_v4.json` 在首次买入决策保存时才创建；仅在部署后、买入窗口前不存在不代表故障。排查零成交优先运行 `./restart.sh diag`，再查看对应版本决策事件，不应只检查成交流水。
+
+当前虚拟数据流回归为 **68 PASS / 0 FAIL**，覆盖模型池封闭、重排有界、A 股 T+1、五级卖出、保护性订阅、成本后净收益门、14:50 到期卖出、14:55 买入、决策 trace 和反事实幂等补齐；V2 的账户隔离、零成交审计、跌停顺延、名额收缩和保护性止盈；V3 的当日预测、新鲜度、`ask1/bid1` 成交、ATR 三类退出和跌停流动性；以及 V4 的完整ETF代码、精确主行业映射、置信度门控、相对弱势过滤、安全降级和独立审计。
 
 ## 11. 部署纪律
 
@@ -264,6 +365,8 @@ docker compose exec -T scheduler python -c "from realtime.config import load; c=
 
 - 模拟盘历史样本仍少，不能据此精确拟合止损、止盈、ATR 或 VWAP 阈值；
 - VWAP 位置已有离线正向证据，L1 imbalance 和 spread 仍需依靠买入决策审计做前向评估；
-- 模拟盘使用实时快照近似成交，未建模完整盘口冲击、排队和实际成交概率；
+- 模拟盘使用实时快照近似成交，未建模完整盘口冲击、排队和实际成交概率；V3 只确认一档报价与挂单方向，SDK 挂单量单位核实前不把一档容量当作完整成交深度；
+- V3/V4 新鲜度表示本进程最近收到回调的时间，`trade_time` 格式和时区经真实回调确认前，不能识别行情源重放旧时间戳的情况；
+- V4 的 ETF 是行业价格代理，不等于完整成分股广度；ETF折溢价、资金申赎和行业映射覆盖会产生跟踪误差，必须结合过滤反事实前向评估；
 - 日线反事实只能评估收盘和日内最高价，不能重建分钟级最优退出路径；
 - `notify.env` 含推送和行情凭证，只能存放在挂载盘，禁止提交到 git。

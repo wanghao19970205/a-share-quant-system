@@ -123,8 +123,8 @@ class RealtimeConfig:
     # 兜底股票池文件（预测清单也缺失时用）。
     universe_file: Path = field(
         default_factory=lambda: Path(_qconfig.MAINBOARD_UNIVERSE_FILE))
-    # 订阅上限（受券商 SubscribeLimitNum 约束）。Top10∪持仓 约 20~30 只远不触顶，
-    # 保留作安全上限：防清单异常退回全市场兜底池(数千只)时直接打爆券商上限。
+    # 本地订阅安全上限。账号不限制代码数，但总带宽上限为 2 MB；保留该阈值防名单异常
+    # 退回全市场时打满带宽。行业 ETF 在股票清单截断后另行加入同一 Push 会话。
     max_subscribe: int = field(default_factory=lambda: _env_int("REALTIME_MAX_SUBSCRIBE", 100))
     # 盘中订阅自动重载：检测到 mobile_snapshot.json / 持仓文件变化即 execv 重启换新名单。
     watchlist_reload: bool = field(default_factory=lambda: _env_bool("REALTIME_WATCHLIST_RELOAD", True))
@@ -194,6 +194,40 @@ class RealtimeConfig:
     paper_take_profit_tighten: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_TAKE_PROFIT_TIGHTEN", 0.03))
     paper_limit_down_roll_max: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_LIMIT_DOWN_ROLL_MAX", 3))
 
+    # ---- V3 模拟盘（执行确认 + ATR 自适应出场）-------------------------------
+    # 与 V2 共用模型池、资金分配、买窗和持仓上限；按 ask1/bid1 模拟可成交报价，
+    # 只使用当日预测和新鲜快照，卖出统一采用 ATR 风险单位。
+    paper_v3_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_V3", True))
+    paper_v3_quote_max_age_sec: float = field(
+        default_factory=lambda: max(
+            1.0, _env_float("REALTIME_PAPER_V3_QUOTE_MAX_AGE_SEC", 90.0)))
+    paper_v3_atr_k: float = field(
+        default_factory=lambda: max(0.1, _env_float("REALTIME_PAPER_V3_ATR_K", 2.0)))
+
+    # ---- V4 模拟盘（V3 + 行业 ETF 弱势回避）---------------------------------
+    # ETF 与个股复用同一 AmazingData Push 会话；ETF 快照只进入板块上下文，不进入个股策略。
+    # V4 第一版只过滤显著弱于沪深300 ETF 的行业，不改 V3 卖点/仓位，保持差异可归因。
+    paper_v4_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_V4", True))
+    sector_etf_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_SECTOR_ETF", True))
+    sector_etf_benchmark: str = field(
+        default_factory=lambda: os.environ.get("REALTIME_SECTOR_ETF_BENCHMARK", "510300.SH").strip().upper())
+    sector_etf_specs: str = field(
+        default_factory=lambda: os.environ.get("REALTIME_SECTOR_ETFS", "").strip())
+    sector_etf_quote_max_age_sec: float = field(
+        default_factory=lambda: max(
+            1.0, _env_float("REALTIME_SECTOR_ETF_QUOTE_MAX_AGE_SEC", 90.0)))
+    paper_v4_sector_weak_excess: float = field(
+        default_factory=lambda: _env_float("REALTIME_PAPER_V4_SECTOR_WEAK_EXCESS", -0.003))
+    paper_v4_sector_strong_excess: float = field(
+        default_factory=lambda: _env_float("REALTIME_PAPER_V4_SECTOR_STRONG_EXCESS", 0.003))
+    paper_v4_sector_mapping_min_confidence: float = field(
+        default_factory=lambda: min(1.0, max(
+            0.0, _env_float("REALTIME_PAPER_V4_SECTOR_MAPPING_MIN_CONFIDENCE", 0.8))))
+    sector_meta_file: Path = field(
+        default_factory=lambda: Path(os.environ.get(
+            "REALTIME_SECTOR_META_FILE", "") or
+            (Path(os.environ.get("SNAPSHOT_DIR", "snapshots")) / "all_a_stock_meta.parquet")))
+
     # ---- 预期收益历史校准（Top-N 展示重标定）------------------------------
     # ridge_pred 强正则收缩偏保守，按历史同档实际兑现(target_ret_{h}d)重标定展示值 + 胜率。
     # 只改展示、不改排序主序（排序仍按原始 ridge_pred）。样本不足/无 target 列则降级回退原始值。
@@ -230,17 +264,27 @@ class RealtimeConfig:
     # ---- 运行参数 ------------------------------------------------------------
     dry_run: bool = field(default_factory=lambda: _env_bool("REALTIME_DRY_RUN", False))
     heartbeat_sec: int = field(default_factory=lambda: _env_int("REALTIME_HEARTBEAT", 60))
+    # 策略信号先进入有界队列，再由单线程顺序执行通知与记账，避免网络 I/O 阻塞行情回调。
+    effect_queue_size: int = field(
+        default_factory=lambda: max(1, _env_int("REALTIME_EFFECT_QUEUE_SIZE", 1000)))
+    effect_shutdown_grace_sec: float = field(
+        default_factory=lambda: max(
+            0.0, _env_float("REALTIME_EFFECT_SHUTDOWN_GRACE_SEC", 3.0)))
 
     def ensure_dirs(self) -> None:
         """确保账本目录存在（推送/状态/审计均落在此目录）。"""
         self.ledger_dir.mkdir(parents=True, exist_ok=True)
 
     def paper_state_files(self) -> tuple[Path, ...]:
-        """全部模拟盘账户状态文件（V1 + 启用时的 V2）；供订阅保护与热重载统一取用。"""
+        """全部模拟盘账户状态文件；供订阅保护与热重载统一取用。"""
         base = Path(self.paper_state_file)
         files = [base]
         if getattr(self, "paper_v2_enabled", False):
             files.append(base.parent / f"{base.stem}_v2{base.suffix}")
+        if getattr(self, "paper_v3_enabled", False):
+            files.append(base.parent / f"{base.stem}_v3{base.suffix}")
+        if getattr(self, "paper_v4_enabled", False):
+            files.append(base.parent / f"{base.stem}_v4{base.suffix}")
         return tuple(files)
 
 

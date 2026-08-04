@@ -24,6 +24,12 @@ from .snapshot import Snapshot
 OnSnapshot = Callable[[Snapshot], None]
 
 
+def subscription_code(code: str, converter) -> str:
+    """保留 SDK 返回的完整代码；仅对旧的 6 位股票代码推断交易所。"""
+    value = str(code or "").strip().upper()
+    return value if "." in value else converter(value)
+
+
 class BaseFeed:
     def start(self) -> None:  # pragma: no cover - 接口
         raise NotImplementedError
@@ -103,7 +109,7 @@ class AmazingDataFeed(BaseFeed):
         ad.login(username=c["username"], password=c["password"],
                  host=c["host"], port=int(c["port"]))
 
-        broker_codes = [ads._to_broker_code(x) for x in self._codes]
+        broker_codes = [subscription_code(x, ads._to_broker_code) for x in self._codes]
         self._ad = ad
         sub = ad.SubscribeData()
         cb = self._cb

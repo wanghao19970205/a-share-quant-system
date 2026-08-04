@@ -118,6 +118,13 @@ class StrategyContext:
         st = self._state(code)
         return st.vwap if st is not None else None
 
+    def quote_age_of(self, code: str, now: Optional[float] = None) -> Optional[float]:
+        """距本进程收到该票最新快照的秒数；无快照则 None。"""
+        st = self._state(code)
+        if st is None or st.cur_ts is None:
+            return None
+        return max(0.0, (time.time() if now is None else now) - st.cur_ts)
+
     def state_of(self, code: str) -> _CodeState:
         return self._by_code.setdefault(code or "?", _CodeState())
 

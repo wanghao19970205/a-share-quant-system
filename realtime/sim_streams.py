@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import tempfile
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -27,6 +28,10 @@ from realtime.strategy import StrategyContext, default_strategies
 from realtime.rerank import RerankScorer
 from realtime.paper_trader import PaperTrader
 from realtime.v2 import V2PaperTrader
+from realtime.v3 import V3PaperTrader
+from realtime.v4 import V4PaperTrader
+from realtime.sector_etf import SectorETFContext
+from realtime.feed import subscription_code
 from realtime.reference import RefRow, expected_return_text
 from realtime.watchlist import load_codes
 
@@ -49,6 +54,19 @@ def check(cond: bool, msg: str) -> None:
 class Cfg:
     paper_trade_enabled = True
     paper_v2_enabled = True
+    paper_v3_enabled = True
+    paper_v4_enabled = True
+    sector_etf_enabled = True
+    sector_etf_benchmark = "510300.SH"
+    sector_etf_specs = (
+        "半导体=512480.SH:数字芯片设计;"
+        "银行=512800.SH:股份制银行Ⅲ;"
+        "军工=512660.SH:军工电子Ⅱ")
+    sector_etf_quote_max_age_sec = 90.0
+    paper_v4_sector_weak_excess = -0.003
+    paper_v4_sector_strong_excess = 0.003
+    paper_v4_sector_mapping_min_confidence = 0.8
+    sector_meta_file = ""
     paper_buy_n = 2
     paper_buy_start = 1455
     paper_buy_end = 1457
@@ -58,6 +76,8 @@ class Cfg:
     paper_breakeven_margin = 0.005
     paper_take_profit_tighten = 0.03
     paper_limit_down_roll_max = 3
+    paper_v3_quote_max_age_sec = 90.0
+    paper_v3_atr_k = 2.0
     paper_start_equity = 100000.0
     paper_cost = 0.002
     sell_horizon = 1
@@ -137,6 +157,10 @@ def new_cfg(**over):
         files = [base]
         if getattr(c, "paper_v2_enabled", False):
             files.append(base.parent / f"{base.stem}_v2{base.suffix}")
+        if getattr(c, "paper_v3_enabled", False):
+            files.append(base.parent / f"{base.stem}_v3{base.suffix}")
+        if getattr(c, "paper_v4_enabled", False):
+            files.append(base.parent / f"{base.stem}_v4{base.suffix}")
         return tuple(files)
 
     c.paper_state_files = _paper_state_files
@@ -542,6 +566,20 @@ def scenario_M():
         "paper_sell_counterfactuals.jsonl": "paper_sell_counterfactuals_v2.jsonl",
     }, "V2 四个审计文件名均为 _v2 且后缀完整")
 
+    cfg_audit = new_cfg(paper_buy_n=1, paper_entry_ask_strong=0.2)
+    ctx_audit = build_ctx(
+        {"000947": RefRow(expected_return=0.05)},
+        [mk_snap("000947", 10.0, pre_close=10.0, vwap=10.0,
+                 imb=-1.0, spread=0.001)])
+    v2_audit = V2PaperTrader(cfg_audit, ctx_audit, FakeNotifier())
+    v2_audit._now_hhmm = 1456
+    v2_audit._run_buys()
+    zero_decision = json.loads(v2_audit._decisions_file.read_text().splitlines()[-1])
+    check(zero_decision["event_type"] == "paper_buy_decision_v2" and
+          zero_decision["decision_status"] == "all_candidates_filtered" and
+          zero_decision["account_after"]["bought_count"] == 0,
+          "V2 全部候选过滤时仍落独立决策审计，零成交也是有效样本")
+
     # 场景 5：炸板判定走公开接口，不再访问私有状态；T+1 持仓评估不抛异常
     ctx5 = build_ctx({"000949": RefRow(expected_return=0.05, atr=0.1)},
                      [mk_snap("000949", 10.5, pre_close=10.0, vwap=10.5)])
@@ -643,6 +681,221 @@ def scenario_M():
           "V2 持仓同样进入保护性订阅，max_subscribe 截断也不丢报价")
 
 
+# ============================================================================
+# N. V3 赛马：盘口确认 + 可成交价 + ATR 出场 + 跌停阻塞
+# ============================================================================
+def scenario_N():
+    print("\n== N. V3 赛马（ask1/bid1 成交 + 当日预测 + ATR 自适应出场）==")
+    today = _dt.date.today().strftime("%Y-%m-%d")
+    refs = {
+        "000960": RefRow(expected_return=0.06, calibrated_net_return=0.01,
+                          atr=0.2, prediction_date="2020-01-02"),
+        "000961": RefRow(expected_return=0.05, calibrated_net_return=0.01,
+                          atr=0.2, prediction_date=today),
+    }
+    snaps = [
+        mk_snap("000960", 10.0, vwap=10.0, imb=0.5, spread=0.001),
+        mk_snap("000961", 10.0, vwap=10.0, imb=0.5, spread=0.002),
+    ]
+    cfg = new_cfg(paper_buy_n=1)
+    trader = V3PaperTrader(cfg, build_ctx(refs, snaps), FakeNotifier())
+    trader.maybe_trade(1456)
+    held = trader._state["positions"]
+    check([p["code"] for p in held] == ["000961"],
+          "V3 过滤非当日预测并顺延买入下一名")
+    expected_ask = trader._ctx.snapshot_of("000961").ask_price1
+    check(held and held[0]["buy_price"] == round(expected_ask, 3) and
+          held[0]["buy_fill_source"] == "ask1",
+          "V3 按卖一 ask1 买入，不再按 last 虚拟成交")
+    decision = json.loads(trader._decisions_file.read_text().splitlines()[0])
+    by_code = {r["code"]: r for r in decision["candidates"]}
+    check(by_code["000960"]["entry_decision"] == "filtered" and
+          "预测非当日" in by_code["000960"]["entry_filter_reason"],
+          "V3 审计记录预测日期过滤原因")
+    check(decision["schema_version"] == 3 and
+          decision["event_type"] == "paper_buy_decision_v3",
+          "V3 抽取版本钩子后仍保持原审计 schema 和事件类型")
+    trader._ctx.state_of("000961").cur_ts -= 1000
+    stale_reason, _ = trader._entry_quote("000961", 0.05)
+    check(stale_reason is not None and "行情过期" in stale_reason,
+          "V3 拒绝使用超过新鲜度门槛的旧快照买入")
+
+    names = {n: V3PaperTrader._suffixed(Path("/x") / n).name for n in (
+        "paper_state.json", "paper_trades.jsonl",
+        "paper_buy_decisions.jsonl", "paper_sell_counterfactuals.jsonl")}
+    check(names == {
+        "paper_state.json": "paper_state_v3.json",
+        "paper_trades.jsonl": "paper_trades_v3.jsonl",
+        "paper_buy_decisions.jsonl": "paper_buy_decisions_v3.jsonl",
+        "paper_sell_counterfactuals.jsonl": "paper_sell_counterfactuals_v3.jsonl",
+    }, "V3 四个账户文件均以 _v3 隔离")
+
+    yesterday = (_dt.date.today() - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    ctx_exit = build_ctx(
+        {"000962": RefRow(expected_return=0.05, atr=0.2, prediction_date=today)},
+        [mk_snap("000962", 10.82, pre_close=10.0, vwap=10.7,
+                 imb=0.2, spread=0.001)])
+    exit_trader = V3PaperTrader(new_cfg(), ctx_exit, FakeNotifier())
+    exit_trader._state["positions"] = [{
+        "code": "000962", "buy_price": 10.0, "peak": 10.8, "peak_bid": 10.8,
+        "shares": 1000, "cost_basis": 10010.0, "buy_date": yesterday,
+        "buy_time": "14:56:00", "prediction_date": today,
+    }]
+    sell_bid = ctx_exit.snapshot_of("000962").bid_price1
+    exit_trader._run_sells(1030)
+    trade = json.loads(exit_trader._trades_file.read_text().splitlines()[-1])
+    check(trade["exit_reason"] == "atr_take_profit",
+          "V3 达到 4ATR 后触发 ATR 止盈")
+    check(trade["sell_price"] == round(sell_bid, 3) and
+          trade["sell_fill_source"] == "bid1",
+          "V3 按买一 bid1 卖出，不再按 last 虚拟成交")
+
+    ctx_trail = build_ctx(
+        {"000963": RefRow(expected_return=0.05, atr=0.2, prediction_date=today)},
+        [mk_snap("000963", 10.29, pre_close=10.0, vwap=10.3,
+                 imb=0.0, spread=0.001)])
+    trail_trader = V3PaperTrader(new_cfg(), ctx_trail, FakeNotifier())
+    pos_trail = {
+        "code": "000963", "buy_price": 10.0, "peak": 10.7, "peak_bid": 10.7,
+    }
+    reason = trail_trader._exit_decision(
+        pos_trail, ctx_trail.snapshot_of("000963").bid_price1, 1, False)
+    check(reason == "atr_trailing", "V3 盈利达到 2ATR 后回撤 2ATR 触发移动止盈")
+    stop_reason = trail_trader._exit_decision(
+        {**pos_trail, "peak": 10.0, "peak_bid": 10.0}, 9.59, 1, False)
+    check(stop_reason == "atr_stop", "V3 买一价跌破入场价 2ATR 时触发硬止损")
+
+    ld_snap = mk_snap("000964", 9.0, pre_close=10.0, vwap=9.0, imb=-1.0)
+    ld_snap.low_limited = 9.0
+    ctx_ld = build_ctx(
+        {"000964": RefRow(expected_return=0.05, atr=0.2, prediction_date=today)},
+        [ld_snap])
+    ld_trader = V3PaperTrader(new_cfg(paper_limit_down_roll_max=0), ctx_ld, FakeNotifier())
+    ld_trader._state["positions"] = [{
+        "code": "000964", "buy_price": 10.0, "peak": 10.0, "peak_bid": 10.0,
+        "shares": 1000, "cost_basis": 10010.0, "buy_date": yesterday,
+        "buy_time": "14:56:00", "prediction_date": today,
+    }]
+    ld_trader._run_sells(1450)
+    check(len(ld_trader._state["positions"]) == 1 and
+          ld_trader._state["positions"][0].get("v3_sell_blocked", {}).get("reason") ==
+          "跌停无买盘承接",
+          "V3 跌停且买一量为零时阻塞卖出，不按 last 强制平仓")
+
+    liquid_ld = mk_snap("000965", 9.0, pre_close=10.0, vwap=9.0, imb=1.0)
+    liquid_ld.low_limited = 9.0
+    ctx_liquid_ld = build_ctx(
+        {"000965": RefRow(expected_return=0.05, atr=0.2, prediction_date=today)},
+        [liquid_ld])
+    liquid_trader = V3PaperTrader(new_cfg(), ctx_liquid_ld, FakeNotifier())
+    liquid_trader._state["positions"] = [{
+        "code": "000965", "buy_price": 10.0, "peak": 10.0, "peak_bid": 10.0,
+        "shares": 1000, "cost_basis": 10010.0, "buy_date": yesterday,
+        "buy_time": "14:56:00", "prediction_date": today,
+    }]
+    liquid_trader._run_sells(1450)
+    check(not liquid_trader._state["positions"],
+          "V3 跌停价仍有有效买一承接时允许按 bid1 卖出")
+
+    cfg_sub = new_cfg(paper_v2_enabled=False, paper_v3_enabled=True)
+    root = Path(cfg_sub.ledger_dir)
+    (root / "paper_state_v3.json").write_text(
+        json.dumps({"cash": 0, "positions": [{"code": "600941"}]}), encoding="utf-8")
+    cfg_sub.mobile_snapshot_file = root / "mobile_snapshot.json"
+    cfg_sub.holdings_file = root / "holdings.txt"
+    cfg_sub.predictions_file = root / "missing.parquet"
+    cfg_sub.universe_file = root / "missing.txt"
+    cfg_sub.max_subscribe = 1
+    cfg_sub.mobile_snapshot_file.write_text(
+        json.dumps({"groups": {"全A": {"rows": [{"code": "000001"}]}}}), encoding="utf-8")
+    check(load_codes(cfg_sub) == ["600941"],
+          "V3 持仓进入保护性订阅并优先于候选名单")
+
+
+# ============================================================================
+# O. V4：ETF 板块相对弱势过滤（V3 规则保持不变）
+# ============================================================================
+def scenario_O():
+    print("\n== O. V4 赛马（V3 + 行业ETF相对弱势回避）==")
+    cfg = new_cfg(paper_buy_n=1, paper_v2_enabled=False, paper_v3_enabled=False,
+                  paper_v4_enabled=True)
+    root = Path(cfg.ledger_dir)
+    cfg.sector_meta_file = root / "all_a_stock_meta.parquet"
+    pd.DataFrame([
+        {"code": "000970", "a_industry": "数字芯片设计",
+         "a_industries": "数字芯片设计、集成电路、电子"},
+        {"code": "000971", "a_industry": "股份制银行Ⅲ",
+         "a_industries": "股份制银行Ⅲ、银行Ⅱ、银行"},
+        {"code": "000972", "a_industry": "印制电路板",
+         "a_industries": "印制电路板、军工电子Ⅱ、电子"},
+    ]).to_parquet(cfg.sector_meta_file, index=False)
+    sector = SectorETFContext(cfg)
+    now = time.time()
+    sector.update(Snapshot(code="510300.SH", last=10.0, pre_close=10.0), now=now)
+    weak_signals = sector.update(
+        Snapshot(code="512480.SH", last=9.95, pre_close=10.0), now=now)
+    sector.update(Snapshot(code="512800.SH", last=10.01, pre_close=10.0), now=now)
+    check(bool(weak_signals) and weak_signals[0].kind == "sector_etf_weak",
+          "ETF 相对沪深300跌 0.5% 时产生 sector_etf_weak 状态信号")
+    check(subscription_code("159928.SZ", lambda _: "159928.SH") == "159928.SZ" and
+          subscription_code("000001", lambda _: "000001.SZ") == "000001.SZ",
+          "订阅层保留 ETF 完整后缀，仅对旧六位股票代码推断交易所")
+
+    today = _dt.date.today().strftime("%Y-%m-%d")
+    ctx = build_ctx({
+        "000970": RefRow(expected_return=0.06, atr=0.2, prediction_date=today),
+        "000971": RefRow(expected_return=0.05, atr=0.2, prediction_date=today),
+        "000972": RefRow(expected_return=0.04, atr=0.2, prediction_date=today),
+    }, [
+        mk_snap("000970", 10.0, pre_close=10.0, vwap=10.0, imb=0.2, spread=0.001),
+        mk_snap("000971", 10.0, pre_close=10.0, vwap=10.0, imb=0.2, spread=0.001),
+        mk_snap("000972", 10.0, pre_close=10.0, vwap=10.0, imb=0.2, spread=0.001),
+    ])
+    trader = V4PaperTrader(cfg, ctx, FakeNotifier(), sector)
+    trader._now_hhmm = 1456
+    trader._run_buys()
+    held = [p["code"] for p in trader._state["positions"]]
+    check(held == ["000971"], "V4 过滤弱势半导体候选并顺延买入中性银行候选")
+    position = trader._state["positions"][0]
+    sector_entry = position.get("sector_etf", {})
+    check(sector_entry.get("etf_code") == "512800.SH",
+          "V4 持仓锁定入场行业ETF上下文，供平仓归因")
+    check(sector_entry.get("mapping_version") == "industry_etf_exact_v2" and
+          sector_entry.get("mapping_source") == "exact_primary" and
+          sector_entry.get("mapping_confidence") == 1.0 and
+          sector_entry.get("stock_industry") == "股份制银行Ⅲ",
+          "V4 审计记录映射版本、来源、置信度和精确主行业")
+    audit = json.loads(trader._decisions_file.read_text().splitlines()[-1])
+    weak_row = next(r for r in audit["candidates"] if r["code"] == "000970")
+    check(audit["schema_version"] == 4 and audit["event_type"] == "paper_buy_decision_v4" and
+          "行业ETF相对弱势" in weak_row.get("entry_filter_reason", ""),
+          "V4 独立审计记录版本、ETF弱势过滤原因和候选快照")
+    check(all("_v4" in p.name for p in (
+        trader._state_file, trader._trades_file, trader._decisions_file,
+        trader._counterfactuals_file)),
+          "V4 四个账户文件均以 _v4 隔离")
+    missing_skip, missing_quote = trader._entry_quote_detail("000972", 0.04)
+    missing_assessment = sector.assessment_for_stock("000972")
+    check(missing_skip is None and missing_quote is not None and
+          missing_assessment["mapping_source"] == "unmapped" and
+          missing_assessment["stock_industry"] == "印制电路板",
+          "V4 只按主行业精确映射，父级文本命中军工也不误过滤")
+
+    cfg_sub = new_cfg(paper_v2_enabled=False, paper_v3_enabled=False, paper_v4_enabled=True)
+    sub_root = Path(cfg_sub.ledger_dir)
+    (sub_root / "paper_state_v4.json").write_text(
+        json.dumps({"cash": 0, "positions": [{"code": "600941"}]}), encoding="utf-8")
+    cfg_sub.mobile_snapshot_file = sub_root / "mobile_snapshot.json"
+    cfg_sub.holdings_file = sub_root / "holdings.txt"
+    cfg_sub.predictions_file = sub_root / "missing.parquet"
+    cfg_sub.universe_file = sub_root / "missing.txt"
+    cfg_sub.max_subscribe = 1
+    cfg_sub.mobile_snapshot_file.write_text(
+        json.dumps({"groups": {"全A": {"rows": [{"code": "000001"}]}}}), encoding="utf-8")
+    check(load_codes(cfg_sub) == ["600941"],
+          "V4 持仓进入保护性订阅并优先于候选名单")
+
+
 def main() -> int:
     print("=" * 68)
     print(" 虚拟数据流验证：实时层重排/模拟盘/出场逻辑")
@@ -650,7 +903,7 @@ def main() -> int:
     for fn in (scenario_A, scenario_B, scenario_C, scenario_D,
                scenario_E, scenario_F, scenario_G, scenario_H,
                scenario_I, scenario_J, scenario_K, scenario_L,
-               scenario_M):
+               scenario_M, scenario_N, scenario_O):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
