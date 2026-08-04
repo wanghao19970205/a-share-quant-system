@@ -22,10 +22,29 @@ from .config import RealtimeConfig
 class RefRow:
     atr: Optional[float] = None          # ATR(14) 绝对值（元）
     atr_pct: Optional[float] = None      # ATR / 昨收，便于缺 ATR 时按比例兜底
-    expected_return: Optional[float] = None  # 模型预期收益（ridge_pred 原始小数，供 GapCalibrate 等）
-    calibrated_return: Optional[float] = None  # ridge_pred 按历史分档重标定的实际兑现均值（仅展示用）
+    expected_return: Optional[float] = None  # 模型预期收益（ridge_pred 原始小数，供排序）
+    calibrated_return: Optional[float] = None  # ridge_pred 历史分档的实际毛收益均值
+    calibrated_net_return: Optional[float] = None  # 按模拟盘成交成本扣费后的历史净收益
     win_rate: Optional[float] = None     # 该分档历史 (target>0) 胜率（仅展示用）
     hold_days: Optional[int] = None      # 已持有交易日数（仅持仓票有值；供 HoldingExpiry）
+
+
+def net_return_after_cost(gross_return: float, roundtrip_cost: float) -> float:
+    """按模拟盘买卖各半成本模型，把毛收益换算为净收益。"""
+    half = max(0.0, float(roundtrip_cost)) / 2.0
+    return (1.0 + float(gross_return)) * (1.0 - half) / (1.0 + half) - 1.0
+
+
+def expected_return_text(ref: Optional[RefRow], raw_return: float,
+                         roundtrip_cost: float) -> str:
+    """展示清晰的净收益、毛收益和历史胜率，避免把毛收益误称为可得预期。"""
+    calibrated = getattr(ref, "calibrated_return", None) if ref is not None else None
+    win_rate = getattr(ref, "win_rate", None) if ref is not None else None
+    gross = float(calibrated) if calibrated is not None else float(raw_return)
+    net = net_return_after_cost(gross, roundtrip_cost)
+    source = "历史净" if calibrated is not None else "模型净"
+    win_text = f" 胜率{win_rate:.0%}" if win_rate is not None else ""
+    return f"{source}{net:+.2%}(毛{gross:+.2%}{win_text})"
 
 
 def _atr14(px, n: int = 14) -> tuple[Optional[float], Optional[float]]:
@@ -295,8 +314,9 @@ def build(cfg: RealtimeConfig, codes: list[str]) -> dict[str, RefRow]:
         atr, atr_pct = atr_map.get(code, (None, None))
         exp = ret_map.get(code)
         cal, wr = (calib(exp) if calib is not None else (None, None))
+        net = (net_return_after_cost(cal, cfg.paper_cost) if cal is not None else None)
         ref[code] = RefRow(atr=atr, atr_pct=atr_pct,
                            expected_return=exp,
-                           calibrated_return=cal, win_rate=wr,
-                           hold_days=hold_map.get(code))
+                           calibrated_return=cal, calibrated_net_return=net,
+                           win_rate=wr, hold_days=hold_map.get(code))
     return ref

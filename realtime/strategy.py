@@ -8,7 +8,7 @@
   买卖点纠偏类（用盘中基准校准模型的静态价位）：
     - VWAPDeviation    现价相对当日 VWAP 偏离（便宜/贵）
     - ChandelierStop   ATR 吊灯跟踪止损（随最高价上移，锁利）
-    - GapCalibrate     开盘跳空校准（高开吃掉预期空间→别追）
+    - GapCalibrate     仅保留显式实验；高开经离线 IC 验证为正向动量，不再默认装配
   持仓管理类（按已定卖点纪律择时了结）：
     - HoldingExpiry    持有期到期卖出（Phase1 对比表定档 T+1，次日提示了结）
 
@@ -467,13 +467,12 @@ class HoldingExpiry(Strategy):
 
 
 def default_strategies() -> list[Strategy]:
-    """默认装配：异动监控 3 条 + 买卖点纠偏 3 条 + 持仓管理 1 条。"""
+    """默认装配：异动监控 3 条 + 已验证纠偏 2 条 + 持仓管理 1 条。"""
     return [
         LimitMoveWatch(),
         SurgeWatch(),
         VolumeSurge(),
         VWAPDeviation(),
         ChandelierStop(),
-        GapCalibrate(),
         HoldingExpiry(),
     ]

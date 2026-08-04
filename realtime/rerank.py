@@ -4,8 +4,8 @@
 容易漂移。这里抽成唯一打分器，两处复用——保证「你看到的榜单」与「模拟盘实际买的」是同一序。
 
 设计原则（守 strategy/RankBoard 既定「模型选强票入池，盘中只做纠偏」）：
-  - 候选池恒 = 模型 expected_return(ridge_pred) > 0 的票，按模型分取 Top-{rank_pool_n}（默认30）。
-    盘中信号【绝不】把池外的票拉进来、【绝不】造新 alpha。
+  - 候选池 = 模型 expected_return(ridge_pred) > 0 且历史校准净收益覆盖成本的票，
+    再按模型分取 Top-{rank_pool_n}（默认30）。盘中信号绝不把池外票拉进来。
   - 重排分 score = exp * (1 + clamp(adj, -cap, +cap))：模型分是主序标尺，盘中 adj 只在
     有界范围（默认 ±30%）里对同池票微调名次——模型分差距大的票次序翻不动，差距小的才被盘中量分出高下。
 
@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .reference import net_return_after_cost
 from .strategy import StrategyContext, _digits
 
 
@@ -51,8 +52,10 @@ class RerankScorer:
         self._cap = max(0.0, float(getattr(cfg, "rerank_cap", 0.30)))
         self._w_vwap = float(getattr(cfg, "rerank_w_vwap", 0.35))
         self._w_imb = float(getattr(cfg, "rerank_w_imb", 0.30))
-        self._w_gap = float(getattr(cfg, "rerank_w_gap", 0.20))
+        self._w_gap = float(getattr(cfg, "rerank_w_gap", 0.0))
         self._w_spread = float(getattr(cfg, "rerank_w_spread", 0.15))
+        self._cost = max(0.0, float(getattr(cfg, "paper_cost", 0.002)))
+        self._min_net = float(getattr(cfg, "rank_min_net_return", 0.0))
 
     # ---- 盘中调整分 --------------------------------------------------------
     def _intraday_adj(self, code: str, exp: float, px: Optional[float]) -> tuple[float, list]:
@@ -82,7 +85,7 @@ class RerankScorer:
                 reasons.append(("买盘强" if imb > 0 else "卖盘强", contrib))
 
         # 3) 高开吃预期（追高惩罚）：gap/exp 越大 → 减分越狠
-        if snap is not None and exp and exp > 0:
+        if self._w_gap > 0 and snap is not None and exp and exp > 0:
             open_px = getattr(snap, "open", None)
             pre_close = getattr(snap, "pre_close", None)
             if open_px and pre_close:
@@ -106,38 +109,73 @@ class RerankScorer:
 
     # ---- 主入口 ------------------------------------------------------------
     def ranked(self, exclude: Optional[set] = None,
-               require_price: bool = False, drop_limit_up: bool = False) -> list[RankRow]:
+               require_price: bool = False, drop_limit_up: bool = False,
+               trace: Optional[list[dict]] = None) -> list[RankRow]:
         """返回按 score 降序的 RankRow 列表。
 
-        - 候选池：expected_return>0 的模型票，先按模型分取 Top-{rank_pool_n}（重排作用域）。
+        - 候选池：模型看多且校准净收益达标的票，按模型分取 Top-{rank_pool_n}。
         - require_price=True：仅保留有实时价的票（买入腿用，买不了的剔除）。
         - drop_limit_up=True：剔除封涨停票（14:50 买不进）。
         - exclude：按 6 位纯代码排除（如已持仓）。
         - rerank 关闭时退化为纯模型序（adj=0），保持旧行为。
+        - trace：可选旁路审计容器；只记录既有分支结果，不改变筛选和排序。
         """
         exclude = exclude or set()
         ref = self._ctx.all_refs() or {}
+        audit: dict[str, dict] = {}
+
+        def _mark(code: str, status: str, **values) -> None:
+            if trace is not None:
+                audit[_digits(code)] = {"code": _digits(code), "status": status, **values}
 
         # 先取模型池（expected_return>0，按模型分降序 Top-pool_n）
         pool: list[tuple[str, float]] = []
         for code, r in ref.items():
-            if _digits(code) in exclude:
+            clean = _digits(code)
+            if clean in exclude:
+                _mark(code, "excluded_held")
                 continue
             exp = getattr(r, "expected_return", None)
-            if exp is None or exp <= 0:
+            if exp is None:
+                _mark(code, "excluded_missing_expected_return")
+                continue
+            if exp <= 0:
+                _mark(code, "excluded_nonpositive_expected_return",
+                      expected_return=float(exp))
+                continue
+            calibrated = getattr(r, "calibrated_return", None)
+            calibrated_net = getattr(r, "calibrated_net_return", None)
+            if calibrated_net is None:
+                gross = float(calibrated) if calibrated is not None else float(exp)
+                calibrated_net = net_return_after_cost(gross, self._cost)
+            values = {
+                "expected_return": float(exp),
+                "calibrated_return": (float(calibrated) if calibrated is not None else None),
+                "calibrated_net_return": float(calibrated_net),
+            }
+            if float(calibrated_net) <= self._min_net:
+                _mark(code, "excluded_net_return_gate", **values)
                 continue
             pool.append((code, float(exp)))
+            _mark(code, "model_pool", **values)
         pool.sort(key=lambda kv: kv[1], reverse=True)
+        for code, _ in pool[self._pool_n:]:
+            if trace is not None:
+                audit[_digits(code)]["status"] = "excluded_outside_model_top_pool"
         pool = pool[: self._pool_n]
 
         rows: list[RankRow] = []
         for code, exp in pool:
             px = self._price_of(code)
             if require_price and px is None:
+                if trace is not None:
+                    audit[_digits(code)]["status"] = "excluded_missing_realtime_price"
                 continue
             if drop_limit_up:
                 snap = self._ctx.snapshot_of(code)
                 if snap is not None and getattr(snap, "is_limit_up", False):
+                    if trace is not None:
+                        audit[_digits(code)]["status"] = "excluded_limit_up"
                     continue
             if self._enabled:
                 adj, reasons = self._intraday_adj(code, exp, px)
@@ -148,6 +186,15 @@ class RerankScorer:
                                 reasons=reasons, px=px))
         # 主序 score 降序；score 相等时回退模型分（稳定）
         rows.sort(key=lambda r: (r.score, r.exp), reverse=True)
+        if trace is not None:
+            for rank, row in enumerate(rows, 1):
+                audit[_digits(row.code)].update({
+                    "status": "eligible_ranked", "rank": rank,
+                    "score": float(row.score), "adj": float(row.adj),
+                    "reasons": [[name, float(value)] for name, value in row.reasons],
+                    "price": row.px,
+                })
+            trace.extend(audit.values())
         return rows
 
     def _price_of(self, code: str) -> Optional[float]:

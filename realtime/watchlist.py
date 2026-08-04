@@ -1,4 +1,4 @@
-"""订阅清单加载：Top10 名单(手机UI) ∪ 持仓，去重、规范 6 位、按上限夹紧。"""
+"""订阅清单加载：保护模拟盘/人工持仓，再合并 Top10 候选并按上限夹紧。"""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,26 @@ _TOP10_GROUPS = ("白名单", "全A", "创新药")
 
 
 def _norm(code: str) -> str:
-    return str(code).strip().zfill(6)
+    return str(code).split(".", 1)[0].strip().zfill(6)
+
+
+def _read_paper_positions(path: Path) -> list[str]:
+    """读取模拟盘持仓代码；状态缺失或损坏时安全降级为空。"""
+    path = Path(path)
+    if not path.exists():
+        return []
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - 状态异常不能阻断实时层启动
+        return []
+    positions = state.get("positions", []) if isinstance(state, dict) else []
+    if not isinstance(positions, list):
+        return []
+    return [
+        _norm(pos.get("code"))
+        for pos in positions
+        if isinstance(pos, dict) and str(pos.get("code", "")).strip()
+    ]
 
 
 def _read_lines(path: Path) -> list[str]:
@@ -94,10 +113,8 @@ def _read_predictions(path: Path) -> list[str]:
 def load_codes(cfg: RealtimeConfig) -> list[str]:
     """返回去重后的订阅代码列表（6 位）。
 
-    优先级（保持"名单在前、持仓在后"的稳定顺序，便于上限夹紧时优先保住名单）：
-      1) Top10 名单(mobile_snapshot) ∪ 持仓   —— 主路径
-      2) 预测 top(active_quant_short_predictions) ∪ 持仓 —— 主路径为空时兜底(保旧行为)
-      3) 兜底股票池(universe_file)             —— 都空时最后兜底
+    模拟盘和人工持仓必须有实时价才能执行风控/卖出，因此优先于候选名单，不能在
+    max_subscribe 截断时被挤掉。候选来源仍保持 Top10 -> 预测 -> 兜底池的原有顺序。
     """
     ordered: list[str] = []
     seen: set[str] = set()
@@ -108,18 +125,23 @@ def load_codes(cfg: RealtimeConfig) -> list[str]:
                 seen.add(c)
                 ordered.append(c)
 
-    _extend(_read_top10_groups(cfg.mobile_snapshot_file))
+    paper_positions = _read_paper_positions(cfg.paper_state_file)
     holdings = _read_lines(cfg.holdings_file)
-    _extend(holdings)
+    top10 = _read_top10_groups(cfg.mobile_snapshot_file)
 
-    # Top10 快照缺失/为空：退回按预测分取 top（旧行为），仍并入持仓。
-    if not ordered:
+    _extend(paper_positions)
+    _extend(holdings)
+    protected_count = len(ordered)
+    _extend(top10)
+
+    # Top10 快照缺失/为空：退回按预测分取 top，持仓仍保持最高优先级。
+    if not top10:
         _extend(_read_predictions(cfg.predictions_file))
-        _extend(holdings)
 
     if not ordered:
         _extend(_read_lines(cfg.universe_file))
 
     if cfg.max_subscribe and len(ordered) > cfg.max_subscribe:
-        ordered = ordered[: cfg.max_subscribe]
+        safe_limit = max(int(cfg.max_subscribe), protected_count)
+        ordered = ordered[:safe_limit]
     return ordered

@@ -5,8 +5,8 @@
 notifier.push 低层派发（不过白名单），自带节奏控制 + 指纹去重防刷屏。
 
 排序主序 = 盘中重排后 score（RerankScorer：模型 expected_return 锚定 + 盘中有界微调）；
-候选池恒 = 模型 expected_return>0 的 Top-rank_pool_n，重排只在池内微调名次、不造新 alpha
-——守 strategy 既定原则「模型选强票入池，盘中只做纠偏」。
+候选池 = 模型看多且历史校准净收益覆盖成本的 Top-rank_pool_n，重排只在池内微调名次，
+不造新 alpha。
 
 只读 ctx 内存状态（最新快照 + VWAP + ref），盘中绝不碰 quant_data。缺 expected_return
 的票自动落榜。仅当 Top-N 榜单指纹（代码序 + 重排幅度 + 标注）变化才推。
@@ -17,6 +17,7 @@ import time
 from typing import Optional
 
 from .notifier import Notifier
+from .reference import expected_return_text
 from .rerank import RerankScorer
 from .strategy import StrategyContext
 
@@ -43,11 +44,11 @@ class RankBoard:
             name = self._name_map.get(digits)
         return f"{code} {name}" if name else str(code)
 
-    def _tags(self, code: str, exp: float) -> tuple[list[str], str]:
+    def _tags(self, code: str, _exp: float) -> tuple[list[str], str]:
         """按盘中量给一只票拼标注，返回 (标注列表, 用于指纹的稳定摘要串)。
 
         只用现成的 Level-1 派生量：现价 vs VWAP（便宜/贵）、买一卖一失衡（买盘强弱）、
-        距涨停空间、当日涨幅、开盘是否已吃预期。缺量的标注自动省略，不崩。
+        距涨停空间和当日涨幅。缺量的标注自动省略，不崩。
         """
         tags: list[str] = []
         fp_parts: list[str] = []
@@ -90,13 +91,6 @@ class RankBoard:
             elif room <= 0.03:
                 tags.append(f"距涨停{room:.1%}"); fp_parts.append("near_lu")
 
-        # 开盘跳空是否已吃掉预期（追高风险）
-        if snap.open is not None and snap.pre_close and exp > 0:
-            gap = snap.open / snap.pre_close - 1.0
-            eaten = gap / exp if exp else 0.0
-            if eaten >= 0.6:
-                tags.append(f"高开已吃预期{eaten:.0%}谨慎"); fp_parts.append("eaten")
-
         return tags, "|".join(fp_parts)
 
     # ---- 主入口 --------------------------------------------------------------
@@ -120,7 +114,7 @@ class RankBoard:
         return True
 
     def _rank(self) -> list:
-        """盘中重排后取 Top-N。候选池 = 模型 expected_return>0 的 Top-rank_pool_n，
+        """盘中重排后取 Top-N。候选池 = 模型看多且校准净收益达标的 Top-rank_pool_n，
         经 RerankScorer 盘中微调后按 score 降序，取前 rank_top_n 展示。
 
         排序主序 = 重排后 score（模型分锚定 + 盘中有界微调），展示预期%仍用校准值。
@@ -133,14 +127,9 @@ class RankBoard:
         return rows[: self._top_n]
 
     def _exp_str(self, code: str, exp: float) -> str:
-        """展示用预期字符串：优先历史校准值 + 胜率，缺校准回退原始 ridge_pred。"""
-        r = self._ctx.ref_of(code)
-        cal = getattr(r, "calibrated_return", None) if r is not None else None
-        wr = getattr(r, "win_rate", None) if r is not None else None
-        if cal is not None:
-            wr_str = f"(胜率{wr:.0%})" if wr is not None else ""
-            return f"预期{cal:+.1%}{wr_str}"
-        return f"预期{exp:+.1%}"
+        """展示扣除模拟盘 round-trip 成本后的净收益，并保留毛收益口径。"""
+        return expected_return_text(
+            self._ctx.ref_of(code), exp, getattr(self._cfg, "paper_cost", 0.002))
 
     def _rerank_str(self, row) -> str:
         """把重排原因拼成短串（▲加分项 / ▼减分项），无调整则空串。"""

@@ -130,30 +130,36 @@ class RealtimeConfig:
     watchlist_reload: bool = field(default_factory=lambda: _env_bool("REALTIME_WATCHLIST_RELOAD", True))
 
     # ---- 实时买入候选榜（RankBoard）----------------------------------------
-    # 跨票聚合器：盘中定期按模型预期收益(expected_return>0)取 Top-N，配盘中量拼 digest 推送。
-    # 排序完全由已验证模型 alpha 决定，盘中信号只做标注/加减分，不引入新 alpha。仅榜单指纹变化才推。
+    # 跨票聚合器：模型看多且校准净收益覆盖成本后取 Top-N，配盘中量拼 digest 推送。
+    # 排序仍由模型 alpha 决定，盘中信号只做有界纠偏；仅榜单指纹变化才推。
     rank_board_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_RANK_BOARD", True))
     rank_interval_sec: int = field(default_factory=lambda: _env_int("REALTIME_RANK_INTERVAL", 300))
     rank_top_n: int = field(default_factory=lambda: _env_int("REALTIME_RANK_TOP_N", 5))
 
     # ---- 盘中动态重排（RerankScorer，RankBoard + PaperTrader 共用）----------
-    # 候选池恒 = 模型 expected_return>0 的 Top-rank_pool_n（重排作用域，绝不拉池外票）；
+    # 候选池 = 模型看多且校准净收益达标的 Top-rank_pool_n；绝不拉池外票。
     # score = exp*(1+clamp(adj,±rerank_cap))：模型分为主序，盘中信号只在 ±cap 内微调名次。
-    # 分项权重（VWAP位置/买卖失衡/高开吃预期/盘口价差）全 env 可调；关闭则退化纯模型序。
+    # VWAP位置/买卖失衡/盘口价差全 env 可调；旧高开惩罚保留开关但默认关闭。
     rerank_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_RERANK", True))
     rank_pool_n: int = field(default_factory=lambda: _env_int("REALTIME_RANK_POOL_N", 30))
     rerank_cap: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_CAP", 0.30))
     rerank_w_vwap: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_W_VWAP", 0.35))
     rerank_w_imb: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_W_IMB", 0.30))
-    rerank_w_gap: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_W_GAP", 0.20))
+    # 离线 IC 已确认高开是正向隔夜动量，旧的“高开吃预期”惩罚方向错误，默认关闭。
+    rerank_w_gap: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_W_GAP", 0.0))
     rerank_w_spread: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_W_SPREAD", 0.15))
+    # 历史分档校准后扣 round-trip 成本的最低净收益；默认至少覆盖交易成本。
+    rank_min_net_return: float = field(
+        default_factory=lambda: _env_float("REALTIME_RANK_MIN_NET_RETURN", 0.0))
 
     # ---- 实时模拟盘（PaperTrader）------------------------------------------
-    # 收盘前 paper_buy_start(默认1450)按模型 expected_return>0 降序买 Top-N(实时价成交)，
-    # 持有到 T+sell_horizon 到期卖出，落 logs/realtime/paper_state.json + paper_trades.jsonl。
+    # T+N 到期腿在收盘前执行，随后从净收益达标候选中按模型分买 Top-N，保持 close→close 口径。
+    # 风险退出（止损/止盈/移动止盈/VWAP破位）不受 time_cap_start 限制，T+1 全天有效。
     paper_trade_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_TRADE", True))
     paper_buy_n: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_N", 2))
-    paper_buy_start: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_START", 1450))
+    paper_buy_start: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_START", 1455))
+    paper_time_cap_start: int = field(
+        default_factory=lambda: _env_int("REALTIME_PAPER_TIME_CAP_START", 1450))
     paper_start_equity: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_START_EQUITY", 100000.0))
     paper_cost: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_COST", 0.002))
     paper_state_file: Path = field(
@@ -168,7 +174,8 @@ class RealtimeConfig:
     paper_vwap_break: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_VWAP_BREAK", 0.02))
     # 买入择时过滤（方向2）：买入腿按重排后 score 降序取 Top-N，买前逐票查以下项，命中即跳过（顺延下一名）。
     # 全 env 可关（设 0 即不过滤该项）；全部候选被过滤则当日不建仓。
-    paper_entry_gap_eaten: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_GAP_EATEN", 0.6))
+    # 与重排一致：高开是已验证的正向隔夜动量，不再按“吃掉预期”阻断入场。
+    paper_entry_gap_eaten: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_GAP_EATEN", 0.0))
     paper_entry_rich: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_RICH", 0.01))
     paper_entry_ask_strong: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_ASK_STRONG", 0.2))
     # 盘口价差流动性门槛：买一/卖一价差率超阈值即跳过（宽价差=薄盘口，14:50 建仓滑点吃 alpha）。

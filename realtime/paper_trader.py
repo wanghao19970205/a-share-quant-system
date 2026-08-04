@@ -2,8 +2,8 @@
 验证「收盘前买入 + 完整出场策略」在真实盘中价上的累计收益。
 
 与 RankBoard（只推送不下单）的区别：PaperTrader 真正维护一个虚拟账户
-（现金 + 持仓），每交易日在收盘前 10 分钟按重排后 score 降序买 Top-N，持仓则在
-【全交易时段】每轮按完整出场策略评估卖出，全部按【触发时的实时价】成交，逐笔落盘复盘。
+（现金 + 持仓），每交易日在 14:55 后按重排 score 买 Top-N；持仓风险退出全天有效，
+T+N 到期腿在 14:50 后执行，全部按【触发时的实时价】成交，逐笔落盘复盘。
 
 出场策略（先触发先走，缺某项数据即跳过该项、绝不误卖）：
   1. 硬止损     ret <= -stop_loss（默认 -5%）          → 控制单笔风险
@@ -20,20 +20,29 @@
   - 状态持久化到挂载盘 JSON：引擎日拱、盘中 execv 重启、跨交易日都要延续持仓。
     任何一步缺实时价/异常都优雅跳过（当日不动，次日再处理），绝不崩、不空跑。
 
-落盘两份（均在 logs/realtime，容器已挂载）：
-  - paper_state.json ：账户当前态（现金 + 持仓列表[含持仓期最高价 peak] + 最近买入日）。
-  - paper_trades.jsonl：每笔平仓一行审计流水（买卖价/出场原因/持有交易日/收益率/累计净值）。
+落盘四份（均在 logs/realtime，容器已挂载）：
+  - paper_state.json：账户当前态（现金 + 持仓列表[含持仓期最高价 peak] + 最近买入日）。
+  - paper_trades.jsonl：每笔平仓一行不可变成交流水。
+  - paper_buy_decisions.jsonl：每日模型池、重排、过滤和成交决策快照。
+  - paper_sell_counterfactuals.jsonl：卖出日及后续 3 日的收益/机会损益标记。
 """
 from __future__ import annotations
 
 import datetime as _dt
+import fcntl
+import hashlib
 import json
+import os
 import time
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
+
+from quant import warehouse
+
 from .notifier import Notifier
-from .reference import _trading_days_between
+from .reference import _trading_days_between, expected_return_text
 from .rerank import RerankScorer
 from .strategy import StrategyContext, _digits
 
@@ -60,7 +69,8 @@ class PaperTrader:
         self._notifier = notifier
         self._name_map = name_map or {}
         self._buy_n = max(1, getattr(cfg, "paper_buy_n", 2))
-        self._buy_start = int(getattr(cfg, "paper_buy_start", 1450))
+        self._buy_start = int(getattr(cfg, "paper_buy_start", 1455))
+        self._time_cap_start = int(getattr(cfg, "paper_time_cap_start", 1450))
         self._start_equity = float(getattr(cfg, "paper_start_equity", 100000.0))
         self._cost = float(getattr(cfg, "paper_cost", 0.002))
         self._horizon = max(1, int(getattr(cfg, "sell_horizon", 1)))
@@ -70,7 +80,7 @@ class PaperTrader:
         self._trail_k = float(getattr(cfg, "paper_trail_k", 3.0))
         self._vwap_break = float(getattr(cfg, "paper_vwap_break", 0.02))
         # 买入择时过滤阈值（方向2；0 即关闭该项）。
-        self._entry_gap_eaten = float(getattr(cfg, "paper_entry_gap_eaten", 0.6))
+        self._entry_gap_eaten = float(getattr(cfg, "paper_entry_gap_eaten", 0.0))
         self._entry_rich = float(getattr(cfg, "paper_entry_rich", 0.01))
         self._entry_ask_strong = float(getattr(cfg, "paper_entry_ask_strong", 0.2))
         self._entry_spread = float(getattr(cfg, "paper_entry_spread", 0.006))
@@ -78,8 +88,12 @@ class PaperTrader:
         self._state_file = Path(getattr(cfg, "paper_state_file", "")
                                 or (Path(getattr(cfg, "ledger_dir", ".")) / "paper_state.json"))
         self._trades_file = self._state_file.with_name("paper_trades.jsonl")
+        self._decisions_file = self._state_file.with_name("paper_buy_decisions.jsonl")
+        self._counterfactuals_file = self._state_file.with_name(
+            "paper_sell_counterfactuals.jsonl")
         self._acted_today = False  # 当日买入腿是否已跑过（进程内哨兵，防同日重复建仓）
         self._state = self._load_state()
+        self._refresh_counterfactuals()
 
     # ---- 展示辅助 ------------------------------------------------------------
     def _label(self, code: str) -> str:
@@ -124,6 +138,109 @@ class PaperTrader:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception as e:  # noqa: BLE001
             print(f"[paper] 写流水失败：{type(e).__name__}", flush=True)
+
+    @staticmethod
+    def _stable_id(prefix: str, *values) -> str:
+        raw = "|".join(str(v) for v in values).encode("utf-8")
+        return f"{prefix}-{hashlib.sha256(raw).hexdigest()[:20]}"
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict]:
+        if not path.exists():
+            return []
+        out: list[dict] = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                rec = json.loads(line)
+                if isinstance(rec, dict):
+                    out.append(rec)
+            except json.JSONDecodeError:
+                continue
+        return out
+
+    def _upsert_jsonl(self, path: Path, key: str, record: dict) -> None:
+        self._upsert_many_jsonl(path, key, [record])
+
+    def _upsert_many_jsonl(self, path: Path, key: str, records: list[dict]) -> None:
+        """按逻辑主键批量原子 upsert JSONL；审计失败不影响交易。"""
+        if not records:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = path.with_suffix(path.suffix + ".lock")
+            with open(lock_path, "a+", encoding="utf-8") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                by_key = {
+                    str(rec.get(key)): rec for rec in self._read_jsonl(path)
+                    if rec.get(key) is not None
+                }
+                by_key.update({str(rec[key]): rec for rec in records})
+                tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    for rec in by_key.values():
+                        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001 - 审计失败不阻断交易
+            print(f"[paper] 写决策审计失败：{type(e).__name__}", flush=True)
+
+    def _trade_id(self, trade: dict) -> str:
+        return str(trade.get("trade_id") or self._stable_id(
+            "paper-sell", trade.get("code"), trade.get("buy_date"),
+            trade.get("buy_price"), trade.get("shares"), trade.get("sell_date"),
+            trade.get("sell_price")))
+
+    def _refresh_counterfactuals(self) -> None:
+        """基于日线幂等补齐每笔卖出的当日及后续 3 日反事实。"""
+        records: list[dict] = []
+        for trade in self._read_jsonl(self._trades_file):
+            if trade.get("action") != "sell":
+                continue
+            try:
+                sell_date = pd.Timestamp(trade["sell_date"]).normalize()
+                price = warehouse.load_price_tail(
+                    _digits(trade.get("code", "")), sell_date, warmup_rows=0)
+                if price.empty or "date" not in price.columns:
+                    continue
+                price = price.copy()
+                price["date"] = pd.to_datetime(price["date"], errors="coerce").dt.normalize()
+                price = price.dropna(subset=["date"]).sort_values("date").drop_duplicates(
+                    "date", keep="last")
+                dates = price["date"].tolist()
+                if sell_date not in dates:
+                    future = price.iloc[0:0]
+                else:
+                    start = dates.index(sell_date)
+                    future = price.iloc[start:start + 4]
+                marks: list[dict] = []
+                buy_price = float(trade.get("buy_price") or 0.0)
+                sell_price = float(trade.get("sell_price") or 0.0)
+                shares = float(trade.get("shares") or 0.0)
+                basis = buy_price * shares * (1 + self._cost / 2.0)
+                for day_index, (_, row) in enumerate(future.iterrows()):
+                    close = float(row["close"])
+                    high = float(row["high"]) if pd.notna(row.get("high")) else None
+                    close_pnl = close * shares * (1 - self._cost / 2.0) - basis
+                    marks.append({
+                        "day": day_index, "date": row["date"].strftime("%Y-%m-%d"),
+                        "close": close, "high": high,
+                        "close_vs_sell": (close / sell_price - 1.0) if sell_price else None,
+                        "high_vs_sell": (high / sell_price - 1.0) if high and sell_price else None,
+                        "hold_close_return": (close_pnl / basis) if basis else None,
+                        "hold_close_pnl": close_pnl,
+                        "opportunity_pnl": close_pnl - float(trade.get("pnl") or 0.0),
+                    })
+                records.append({
+                    "schema_version": 1, "event_type": "paper_sell_counterfactual",
+                    "trade_id": self._trade_id(trade),
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "sell": trade, "markouts": marks,
+                })
+            except Exception as e:  # noqa: BLE001 - 单票数据问题不影响其它交易/实时引擎
+                print(f"[paper] 反事实补齐跳过 {trade.get('code')}: {type(e).__name__}", flush=True)
+        self._upsert_many_jsonl(
+            self._counterfactuals_file, "trade_id", records)
 
     # ---- 估值 ----------------------------------------------------------------
     def _price_of(self, code: str) -> Optional[float]:
@@ -173,20 +290,18 @@ class PaperTrader:
             return
         t = now_hhmm if now_hhmm is not None else (
             _dt.datetime.now().hour * 100 + _dt.datetime.now().minute)
-        # 卖出腿：全交易时段每轮评估（止损/止盈/移动止盈/破位/到期，先触发先走）。
-        self._run_sells()
-        # 买入腿：仍只在收盘前 [buy_start, 收盘] 窗内、且当日未建过仓时建仓。
+        # 风险退出全天有效；纯到期退出只在收盘前执行，保持训练的 close→close 口径。
+        self._run_sells(t)
+        # 买入腿：只在收盘前 [buy_start, 收盘] 窗内、且当日未建过仓时建仓。
         if self._buy_start <= t <= 1500:
             if not (self._acted_today and self._state.get("last_buy_date") == _today()):
                 self._run_buys()
                 self._acted_today = True
 
     # ---- 出场评估 ------------------------------------------------------------
-    def _exit_decision(self, pos: dict, px: float, held: int) -> Optional[str]:
-        """按优先级判该持仓是否出场，返回出场原因 key（None=继续持有）。先触发先走。
-
-        缺某项数据（ATR/VWAP）即跳过该项判定，不误卖；时间上限恒可用作最终兜底。
-        """
+    def _exit_decision(self, pos: dict, px: float, held: int,
+                       allow_time_cap: bool = True) -> Optional[str]:
+        """按优先级判持仓是否出场；风险退出全天有效，到期退出由调用方按时段放行。"""
         buy_price = pos.get("buy_price") or 0.0
         ret = (px / buy_price - 1.0) if buy_price else 0.0
         # 1) 硬止损
@@ -207,22 +322,22 @@ class PaperTrader:
             vwap = self._ctx.vwap_of(pos["code"])
             if vwap and vwap > 0 and px < vwap * (1 - self._vwap_break):
                 return "vwap_break"
-        # 5) 时间上限（T+N 到期兜底）
-        if held >= self._horizon:
+        # 5) 时间上限（T+N 到期兜底）：只在收盘前放行，避免把 close→close 做成 next-open。
+        if allow_time_cap and held >= self._horizon:
             return "time_cap"
         return None
 
-    def _run_sells(self) -> None:
-        """全时段评估每个持仓的出场；命中即按实时价平仓，缺实时价则保留待下轮/次日。
+    def _run_sells(self, now_hhmm: Optional[int] = None) -> None:
+        """评估持仓出场；风险规则全天生效，纯到期规则只在 time_cap_start 后生效。
 
-        A股 T+1：当日买入（held<1）的持仓【不可卖】，跳过全部出场评估（仍持有、仍刷 peak），
-        次日 held>=1 起才进出场逻辑——否则会出现 14:50 建仓后价格触止损/破位即当日平仓的 T+0 违规。
-
-        迭代持仓列表的副本，成交时【先从持仓移除再把所得计入现金】，使 _equity()/summary()
-        在写流水/推送那一刻即自洽（否则已卖出持仓仍留在列表里被重复计市值 → 净值虚高一份）。
+        A股 T+1：当日买入（held<1）的持仓不可卖，跳过全部出场评估（仍持有、仍刷 peak）。
+        缺实时价时保留待下轮；直接调用未传时刻时按收盘时段处理，保持测试与旧内部调用兼容。
         """
+        t = 1500 if now_hhmm is None else int(now_hhmm)
+        allow_time_cap = t >= self._time_cap_start
         today = _dt.date.today()
         changed = False
+        sold = False
         for pos in list(self._state.get("positions", [])):  # 迭代副本，循环内可安全移除
             px = self._price_of(pos["code"])
             if px is None:  # 无实时价 → 无法评估/成交，保留，下轮再来
@@ -237,7 +352,7 @@ class PaperTrader:
             # A股 T+1：当日买入不可卖出，跳过出场评估（time_cap 也自然要到 held>=horizon 才触发）。
             if held < 1:
                 continue
-            reason = self._exit_decision(pos, px, held)
+            reason = self._exit_decision(pos, px, held, allow_time_cap=allow_time_cap)
             if reason is None:
                 continue
             # 先移除持仓、再把所得入现金 → _equity()/summary() 立即反映平仓后的正确净值。
@@ -252,56 +367,137 @@ class PaperTrader:
             self._state["cash"] = self._state.get("cash", 0.0) + proceeds
             self._state["realized_pnl"] = self._state.get("realized_pnl", 0.0) + pnl
             changed = True
-            self._append_trade({
-                "action": "sell", "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            sell_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            trade_rec = {
+                "action": "sell", "time": sell_time,
+                "trade_id": str(pos.get("position_id") or self._stable_id(
+                    "paper-pos", pos["code"], pos.get("buy_date"), pos.get("buy_time"),
+                    pos["buy_price"], pos["shares"])),
                 "code": pos["code"], "name": self._name_map.get(_digits(pos["code"]), ""),
-                "buy_date": pos.get("buy_date"), "buy_price": pos["buy_price"],
-                "sell_date": _today(), "sell_price": round(px, 3), "held_days": held,
+                "buy_date": pos.get("buy_date"), "buy_time": pos.get("buy_time"),
+                "buy_price": pos["buy_price"], "sell_date": _today(),
+                "sell_price": round(px, 3), "held_days": held,
                 "exit_reason": reason, "peak": pos.get("peak"), "exp": pos.get("exp"),
                 "shares": pos["shares"], "pnl": round(pnl, 2), "return": round(ret, 4),
                 "equity_after": round(self._equity(), 2),
-            })
+            }
+            self._append_trade(trade_rec)
+            sold = True
             self._notifier.push(
                 f"[模拟盘] 卖出 {self._label(pos['code'])} @{px:.2f} {_EXIT_LABEL.get(reason, reason)}",
                 f"持有T+{held} 收益{ret:+.2%} 盈亏¥{pnl:,.0f}\n{self.summary()}")
         if changed:
             self._save_state()
+        if sold:
+            self._refresh_counterfactuals()
+
+    def _market_audit(self, code: str) -> dict:
+        snap = self._ctx.snapshot_of(code)
+        return {
+            "last": getattr(snap, "last", None) if snap is not None else None,
+            "pre_close": getattr(snap, "pre_close", None) if snap is not None else None,
+            "open": getattr(snap, "open", None) if snap is not None else None,
+            "vwap": self._ctx.vwap_of(code),
+            "bid_ask_imbalance": (
+                getattr(snap, "bid_ask_imbalance", None) if snap is not None else None),
+            "spread_pct": getattr(snap, "spread_pct", None) if snap is not None else None,
+            "is_limit_up": bool(
+                getattr(snap, "is_limit_up", False)) if snap is not None else False,
+        }
+
+    def _record_buy_decision(self, candidates: list[dict], account_before: dict,
+                             bought_count: int) -> None:
+        for rec in candidates:
+            rec["name"] = self._name_map.get(_digits(rec.get("code", "")), "")
+            rec["market"] = self._market_audit(rec.get("code", ""))
+        eligible = [r for r in candidates if r.get("status") == "eligible_ranked"]
+        if bought_count:
+            status = "bought" if bought_count == self._buy_n else "partial_fill"
+        elif eligible and all(r.get("entry_decision") == "filtered" for r in eligible):
+            status = "all_candidates_filtered"
+        elif eligible:
+            status = "insufficient_cash_or_lot"
+        else:
+            status = "no_ranked_candidate"
+        record = {
+            "schema_version": 1, "event_type": "paper_buy_decision",
+            "event_id": f"paper-buy-decision:{_today()}",
+            "trade_date": _today(), "decision_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "decision_status": status,
+            "paper_config": {
+                "buy_n": self._buy_n, "buy_start": self._buy_start,
+                "time_cap_start": self._time_cap_start, "cost_roundtrip": self._cost,
+                "rank_pool_n": getattr(self._cfg, "rank_pool_n", 30),
+                "rank_min_net_return": getattr(self._cfg, "rank_min_net_return", 0.0),
+                "entry_rich": self._entry_rich,
+                "entry_ask_strong": self._entry_ask_strong,
+                "entry_spread": self._entry_spread,
+            },
+            "account_before": account_before,
+            "account_after": {
+                "cash": self._state.get("cash", 0.0),
+                "position_count": len(self._state.get("positions", [])),
+                "bought_count": bought_count,
+            },
+            "candidates": candidates,
+        }
+        self._upsert_jsonl(self._decisions_file, "event_id", record)
 
     def _run_buys(self) -> None:
         """当日尚未建仓则按【重排后 score】降序买 Top-N，买前过滤追高票，均分现金。"""
         if self._state.get("last_buy_date") == _today():
             return
-        held_codes = {_digits(p["code"]) for p in self._state.get("positions", [])}
-        ranked = self._rank(exclude=held_codes)
-        if not ranked:
-            self._state["last_buy_date"] = _today()  # 无候选也标记，避免反复重算
-            self._save_state()
-            return
-        alloc = self._state.get("cash", 0.0) / self._buy_n  # 按目标只数均分（留现金给不足的腿）
+        positions = self._state.get("positions", [])
+        held_codes = {_digits(p["code"]) for p in positions}
+        account_before = {
+            "cash": self._state.get("cash", 0.0),
+            "position_count": len(positions), "held_codes": sorted(held_codes),
+        }
+        trace: list[dict] = []
+        ranked_rows = self._scorer.ranked(
+            exclude=held_codes, require_price=True, drop_limit_up=True, trace=trace)
+        trace_by_code = {rec["code"]: rec for rec in trace}
+        alloc = self._state.get("cash", 0.0) / self._buy_n
         bought: list[str] = []
-        for code, exp, px in ranked:
+        for row in ranked_rows:
+            code, exp, px = row.code, row.exp, row.px
+            audit = trace_by_code.get(_digits(code), {})
             if len(bought) >= self._buy_n:
-                break
-            skip = self._entry_skip(code, exp, px)  # 入场择时过滤：追高/偏贵/卖盘强则跳过
+                audit["entry_decision"] = "not_selected_below_buy_n"
+                continue
+            skip = self._entry_skip(code, exp, px)
             if skip:
+                audit.update({"entry_decision": "filtered", "entry_filter_reason": skip})
                 print(f"[paper] 跳过追高候选 {code}：{skip}", flush=True)
                 continue
             budget = min(alloc, self._state.get("cash", 0.0))
-            shares = int(budget / (px * (1 + self._cost / 2.0)) // 100) * 100  # A股整百手
+            shares = int(budget / (px * (1 + self._cost / 2.0)) // 100) * 100
             if shares <= 0:
+                audit["entry_decision"] = "insufficient_lot_cash"
                 continue
             cost_basis = px * shares * (1 + self._cost / 2.0)
             if cost_basis > self._state.get("cash", 0.0):
+                audit["entry_decision"] = "insufficient_cash"
                 continue
+            buy_time = time.strftime("%H:%M:%S")
+            position_id = self._stable_id(
+                "paper-pos", code, _today(), buy_time, round(px, 3), shares)
             self._state["cash"] -= cost_basis
             self._state.setdefault("positions", []).append({
+                "position_id": position_id,
                 "code": code, "name": self._name_map.get(_digits(code), ""),
-                "buy_date": _today(), "buy_time": time.strftime("%H:%M:%S"),
+                "buy_date": _today(), "buy_time": buy_time,
                 "buy_price": round(px, 3), "shares": shares, "peak": round(px, 3),
                 "cost_basis": round(cost_basis, 2), "exp": round(exp, 4)})
+            audit.update({
+                "entry_decision": "bought", "position_id": position_id,
+                "shares": shares, "fill_price": round(px, 3),
+                "allocated_cash": budget, "cost_basis": round(cost_basis, 2),
+            })
             bought.append(f"{self._label(code)} @{px:.2f} {self._exp_str(code, exp)} {shares}股")
         self._state["last_buy_date"] = _today()
         self._save_state()
+        self._record_buy_decision(trace, account_before, len(bought))
         if bought:
             self._notifier.push(
                 f"[模拟盘] 买入 {len(bought)}只 {_dt.datetime.now():%m-%d %H:%M}",
@@ -340,14 +536,9 @@ class PaperTrader:
         return None
 
     def _exp_str(self, code: str, exp: float) -> str:
-        """展示用预期字符串：优先历史校准值 + 胜率，缺校准回退原始 ridge_pred。"""
+        """展示扣除模拟盘 round-trip 成本后的净收益，并保留毛收益口径。"""
         r = self._ctx.ref_of(code) or self._ctx.ref_of(_digits(code))
-        cal = getattr(r, "calibrated_return", None) if r is not None else None
-        wr = getattr(r, "win_rate", None) if r is not None else None
-        if cal is not None:
-            wr_str = f" 胜率{wr:.0%}" if wr is not None else ""
-            return f"预期{cal:+.1%}{wr_str}"
-        return f"预期{exp:+.1%}"
+        return expected_return_text(r, exp, self._cost)
 
     def _rank(self, exclude: Optional[set] = None) -> list:
         """按【重排后 score】降序返回可买候选 [(code, exp, price)]。

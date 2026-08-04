@@ -159,12 +159,13 @@ def main() -> int:
         _fail("HoldingExpiry 对非持仓票误触发")
         errors += 1
 
-    # default_strategies 应装配 7 条
+    # 高开惩罚已判负，默认只装配 6 条已验证策略；GapCalibrate 类仍保留供显式实验。
     ds = default_strategies()
-    if len(ds) == 7:
-        _ok(f"default_strategies 装配 7 条：{[s.name for s in ds]}")
+    ds_names = [s.name for s in ds]
+    if len(ds) == 6 and "gap_calibrate" not in ds_names:
+        _ok(f"default_strategies 装配 6 条已验证策略：{ds_names}")
     else:
-        _fail(f"default_strategies 数量异常: {len(ds)}")
+        _fail(f"default_strategies 装配异常: {ds_names}")
         errors += 1
 
     # 6) DummyFeed 短跑（验证 feed 线程 + 回调）

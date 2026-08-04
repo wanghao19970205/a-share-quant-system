@@ -96,6 +96,7 @@
 │   └── refresh_qfq.py         #   qfq 复权口径维护（除权票重拉）
 │
 ├── realtime/                  # ⚡ 盘中实时策略层（交易时段常驻）
+│   ├── README.md              #   现役策略、参数、审计与部署说明
 │   ├── engine.py              #   主循环+生命周期（自管交易时段）
 │   ├── feed.py                #   订阅流封装（L1 快照回调）
 │   ├── rerank.py              #   ⭐ 盘中动态重排打分器（共享入口）
@@ -278,7 +279,7 @@ docker exec -d a-scheduler-1 /app/docker/scheduler_jobs.sh daily-light
 | 时间 | 任务 | 说明 |
 |---|---|---|
 | 交易日 09:20 | `realtime` | 拉起盘中实时层引擎（常驻至收盘自动退出） |
-| 交易日 09-14 每 10min | `realtime` | 🐕 **watchdog 自愈**：引擎被重训 OOM 挤死则自动重拉，赶在 14:50 买入窗前恢复 |
+| 交易日 09-14 每 10min | `realtime` | 🐕 **watchdog 自愈**：引擎被重训 OOM 挤死则自动重拉，保障 14:50 到期卖出与 14:55 买入 |
 | 交易日 10:30 / 13:30 | `intraday-light` | 盘中轻量刷新（训练最近 6 窗） |
 | 交易日 11:40 | `daily-light` | 盘中快速日更 + 短线/波段训练 + 发布 |
 | 周一~周四 15:05 | `daily-light` | 收盘后快速日更 |
@@ -341,7 +342,7 @@ docker exec -it a-scheduler-1 sh -lc 'cd /app && python -m py_compile \
 <details>
 <summary><b>实时层引擎被重训 OOM 连坐（watchdog 自愈）</b></summary>
 
-- **现象**：引擎（内存很轻）被 10:30/13:30 盘中重训（峰值 ~9.5GB 撞 16GB 物理墙）连坐 OOM kill，导致当日 14:50 买入窗无买入腿。
+- **现象**：引擎（内存很轻）被 10:30/13:30 盘中重训（峰值 ~9.5GB 撞 16GB 物理墙）连坐 OOM kill，导致当日 14:50 到期卖出与 14:55 买入腿缺失。
 - **修复**：cron 交易时段每 10 分钟扫 `/proc`——引擎活着零副作用 SKIP，死了 10 分钟内自动重拉。分钟错开 :20 避免与 09:20 首拉起双引擎。
 </details>
 

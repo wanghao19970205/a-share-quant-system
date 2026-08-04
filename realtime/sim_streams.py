@@ -15,14 +15,19 @@
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import tempfile
 from pathlib import Path
 
+import pandas as pd
+
+from realtime import paper_trader as paper_mod
 from realtime.snapshot import Snapshot
-from realtime.strategy import StrategyContext
+from realtime.strategy import StrategyContext, default_strategies
 from realtime.rerank import RerankScorer
 from realtime.paper_trader import PaperTrader
-from realtime.reference import RefRow
+from realtime.reference import RefRow, expected_return_text
+from realtime.watchlist import load_codes
 
 # ---- 轻量断言框架 ----------------------------------------------------------
 _PASS = 0
@@ -43,7 +48,8 @@ def check(cond: bool, msg: str) -> None:
 class Cfg:
     paper_trade_enabled = True
     paper_buy_n = 2
-    paper_buy_start = 1450
+    paper_buy_start = 1455
+    paper_time_cap_start = 1450
     paper_start_equity = 100000.0
     paper_cost = 0.002
     sell_horizon = 1
@@ -51,7 +57,7 @@ class Cfg:
     paper_take_profit = 0.09
     paper_trail_k = 3.0
     paper_vwap_break = 0.02
-    paper_entry_gap_eaten = 0.6
+    paper_entry_gap_eaten = 0.0
     paper_entry_rich = 0.01
     paper_entry_ask_strong = 0.2
     ledger_dir = "/tmp"
@@ -61,8 +67,9 @@ class Cfg:
     rerank_cap = 0.30
     rerank_w_vwap = 0.35
     rerank_w_imb = 0.30
-    rerank_w_gap = 0.20
+    rerank_w_gap = 0.0
     rerank_w_spread = 0.15
+    rank_min_net_return = 0.0
 
 
 class FakeNotifier:
@@ -204,7 +211,7 @@ def scenario_D():
     snaps = [mk_snap("000001", 10.0, pre_close=10.0, vwap=10.0)]
     ctx = build_ctx(refs, snaps)
     trader = PaperTrader(new_cfg(paper_buy_n=1), ctx, FakeNotifier())
-    trader.maybe_trade(1450)  # 收盘前买入窗
+    trader.maybe_trade(1455)  # 收盘前买入窗
     check(len(trader._state["positions"]) == 1, "买入窗成功建仓 1 只")
     # 同日价格暴跌 -20%，再评估出场
     ctx.update(mk_snap("000001", 8.0, pre_close=10.0, vwap=10.0))
@@ -287,8 +294,9 @@ def scenario_F():
         mk_snap("000800", 10.0, pre_close=10.0, open_px=10.0, vwap=10.0, imb=0.0, spread=0.001),
     ]
     ctx = build_ctx(refs, snaps)
-    trader = PaperTrader(new_cfg(paper_buy_n=1), ctx, FakeNotifier())
-    trader.maybe_trade(1450)
+    trader = PaperTrader(new_cfg(paper_buy_n=1, paper_entry_gap_eaten=0.6),
+                         ctx, FakeNotifier())
+    trader.maybe_trade(1455)
     held = [p["code"] for p in trader._state["positions"]]
     print(f"     持仓={held}")
     check("000700" not in held, "追高票(000700 高开吃预期60%)被入场过滤跳过")
@@ -320,12 +328,154 @@ def scenario_G():
     check(all(abs(r.adj) < 1e-9 for r in rows), "缺量各票 adj=0（无盘中微调，不误判）")
 
 
+# ============================================================================
+# H. 模拟盘持仓保护性订阅：即使跌出 Top10 也必须保留报价
+# ============================================================================
+def scenario_H():
+    """验证模拟盘持仓在订阅上限下仍受保护。"""
+    print("\n== H. 模拟盘持仓保护性订阅（不被 Top10 / 上限挤掉）==")
+    cfg = new_cfg()
+    root = Path(cfg.ledger_dir)
+    cfg.mobile_snapshot_file = root / "mobile_snapshot.json"
+    cfg.holdings_file = root / "realtime_holdings.txt"
+    cfg.predictions_file = root / "missing_predictions.parquet"
+    cfg.universe_file = root / "missing_universe.txt"
+    cfg.max_subscribe = 1
+    Path(cfg.paper_state_file).write_text(json.dumps({
+        "cash": 50000,
+        "positions": [{"code": "600941.SH"}, {"code": "000766"}],
+    }), encoding="utf-8")
+    cfg.mobile_snapshot_file.write_text(json.dumps({
+        "groups": {"全A": {"rows": [{"code": "000001"}]}}
+    }, ensure_ascii=False), encoding="utf-8")
+    codes = load_codes(cfg)
+    print(f"     订阅={codes}")
+    check(codes == ["600941", "000766"],
+          "全部模拟盘持仓优先订阅，max_subscribe 截断也不丢报价")
+
+
+# ============================================================================
+# I. 成本后净预期门：毛收益不能覆盖 round-trip 成本的票不入池
+# ============================================================================
+def scenario_I():
+    """验证成本后净收益门过滤毛正净负候选。"""
+    print("\n== I. 成本后净预期门（过滤毛正净负候选）==")
+    refs = {
+        "000910": RefRow(expected_return=0.0030, calibrated_return=0.00156,
+                          calibrated_net_return=-0.00044, win_rate=0.49),
+        "000911": RefRow(expected_return=0.0050, calibrated_return=0.00578,
+                          calibrated_net_return=0.00377, win_rate=0.52),
+    }
+    snaps = [mk_snap("000910", 10.0), mk_snap("000911", 10.0)]
+    rows = RerankScorer(new_cfg(), build_ctx(refs, snaps)).ranked()
+    check([r.code for r in rows] == ["000911"], "仅校准净收益覆盖成本的候选入榜")
+    text = expected_return_text(refs["000910"], 0.0030, 0.002)
+    print(f"     展示={text}")
+    check("历史净-0.04%" in text and "毛+0.16%" in text,
+          "展示同时给出扣费净收益与历史毛收益，不再四舍五入成模糊 +0.1%")
+
+
+# ============================================================================
+# J. 高开惩罚默认关闭：隔夜动量不再被错误减分或拦买
+# ============================================================================
+def scenario_J():
+    """验证高开惩罚默认关闭且不再生成误导信号。"""
+    print("\n== J. 高开惩罚默认关闭（保留隔夜动量）==")
+    refs = {"000920": RefRow(expected_return=0.05, calibrated_net_return=0.01)}
+    snap = mk_snap("000920", 10.3, pre_close=10.0, open_px=10.3,
+                   vwap=10.3, imb=0.0, spread=0.0025)
+    ctx = build_ctx(refs, [snap])
+    cfg = new_cfg(rerank_w_vwap=0.0, rerank_w_imb=0.0, rerank_w_spread=0.0)
+    row = RerankScorer(cfg, ctx).ranked()[0]
+    trader = PaperTrader(cfg, ctx, FakeNotifier())
+    check(all(reason[0] != "追高" for reason in row.reasons), "高开不再触发错误方向的重排减分")
+    check(trader._entry_skip("000920", 0.05, 10.3) is None, "高开不再触发错误方向的入场阻断")
+    check("gap_calibrate" not in {s.name for s in default_strategies()},
+          "高开吃预期不再进入默认信号策略")
+
+
+# ============================================================================
+# K. 到期卖出口径：T+1 风险退出全天有效，纯 time_cap 只在收盘前执行
+# ============================================================================
+def scenario_K():
+    """验证到期仓不会在 T+1 开盘卖飞，而在收盘前按 close 口径退出。"""
+    print("\n== K. 到期卖出口径（风险全天、到期收盘前）==")
+    trader = _exit_trader(10.0, vwap=10.0, atr=None)
+    trader._run_sells(930)
+    check(len(trader._state["positions"]) == 1,
+          "T+1 早盘无风险信号时继续持有，不把 close→close 做成 next-open")
+    trader._run_sells(1450)
+    check(len(trader._state["positions"]) == 0 and _last_exit(trader) == "time_cap",
+          "T+1 到 14:50 后按 time_cap 收盘前退出")
+
+    refs = {"000930": RefRow(expected_return=0.05, calibrated_net_return=0.01)}
+    ctx = build_ctx(refs, [mk_snap("000930", 10.0, vwap=10.0)])
+    buyer = PaperTrader(new_cfg(paper_buy_n=1), ctx, FakeNotifier())
+    buyer.maybe_trade(1450)
+    check(not buyer._state["positions"], "14:50 先完成旧仓到期腿，不提前建立新仓")
+    buyer.maybe_trade(1455)
+    check(len(buyer._state["positions"]) == 1, "14:55 后才按收盘口径建立新仓")
+
+
+# ============================================================================
+# L. 决策审计：买入全候选理由 + 卖出后反事实幂等补齐
+# ============================================================================
+def scenario_L():
+    """验证决策快照完整记录过滤/成交，反事实重复补齐不产生重复行。"""
+    print("\n== L. 决策审计（买入 trace + 卖出反事实）==")
+    refs = {
+        "000940": RefRow(expected_return=0.06, calibrated_net_return=0.01),
+        "000941": RefRow(expected_return=0.05, calibrated_net_return=0.01),
+        "000942": RefRow(expected_return=0.04, calibrated_net_return=-0.001),
+    }
+    snaps = [
+        mk_snap("000940", 10.2, vwap=10.0),
+        mk_snap("000941", 10.0, vwap=10.0),
+        mk_snap("000942", 10.0, vwap=10.0),
+    ]
+    trader = PaperTrader(new_cfg(paper_buy_n=1), build_ctx(refs, snaps), FakeNotifier())
+    trader.maybe_trade(1455)
+    decisions = [json.loads(x) for x in trader._decisions_file.read_text().splitlines()]
+    by_code = {r["code"]: r for r in decisions[0]["candidates"]}
+    check(by_code["000940"]["entry_decision"] == "filtered",
+          "买入快照记录高于 VWAP 的过滤原因")
+    check(by_code["000941"]["entry_decision"] == "bought",
+          "买入快照记录最终成交、股数和成本")
+    check(by_code["000942"]["status"] == "excluded_net_return_gate",
+          "买入快照记录模型池前置净收益门槛")
+
+    trade = {
+        "action": "sell", "time": "2026-08-04 14:50:00", "code": "000941",
+        "buy_date": "2026-08-03", "buy_time": "14:55:00", "buy_price": 10.0,
+        "sell_date": "2026-08-04", "sell_price": 10.1, "shares": 1000,
+        "pnl": 79.9, "return": 0.008, "exit_reason": "time_cap",
+    }
+    trader._trades_file.write_text(json.dumps(trade) + "\n", encoding="utf-8")
+    original = paper_mod.warehouse.load_price_tail
+    paper_mod.warehouse.load_price_tail = lambda *_args, **_kwargs: pd.DataFrame({
+        "date": pd.to_datetime(["2026-08-04", "2026-08-05"]),
+        "close": [10.3, 10.5], "high": [10.4, 10.6],
+    })
+    try:
+        trader._refresh_counterfactuals()
+        trader._refresh_counterfactuals()
+    finally:
+        paper_mod.warehouse.load_price_tail = original
+    counterfactuals = [
+        json.loads(x) for x in trader._counterfactuals_file.read_text().splitlines()]
+    check(len(counterfactuals) == 1, "同一卖出 trade_id 重复补齐仍只有一条记录")
+    check(len(counterfactuals[0]["markouts"]) == 2 and
+          counterfactuals[0]["markouts"][0]["opportunity_pnl"] > 0,
+          "反事实记录卖出日和后续日的收盘/最高价及机会损益")
+
+
 def main() -> int:
     print("=" * 68)
     print(" 虚拟数据流验证：实时层重排/模拟盘/出场逻辑")
     print("=" * 68)
     for fn in (scenario_A, scenario_B, scenario_C, scenario_D,
-               scenario_E, scenario_F, scenario_G):
+               scenario_E, scenario_F, scenario_G, scenario_H,
+               scenario_I, scenario_J, scenario_K, scenario_L):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

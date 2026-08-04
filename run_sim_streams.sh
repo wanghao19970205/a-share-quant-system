@@ -53,9 +53,9 @@ echo "-- ast.parse 语法自检 --"
 docker exec "$CT" python3 -c "import ast,sys; ast.parse(open('/tmp/sim_streams.py').read()); print('  [ok] AST OK')" \
   || { echo "  [abort] sim_streams.py 语法错误"; exit 2; }
 
-# ---- 4) 跑虚拟数据流（PYTHONPATH=/app 以 import 现役 realtime 包）----
-echo "-- 运行虚拟数据流验证（下方 PASS/FAIL 为断言结果）--"
-docker exec -e PYTHONPATH=/app "$CT" python3 /tmp/sim_streams.py
+# ---- 4) 直接运行镜像内现役测试模块；/tmp 内嵌副本不再作为执行源 ----
+echo "-- 运行镜像内 realtime.sim_streams（下方 PASS/FAIL 为断言结果）--"
+docker exec -e PYTHONPATH=/app "$CT" python3 -m realtime.sim_streams
 RC=$?
 
 echo ""
@@ -65,7 +65,7 @@ if [ "$RC" -eq 0 ]; then
 else
   echo " ❌ 有断言失败（见上方 [FAIL] 行），RC=$RC"
 fi
-echo " 提示：本验证跑的是容器内现役 /app/realtime 代码；sim_streams.py 仅在 /tmp 临时态。"
+echo " 提示：断言直接运行镜像内 /app/realtime/sim_streams.py；/tmp 旧载荷不参与执行。"
 echo "=================================================================="
 exit $RC
 

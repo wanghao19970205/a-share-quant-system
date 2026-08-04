@@ -124,11 +124,15 @@ class Engine:
             print(f"[engine] 订阅已停止{('：' + reason) if reason else ''}", flush=True)
 
     # ---- 盘中名单自动重载 ----------------------------------------------------
-    def _src_mtimes(self) -> tuple[float, float]:
-        return (_mtime(self._cfg.mobile_snapshot_file), _mtime(self._cfg.holdings_file))
+    def _src_mtimes(self) -> tuple[float, float, float]:
+        return (
+            _mtime(self._cfg.mobile_snapshot_file),
+            _mtime(self._cfg.holdings_file),
+            _mtime(self._cfg.paper_state_file),
+        )
 
     def _maybe_reload(self) -> None:
-        """盘中检测 Top10 快照 / 持仓文件是否更新；变了且码集变化则 execv 自我重启。
+        """盘中检测 Top10、人工持仓或模拟盘状态更新；码集变化则 execv 自我重启。
 
         AmazingData SDK 无可靠优雅 stop（见 feed.AmazingDataFeed.stop 注释），进程内换订阅
         会残留旧订阅线程 → 重复推送 + 抢券商连接。故用 os.execv 整体替换进程映像：daemon
@@ -149,8 +153,8 @@ class Engine:
         new_key = frozenset(new_codes)
         if not new_key or new_key == self._codes_key:
             return  # 空清单不切（防误清空）；码集无变化不重启
-        print(f"[engine] 订阅清单更新（Top10/持仓变化 {len(self._codes_key)}→{len(new_key)} 只），"
-              f"重启引擎重新订阅 ...", flush=True)
+        print(f"[engine] 订阅清单更新（Top10/人工持仓/模拟盘变化 "
+              f"{len(self._codes_key)}→{len(new_key)} 只），重启引擎重新订阅 ...", flush=True)
         sys.stdout.flush()
         sys.stderr.flush()
         os.execv(sys.executable, [sys.executable, "-m", "realtime.engine"])
@@ -186,11 +190,12 @@ class Engine:
             self._rankboard = RankBoard(self._cfg, self._ctx, self._notifier, name_map)
             print(f"[engine] 实时候选榜就绪：每 {self._cfg.rank_interval_sec}s 推 Top{self._cfg.rank_top_n}"
                   f"（仅榜单变化时）", flush=True)
-        # 装配实时模拟盘（纸上账户）：收盘前 paper_buy_start 按模型 Top-N 买入、T+N 到期卖出。
+        # 装配实时模拟盘：收盘前先执行 T+N 到期腿，再按模型 Top-N 建新仓。
         if self._cfg.paper_trade_enabled:
             self._paper = PaperTrader(self._cfg, self._ctx, self._notifier, name_map)
-            print(f"[engine] 模拟盘就绪：{self._paper.summary()}，收盘前{1500 - self._cfg.paper_buy_start}"
-                  f"分钟买 Top{self._cfg.paper_buy_n}、T+{self._cfg.sell_horizon} 卖出", flush=True)
+            print(f"[engine] 模拟盘就绪：{self._paper.summary()}，"
+                  f"{self._cfg.paper_time_cap_start} 后到期卖、{self._cfg.paper_buy_start} 后买 "
+                  f"Top{self._cfg.paper_buy_n}（T+{self._cfg.sell_horizon}）", flush=True)
         print(f"[engine] 启动实时层：清单 {len(codes)} 只，"
               f"时段 {self._cfg.session_start}-{self._cfg.session_end}，"
               f"策略 {[s.name for s in self._strategies]}", flush=True)

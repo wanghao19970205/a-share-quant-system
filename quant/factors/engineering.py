@@ -22,6 +22,10 @@ from quant import config, warehouse
 
 
 _PRICE_COLS = ["open", "high", "low", "close", "volume", "amount", "turnover", "pct_change"]
+_VALUATION_COLS = [
+    "pe_ttm", "pe_static", "pb", "ps", "peg", "pcf",
+    "mv_total", "mv_float", "log_mv_total", "log_mv_float",
+]
 _PANEL_WORKERS = 12
 _PRICE_PROCESS_MIN_CODES = 50
 _PRICE_PROCESS_WORKERS = min(
@@ -202,7 +206,7 @@ def _valuation_factors(code: str, start_date: pd.Timestamp | None = None) -> pd.
     if start_date is not None:
         df = df[df["date"] >= pd.Timestamp(start_date)].copy()
     keep = ["code", "date"]
-    for c in ("pe_ttm", "pe_static", "pb", "ps", "peg", "pcf", "mv_total", "mv_float"):
+    for c in _VALUATION_COLS[:8]:
         if c in df.columns:
             df[c] = _num(df[c])
             keep.append(c)
@@ -410,6 +414,11 @@ def build_panel(codes: list[str] | None = None, limit: int = 0, horizon: int = 5
     if val_parts:
         val = pd.concat(val_parts, ignore_index=True)
         panel = panel.merge(val, on=["code", "date"], how="left", suffixes=("", "_val"))
+    # 跨月增量刷新可能早于当月估值数据到达。即使本轮 val_parts 全空，也必须保留
+    # 稳定 schema，否则历史窗口按既有因子列读取新月份 parquet 会直接 ArrowInvalid。
+    for c in _VALUATION_COLS:
+        if c not in panel.columns:
+            panel[c] = np.nan
     print(
         f"[panel:raw:timing] stage=valuation seconds={time.perf_counter() - stage_started:.2f}",
         flush=True,
@@ -531,7 +540,7 @@ def _feature_kind(name: str) -> str:
         return "price_volume_continuous"
     if name.startswith("ovn_"):
         return "overnight_gap_continuous"
-    if name in {"pe_ttm", "pe_static", "pb", "ps", "peg", "pcf", "mv_total", "mv_float", "log_mv_total", "log_mv_float"}:
+    if name in _VALUATION_COLS:
         return "valuation_continuous"
     if name.startswith(("yjbb_", "income_", "cashflow_", "balance_")):
         return "financial_continuous"
