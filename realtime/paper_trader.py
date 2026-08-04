@@ -62,6 +62,16 @@ _EXIT_LABEL = {
 
 
 class PaperTrader:
+    # 子类可设文件名后缀（如 V2 赛马账户设 "_v2"），使状态/流水/审计在构造前即完全隔离。
+    _FILE_SUFFIX = ""
+
+    @classmethod
+    def _suffixed(cls, base: Path) -> Path:
+        """按 _FILE_SUFFIX 派生同目录同后缀的账户文件名；空后缀时原样返回。"""
+        if not cls._FILE_SUFFIX:
+            return base
+        return base.parent / f"{base.stem}{cls._FILE_SUFFIX}{base.suffix}"
+
     def __init__(self, cfg, ctx: StrategyContext, notifier: Notifier,
                  name_map: Optional[dict] = None):
         self._cfg = cfg
@@ -85,12 +95,15 @@ class PaperTrader:
         self._entry_ask_strong = float(getattr(cfg, "paper_entry_ask_strong", 0.2))
         self._entry_spread = float(getattr(cfg, "paper_entry_spread", 0.006))
         self._scorer = RerankScorer(cfg, ctx)  # 与 RankBoard 共用的盘中重排打分器
-        self._state_file = Path(getattr(cfg, "paper_state_file", "")
-                                or (Path(getattr(cfg, "ledger_dir", ".")) / "paper_state.json"))
-        self._trades_file = self._state_file.with_name("paper_trades.jsonl")
-        self._decisions_file = self._state_file.with_name("paper_buy_decisions.jsonl")
-        self._counterfactuals_file = self._state_file.with_name(
-            "paper_sell_counterfactuals.jsonl")
+        base_state = Path(getattr(cfg, "paper_state_file", "")
+                          or (Path(getattr(cfg, "ledger_dir", ".")) / "paper_state.json"))
+        # 四个账户文件在任何 I/O 之前一次性定型，子类只需声明 _FILE_SUFFIX 即完全隔离。
+        self._state_file = self._suffixed(base_state)
+        self._trades_file = self._suffixed(base_state.with_name("paper_trades.jsonl"))
+        self._decisions_file = self._suffixed(
+            base_state.with_name("paper_buy_decisions.jsonl"))
+        self._counterfactuals_file = self._suffixed(
+            base_state.with_name("paper_sell_counterfactuals.jsonl"))
         self._acted_today = False  # 当日买入腿是否已跑过（进程内哨兵，防同日重复建仓）
         self._state = self._load_state()
         self._refresh_counterfactuals()
@@ -124,10 +137,11 @@ class PaperTrader:
     def _save_state(self) -> None:
         try:
             self._state_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._state_file.with_suffix(".tmp")
+            # 唯一临时名 + 原子替换：避免多进程/重启窗口下互相覆盖同一 .tmp。
+            tmp = self._state_file.with_suffix(f".{os.getpid()}.tmp")
             tmp.write_text(json.dumps(self._state, ensure_ascii=False, indent=2),
                            encoding="utf-8")
-            tmp.replace(self._state_file)  # 原子替换，避免半写
+            os.replace(tmp, self._state_file)
         except Exception as e:  # noqa: BLE001 - 落盘失败不拖垮主循环
             print(f"[paper] 写状态失败：{type(e).__name__}", flush=True)
 

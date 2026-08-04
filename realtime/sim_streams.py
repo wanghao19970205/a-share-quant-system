@@ -26,6 +26,7 @@ from realtime.snapshot import Snapshot
 from realtime.strategy import StrategyContext, default_strategies
 from realtime.rerank import RerankScorer
 from realtime.paper_trader import PaperTrader
+from realtime.v2 import V2PaperTrader
 from realtime.reference import RefRow, expected_return_text
 from realtime.watchlist import load_codes
 
@@ -47,9 +48,16 @@ def check(cond: bool, msg: str) -> None:
 # ---- 假配置：属性齐全，阈值取生产默认 --------------------------------------
 class Cfg:
     paper_trade_enabled = True
+    paper_v2_enabled = True
     paper_buy_n = 2
     paper_buy_start = 1455
+    paper_buy_end = 1457
     paper_time_cap_start = 1450
+    paper_max_positions = 4
+    paper_breakeven_arm = 0.03
+    paper_breakeven_margin = 0.005
+    paper_take_profit_tighten = 0.03
+    paper_limit_down_roll_max = 3
     paper_start_equity = 100000.0
     paper_cost = 0.002
     sell_horizon = 1
@@ -123,6 +131,15 @@ def new_cfg(**over):
     c.paper_state_file = str(Path(d) / "paper_state.json")  # 不预创建 → 起干净空仓
     for k, v in over.items():
         setattr(c, k, v)
+
+    def _paper_state_files():
+        base = Path(c.paper_state_file)
+        files = [base]
+        if getattr(c, "paper_v2_enabled", False):
+            files.append(base.parent / f"{base.stem}_v2{base.suffix}")
+        return tuple(files)
+
+    c.paper_state_files = _paper_state_files
     return c
 
 
@@ -469,13 +486,171 @@ def scenario_L():
           "反事实记录卖出日和后续日的收盘/最高价及机会损益")
 
 
+# ============================================================================
+# M. V2 赛马对照：动态分配 + 保护止盈 + 买窗到 1457
+# ============================================================================
+def scenario_M():
+    """验证 V2 端到端：资金利用率提升 / 保护性止盈不误触发 / 买窗到 14:57。"""
+    print("\n== M. V2 赛马（动态分配 + 保护止盈 + 买窗 1457）==")
+    refs = {
+        "000945": RefRow(expected_return=0.05, calibrated_net_return=0.01),
+        "000946": RefRow(expected_return=0.04, calibrated_net_return=0.01),
+    }
+    snaps = [mk_snap("000945", 450.0, vwap=450.0), mk_snap("000946", 10.0, vwap=10.0)]
+    trader = V2PaperTrader(
+        new_cfg(paper_buy_n=2), build_ctx(refs, snaps), FakeNotifier())
+    trader.maybe_trade(1456)
+    held = [p["code"] for p in trader._state["positions"]]
+    print(f"     V2持仓={held}")
+    check("000946" in held, "V2 高价股资金不足名额顺延到下一只")
+    # 名义等额分配但高价股只买得起 100 股(¥45,045)，余钱集中到第二只
+    total_shares = sum(p["shares"] for p in trader._state["positions"])
+    check(total_shares >= 5500,
+          f"V2 动态分配总股数 ≥ 5500（实际 {total_shares}）")
+
+    # 场景 2：V2 买窗收窄配置生效（地板值 1455）
+    trader2 = V2PaperTrader(
+        new_cfg(paper_buy_n=1, paper_buy_end=1450), build_ctx(refs, snaps), FakeNotifier())
+    check(trader2._buy_end >= 1455, f"V2 buy_end 铁底 1455（got {trader2._buy_end}）")
+
+    # 场景 3：保护性止盈完整校验
+    cfg_v2 = new_cfg()
+    trader3 = V2PaperTrader(cfg_v2, build_ctx(
+        {"000948": RefRow(expected_return=0.05)},
+        [mk_snap("000948", 10.05, vwap=10.05)]), FakeNotifier())
+    print(f"     breakeven_arm={trader3._breakeven_arm} breakeven_margin={trader3._breakeven_margin}")
+    pos = {"code": "000948", "buy_price": 10.0, "peak": 10.4, "shares": 1000,
+           "cost_basis": 10000.0}
+    reason = trader3._exit_decision(pos, 10.05, 1, True)
+    check(reason == "breakeven_stop",
+          f"V2 浮盈 4% 回撤到 +0.5% 触发保本退出（got {reason}）")
+    # 情景 b：peak=10.1 (< buy_price+3%=10.3)，不触发保护，落到 time_cap
+    reason2 = trader3._exit_decision(
+        {**pos, "peak": 10.1}, 10.09, 1, True)
+    check(reason2 != "breakeven_stop",
+          "V2 peak 仅 +1% 不误触发保本退出")
+
+    # 场景 4：V2 审计文件名必须保留原后缀（后缀派生不得吃掉 .jsonl 的 l）
+    names = {n: V2PaperTrader._suffixed(Path("/x") / n).name for n in (
+        "paper_state.json", "paper_trades.jsonl",
+        "paper_buy_decisions.jsonl", "paper_sell_counterfactuals.jsonl")}
+    print(f"     V2文件名={list(names.values())}")
+    check(names == {
+        "paper_state.json": "paper_state_v2.json",
+        "paper_trades.jsonl": "paper_trades_v2.jsonl",
+        "paper_buy_decisions.jsonl": "paper_buy_decisions_v2.jsonl",
+        "paper_sell_counterfactuals.jsonl": "paper_sell_counterfactuals_v2.jsonl",
+    }, "V2 四个审计文件名均为 _v2 且后缀完整")
+
+    # 场景 5：炸板判定走公开接口，不再访问私有状态；T+1 持仓评估不抛异常
+    ctx5 = build_ctx({"000949": RefRow(expected_return=0.05, atr=0.1)},
+                     [mk_snap("000949", 10.5, pre_close=10.0, vwap=10.5)])
+    trader5 = V2PaperTrader(new_cfg(), ctx5, FakeNotifier())
+    yesterday = (_dt.date.today() - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    trader5._state["positions"] = [{
+        "code": "000949", "buy_price": 10.0, "peak": 10.5, "shares": 1000,
+        "cost_basis": 10010.0, "buy_date": yesterday, "buy_time": "14:56:00"}]
+    trader5._run_sells(1030)
+    check(len(trader5._state["positions"]) == 1,
+          "V2 T+1 持仓早盘无风险信号时不抛异常且继续持有")
+
+    # 场景 6：任一出场原因成交后，磁盘状态必须与内存一致（防重启重复卖出）
+    ctx6 = build_ctx({"000950": RefRow(expected_return=0.05, atr=None)},
+                     [mk_snap("000950", 10.0, pre_close=10.0, vwap=10.0)])
+    trader6 = V2PaperTrader(new_cfg(), ctx6, FakeNotifier())
+    trader6._state["positions"] = [{
+        "code": "000950", "buy_price": 10.0, "peak": 10.0, "shares": 1000,
+        "cost_basis": 10010.0, "buy_date": yesterday, "buy_time": "14:56:00"}]
+    trader6._save_state()
+    trader6._run_sells(1450)
+    disk = json.loads(trader6._state_file.read_text())
+    check(not disk["positions"] and abs(disk["cash"] - trader6._state["cash"]) < 0.01,
+          "V2 到期卖出后磁盘状态与内存一致（现金已入账、持仓已移除）")
+
+    # 场景 7：V2 构造绝不触碰 V1 的四个账户文件
+    cfg7 = new_cfg()
+    v1_state = Path(cfg7.paper_state_file)
+    v1_state.parent.mkdir(parents=True, exist_ok=True)
+    v1_state.with_name("paper_trades.jsonl").write_text(json.dumps({
+        "action": "sell", "code": "000951", "buy_date": "2026-08-03",
+        "buy_price": 10.0, "sell_date": "2026-08-04", "sell_price": 10.2,
+        "shares": 1000, "pnl": 180.0, "return": 0.018,
+        "exit_reason": "time_cap"}) + "\n", encoding="utf-8")
+    before = {p.name for p in v1_state.parent.iterdir()}
+    original = paper_mod.warehouse.load_price_tail
+    paper_mod.warehouse.load_price_tail = lambda *_a, **_k: pd.DataFrame({
+        "date": pd.to_datetime(["2026-08-04", "2026-08-05"]),
+        "close": [10.5, 10.7], "high": [10.6, 10.8]})
+    try:
+        V2PaperTrader(cfg7, build_ctx({"000951": RefRow(expected_return=0.05)},
+                                      [mk_snap("000951", 10.2)]), FakeNotifier())
+    finally:
+        paper_mod.warehouse.load_price_tail = original
+    created = {p.name for p in v1_state.parent.iterdir()} - before
+    v1_cf = v1_state.with_name("paper_sell_counterfactuals.jsonl")
+    print(f"     V2构造新建={sorted(created)} V1反事实存在={v1_cf.exists()}")
+    check(all("_v2" in n for n in created) and not v1_cf.exists(),
+          "V2 构造只写 _v2 文件，不读不写 V1 状态/流水/审计")
+
+    # 场景 8：跌停顺延按交易日计数，同日多次心跳不重复累加
+    ld_snap = mk_snap("000952", 9.0, pre_close=10.0, vwap=9.0)
+    object.__setattr__(ld_snap, "low_limited", 9.0)
+    ctx8 = build_ctx({"000952": RefRow(expected_return=0.05)}, [ld_snap])
+    trader8 = V2PaperTrader(new_cfg(), ctx8, FakeNotifier())
+    trader8._state["positions"] = [{
+        "code": "000952", "buy_price": 10.0, "peak": 10.0, "shares": 1000,
+        "cost_basis": 10010.0, "buy_date": yesterday, "buy_time": "14:56:00"}]
+    for _ in range(5):
+        trader8._run_sells(1030)
+    still_held = trader8._state["positions"]
+    rolls = still_held[0].get("_ld_rolls") if still_held else None
+    print(f"     跌停5次心跳后 _ld_rolls={rolls} 持仓={len(still_held)}")
+    check(len(still_held) == 1 and rolls == 1,
+          "V2 跌停同日多次心跳只累加 1 次，不误触发强制平仓")
+
+    # 场景 9：持仓上限收缩目标只数，避免接近上限时资金闲置
+    refs9 = {"000953": RefRow(expected_return=0.05, calibrated_net_return=0.01),
+             "000954": RefRow(expected_return=0.04, calibrated_net_return=0.01)}
+    ctx9 = build_ctx(refs9, [mk_snap("000953", 10.0, vwap=10.0),
+                             mk_snap("000954", 10.0, vwap=10.0)])
+    trader9 = V2PaperTrader(
+        new_cfg(paper_buy_n=2, paper_max_positions=2), ctx9, FakeNotifier())
+    trader9._state["positions"] = [{
+        "code": "000955", "buy_price": 10.0, "peak": 10.0, "shares": 100,
+        "cost_basis": 1001.0, "buy_date": yesterday, "buy_time": "14:56:00"}]
+    trader9.maybe_trade(1456)
+    new_pos = [p for p in trader9._state["positions"] if p["code"] != "000955"]
+    print(f"     上限2已持1只 → 新建{len(new_pos)}只 股数={[p['shares'] for p in new_pos]}")
+    check(len(new_pos) == 1 and new_pos[0]["shares"] >= 9000,
+          "V2 剩余 1 个名额时全额投入，不按 buy_n 均分闲置现金")
+
+    # 场景 10：订阅保护覆盖 V2 持仓
+    cfg10 = new_cfg()
+    v2_state = Path(cfg10.paper_state_file)
+    v2_state.parent.mkdir(parents=True, exist_ok=True)
+    (v2_state.parent / "paper_state_v2.json").write_text(
+        json.dumps({"cash": 0, "positions": [{"code": "600941"}]}), encoding="utf-8")
+    cfg10.mobile_snapshot_file = v2_state.parent / "mobile_snapshot.json"
+    cfg10.holdings_file = v2_state.parent / "realtime_holdings.txt"
+    cfg10.predictions_file = v2_state.parent / "missing.parquet"
+    cfg10.universe_file = v2_state.parent / "missing.txt"
+    cfg10.max_subscribe = 1
+    cfg10.mobile_snapshot_file.write_text(
+        json.dumps({"groups": {"全A": {"rows": [{"code": "000001"}]}}}), encoding="utf-8")
+    codes10 = load_codes(cfg10)
+    print(f"     订阅={codes10}")
+    check("600941" in codes10,
+          "V2 持仓同样进入保护性订阅，max_subscribe 截断也不丢报价")
+
+
 def main() -> int:
     print("=" * 68)
     print(" 虚拟数据流验证：实时层重排/模拟盘/出场逻辑")
     print("=" * 68)
     for fn in (scenario_A, scenario_B, scenario_C, scenario_D,
                scenario_E, scenario_F, scenario_G, scenario_H,
-               scenario_I, scenario_J, scenario_K, scenario_L):
+               scenario_I, scenario_J, scenario_K, scenario_L,
+               scenario_M):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

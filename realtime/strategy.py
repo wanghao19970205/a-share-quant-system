@@ -121,6 +121,11 @@ class StrategyContext:
     def state_of(self, code: str) -> _CodeState:
         return self._by_code.setdefault(code or "?", _CodeState())
 
+    def ever_limit_up_of(self, code: str) -> bool:
+        """该票当日是否曾封涨停（无状态则 False）；供炸板退出判定只读查询。"""
+        st = self._state(code)
+        return bool(getattr(st, "ever_limit_up", False)) if st is not None else False
+
     def update(self, snap: Snapshot) -> _CodeState:
         st = self._by_code.setdefault(snap.code or "?", _CodeState())
         self._by_digits[_digits(snap.code)] = st  # 维护 6 位索引，供 RankBoard 无后缀口径反查

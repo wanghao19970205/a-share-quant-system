@@ -38,7 +38,7 @@
 
 订阅优先级如下：
 
-1. `paper_state.json` 中的模拟盘持仓；
+1. 全部模拟盘账户持仓（`paper_state.json` 与启用时的 `paper_state_v2.json`）；
 2. `realtime_holdings.txt` 中的人工持仓；
 3. `mobile_snapshot.json` 中手机端 Top10 组；
 4. Top10 缺失时使用最新预测文件；
@@ -167,6 +167,36 @@ REALTIME_PAPER_VWAP_BREAK=0.02
 
 信号策略负责账本和通知，不直接替代 `PaperTrader` 的成交判断。
 
+## 8.1 V2 赛马账户
+
+`realtime/v2.py` 的 `V2PaperTrader` 与 V1 在同一引擎内并行，共享 ctx、模型候选池和通知通道，但账户状态、流水和审计写入 `_v2` 独立副本。V1 现役策略不受任何影响。
+
+V2 与 V1 的差异仅在执行端：
+
+- 买入窗收窄到 `14:55-14:57`，规避收盘集合竞价成交价偏差；
+- 资金按剩余名额动态分配，高价股买不起时余钱顺延给下一名；
+- 目标只数受 `paper_max_positions` 收缩，避免接近上限时闲置现金；
+- 浮盈达 `paper_breakeven_arm` 后回落至成本附近触发 `breakeven_stop`；
+- 持有多日后按 `paper_take_profit_tighten` 收窄止盈阈值；
+- 曾封涨停后开板且有浮盈触发 `limit_open`；
+- 封跌停时按交易日顺延，最多 `paper_limit_down_roll_max` 日后强制平仓。
+
+模型口径、`close→close` 到期腿、`±30%` 重排上限和成本假设与 V1 完全一致。
+
+关键参数：
+
+```text
+REALTIME_PAPER_V2=true
+REALTIME_PAPER_BUY_END=1457
+REALTIME_PAPER_MAX_POSITIONS=4
+REALTIME_PAPER_BREAKEVEN_ARM=0.03
+REALTIME_PAPER_BREAKEVEN_MARGIN=0.005
+REALTIME_PAPER_TAKE_PROFIT_TIGHTEN=0.03
+REALTIME_PAPER_LIMIT_DOWN_ROLL_MAX=3
+```
+
+两个账户的持仓都进入保护性订阅，`config.paper_state_files()` 是订阅清单与热重载的统一口径。V2 装配异常会降级跳过并保留 V1 运行。
+
 ## 9. 持久化与决策审计
 
 所有文件位于 `logs/realtime/` 挂载盘，容器重建后保留：
@@ -177,6 +207,7 @@ REALTIME_PAPER_VWAP_BREAK=0.02
 | `paper_trades.jsonl` | 每笔平仓的不可变流水 |
 | `paper_buy_decisions.jsonl` | 每日模型池、重排、过滤和成交快照 |
 | `paper_sell_counterfactuals.jsonl` | 卖出日及后续 3 个交易日反事实 |
+| `paper_*_v2.json(l)` | V2 赛马账户的同名独立副本 |
 | `signals_YYYYMMDD.jsonl` | 实时信号账本 |
 | `engine.YYYYMMDD.log` | 引擎运行日志 |
 
@@ -215,7 +246,7 @@ bash run_sim_streams.sh
 docker compose exec -T scheduler python -c "from realtime.config import load; c=load(); print(c.paper_time_cap_start, c.paper_buy_start, c.sell_horizon, c.paper_cost)"
 ```
 
-当前虚拟数据流覆盖：模型池封闭、重排有界、A 股 T+1、五级卖出、保护性订阅、成本后净收益门、高开惩罚关闭、14:50 到期卖出、14:55 买入、决策 trace 和反事实幂等补齐。
+当前虚拟数据流覆盖：模型池封闭、重排有界、A 股 T+1、五级卖出、保护性订阅、成本后净收益门、高开惩罚关闭、14:50 到期卖出、14:55 买入、决策 trace、反事实幂等补齐，以及 V2 的账户隔离、文件命名、跌停按日顺延、名额收缩和保护性止盈。
 
 ## 11. 部署纪律
 

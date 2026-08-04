@@ -166,6 +166,7 @@ class RealtimeConfig:
         default_factory=lambda: Path(
             os.environ.get("REALTIME_PAPER_STATE_FILE",
                            str(_realtime_dir() / "paper_state.json"))))
+
     # 出场策略（先触发先走）：硬止损 / 止盈上限 / 移动止盈(ATR吊灯) / 破位(跌破VWAP) / T+N时间上限。
     # 卖出腿全交易时段每轮评估；买入腿仍只在收盘前窗口。全 env 可调，实盘复盘后按流水再调。
     paper_stop_loss: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_STOP_LOSS", 0.05))
@@ -181,6 +182,17 @@ class RealtimeConfig:
     # 盘口价差流动性门槛：买一/卖一价差率超阈值即跳过（宽价差=薄盘口，14:50 建仓滑点吃 alpha）。
     # 默认 0.006(0.6%)；设 0 关闭。缺盘口价(spread_pct=None)不拦，不误跳。
     paper_entry_spread: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_SPREAD", 0.006))
+
+    # ---- V2 模拟盘（赛马对照）------------------------------------------------
+    # V2 与 V1 在同一引擎内并行，读取独立状态文件（_v2 后缀），共享 ctx 与 notifier。
+    # V1 现役策略完全不动；V2 在这里增加保护性止盈、动态分配、持仓上限、买窗收窄和跌停阻塞。
+    paper_v2_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_V2", True))
+    paper_buy_end: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_END", 1457))
+    paper_max_positions: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_MAX_POSITIONS", 4))
+    paper_breakeven_arm: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_BREAKEVEN_ARM", 0.03))
+    paper_breakeven_margin: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_BREAKEVEN_MARGIN", 0.005))
+    paper_take_profit_tighten: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_TAKE_PROFIT_TIGHTEN", 0.03))
+    paper_limit_down_roll_max: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_LIMIT_DOWN_ROLL_MAX", 3))
 
     # ---- 预期收益历史校准（Top-N 展示重标定）------------------------------
     # ridge_pred 强正则收缩偏保守，按历史同档实际兑现(target_ret_{h}d)重标定展示值 + 胜率。
@@ -220,7 +232,16 @@ class RealtimeConfig:
     heartbeat_sec: int = field(default_factory=lambda: _env_int("REALTIME_HEARTBEAT", 60))
 
     def ensure_dirs(self) -> None:
+        """确保账本目录存在（推送/状态/审计均落在此目录）。"""
         self.ledger_dir.mkdir(parents=True, exist_ok=True)
+
+    def paper_state_files(self) -> tuple[Path, ...]:
+        """全部模拟盘账户状态文件（V1 + 启用时的 V2）；供订阅保护与热重载统一取用。"""
+        base = Path(self.paper_state_file)
+        files = [base]
+        if getattr(self, "paper_v2_enabled", False):
+            files.append(base.parent / f"{base.stem}_v2{base.suffix}")
+        return tuple(files)
 
 
 def load() -> RealtimeConfig:

@@ -34,6 +34,17 @@ def _read_paper_positions(path: Path) -> list[str]:
     ]
 
 
+def _paper_state_files(cfg: RealtimeConfig) -> tuple[Path, ...]:
+    """全部模拟盘账户状态文件；优先用 config 的统一口径，缺失则回退 V1 单文件。"""
+    getter = getattr(cfg, "paper_state_files", None)
+    if callable(getter):
+        try:
+            return tuple(Path(p) for p in getter())
+        except Exception:  # noqa: BLE001 - 口径异常不阻断订阅
+            pass
+    return (Path(cfg.paper_state_file),)
+
+
 def _read_lines(path: Path) -> list[str]:
     if not path.exists():
         return []
@@ -125,7 +136,9 @@ def load_codes(cfg: RealtimeConfig) -> list[str]:
                 seen.add(c)
                 ordered.append(c)
 
-    paper_positions = _read_paper_positions(cfg.paper_state_file)
+    paper_positions: list[str] = []
+    for state_file in _paper_state_files(cfg):
+        paper_positions.extend(_read_paper_positions(state_file))
     holdings = _read_lines(cfg.holdings_file)
     top10 = _read_top10_groups(cfg.mobile_snapshot_file)
 

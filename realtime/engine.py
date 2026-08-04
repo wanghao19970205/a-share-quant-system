@@ -30,6 +30,7 @@ from .config import RealtimeConfig, load
 from .ledger import Ledger
 from .notifier import Notifier
 from .paper_trader import PaperTrader
+from .v2 import V2PaperTrader
 from .rankboard import RankBoard
 from .snapshot import Snapshot
 from .strategy import Strategy, StrategyContext, default_strategies
@@ -57,14 +58,15 @@ class Engine:
         self._notifier = Notifier(self._cfg)
         self._ledger = Ledger(self._cfg)
         self._rankboard = None  # 实时买入候选榜（run() 就绪后装配）
-        self._paper = None     # 实时模拟盘（run() 就绪后装配）
+        self._paper = None     # 实时模拟盘 V1（run() 就绪后装配）
+        self._paper_v2 = None  # 实时模拟盘 V2（赛马对照）
         self._feed: feed_mod.BaseFeed | None = None
         self._stop = threading.Event()
         self._active = False          # 当前是否处于活跃订阅态
         self._recv = 0                # 收到快照计数（心跳打印用）
         self._signals = 0
         self._codes_key: frozenset = frozenset()  # 当前订阅码集指纹（供盘中重载比对）
-        self._src_mtime = (0.0, 0.0)  # (mobile_snapshot, holdings) 上次读到的 mtime
+        self._src_mtime: tuple[float, ...] = ()   # 名单/持仓源上次读到的 mtime
 
     # ---- 生命周期判定 --------------------------------------------------------
     def _in_avoid_window(self, t: int) -> bool:
@@ -124,11 +126,12 @@ class Engine:
             print(f"[engine] 订阅已停止{('：' + reason) if reason else ''}", flush=True)
 
     # ---- 盘中名单自动重载 ----------------------------------------------------
-    def _src_mtimes(self) -> tuple[float, float, float]:
+    def _src_mtimes(self) -> tuple[float, ...]:
+        """名单/持仓源文件 mtime 指纹：Top10、人工持仓、全部模拟盘账户（含 V2）。"""
         return (
             _mtime(self._cfg.mobile_snapshot_file),
             _mtime(self._cfg.holdings_file),
-            _mtime(self._cfg.paper_state_file),
+            *(_mtime(p) for p in wl_mod._paper_state_files(self._cfg)),
         )
 
     def _maybe_reload(self) -> None:
@@ -196,6 +199,20 @@ class Engine:
             print(f"[engine] 模拟盘就绪：{self._paper.summary()}，"
                   f"{self._cfg.paper_time_cap_start} 后到期卖、{self._cfg.paper_buy_start} 后买 "
                   f"Top{self._cfg.paper_buy_n}（T+{self._cfg.sell_horizon}）", flush=True)
+        if getattr(self._cfg, "paper_v2_enabled", True):
+            # V2 是赛马对照账户，其初始化异常绝不能拖垮已装配好的 V1 现役策略。
+            try:
+                self._paper_v2 = V2PaperTrader(
+                    self._cfg, self._ctx, self._notifier, name_map)
+                print(f"[engine] 模拟盘V2就绪：{self._paper_v2.summary()}，"
+                      f"保护止盈{self._paper_v2._breakeven_arm:+.0%} | "
+                      f"持仓上限{self._paper_v2._max_positions} | "
+                      f"动态分配 | 买窗{self._cfg.paper_buy_start}-{self._paper_v2._buy_end}",
+                      flush=True)
+            except Exception as e:  # noqa: BLE001 - V2 降级不影响 V1
+                self._paper_v2 = None
+                print(f"[engine] 模拟盘V2装配失败(降级跳过，V1 不受影响)："
+                      f"{type(e).__name__}: {e}", flush=True)
         print(f"[engine] 启动实时层：清单 {len(codes)} 只，"
               f"时段 {self._cfg.session_start}-{self._cfg.session_end}，"
               f"策略 {[s.name for s in self._strategies]}", flush=True)
@@ -224,6 +241,11 @@ class Engine:
                         self._paper.maybe_trade(t)  # 收盘前交易窗内买 Top-N / 卖到期
                     except Exception as e:  # noqa: BLE001 - 模拟盘异常不拖垮主循环
                         print(f"[engine] 模拟盘交易异常: {type(e).__name__}", flush=True)
+                if self._paper_v2 is not None:
+                    try:
+                        self._paper_v2.maybe_trade(t)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[engine] 模拟盘V2交易异常: {type(e).__name__}", flush=True)
             else:
                 self._stop_feed("非交易时段/规避窗")
 

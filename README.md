@@ -102,6 +102,7 @@
 │   ├── rerank.py              #   ⭐ 盘中动态重排打分器（共享入口）
 │   ├── rankboard.py           #   实时买入候选榜（推送 digest）
 │   ├── paper_trader.py        #   实时模拟盘（持久化纸上账户+5级出场）
+│   ├── v2.py                  #   V2 赛马账户（执行端优化，状态与 V1 隔离）
 │   ├── strategy.py            #   信号策略骨架
 │   ├── snapshot.py            #   Snapshot 数据模型+盘口微结构派生量
 │   ├── reference.py           #   启动期静态基准（校准用）
