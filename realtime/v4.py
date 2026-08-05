@@ -21,6 +21,8 @@ class V4PaperTrader(V3PaperTrader):
         self._sector_ctx = sector_ctx
         self._sector_entry_cache: dict[str, dict] = {}
         super().__init__(cfg, ctx, notifier, name_map)
+        self._sector_max_positions = max(
+            1, int(getattr(cfg, "paper_sector_max_positions", 2)))
 
     def _prefix(self) -> str:
         return "[paper_v4]"
@@ -48,6 +50,22 @@ class V4PaperTrader(V3PaperTrader):
         )
         return audit
 
+    def _allocation_factor(self, code: str) -> tuple[float, Optional[str]]:
+        sector = (self._sector_entry_cache.get(code)
+                  or self._sector_ctx.assessment_for_stock(code))
+        sector_key = sector.get("etf_code") or sector.get("stock_industry")
+        if not sector_key:
+            return 1.0, None
+        held_in_sector = 0
+        for pos in self._state.get("positions", []):
+            held_sector = pos.get("sector_etf") or {}
+            held_key = held_sector.get("etf_code") or held_sector.get("stock_industry")
+            if held_key == sector_key:
+                held_in_sector += 1
+        if held_in_sector >= self._sector_max_positions:
+            return 0.0, f"行业集中度上限({held_in_sector}/{self._sector_max_positions})"
+        return 1.0, None
+
     def _entry_extra(self, code: str, quote: dict) -> dict:
         return {"sector_etf": quote.get("sector_etf") or self._sector_entry_cache.get(code)}
 
@@ -62,4 +80,5 @@ class V4PaperTrader(V3PaperTrader):
             "sector_benchmark": self._sector_ctx.benchmark,
             "sector_mapping_version": self._sector_ctx.mapping_version,
             "sector_mapping_min_confidence": self._sector_ctx.mapping_min_confidence,
+            "sector_max_positions": self._sector_max_positions,
         }

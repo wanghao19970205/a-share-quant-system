@@ -186,12 +186,12 @@ REALTIME_PAPER_VWAP_BREAK=0.02
 
 | 版本 | 买卖成交价 | 入场增强 | 出场与风险 | 独立文件 |
 |---|---|---|---|---|
-| **V1** | `last / last` | 模型池 + 盘中重排 | 固定止损止盈、ATR吊灯、VWAP破位、T+N | 无后缀 |
-| **V2** | `last / last` | V1 + 动态资金与持仓上限 | 保护止盈、炸板、跌停顺延、时间加权止盈 | `_v2` |
-| **V3** | `ask1 / bid1` | 当日预测、新鲜度、盘口确认 | 入场锁定ATR、硬止损/止盈/移动止盈、T+N | `_v3` |
-| **V4** | `ask1 / bid1` | V3 + 精确主行业ETF弱势回避 | 完整继承V3，暂不叠加板块卖出 | `_v4` |
+| **V1** | `last / last` | 模型池 + 盘中重排 + 风险预算 | 固定止损止盈、ATR吊灯、VWAP破位、T+N | 无后缀 |
+| **V2** | `last / last` | V1 + 持仓上限 | 保护止盈、炸板、跌停顺延、时间加权止盈 | `_v2` |
+| **V3** | `ask1 / bid1` | 当日预测、新鲜度、盘口确认 + 风险预算 | 入场锁定ATR、硬止损/止盈/移动止盈、T+N | `_v3` |
+| **V4** | `ask1 / bid1` | V3 + 精确主行业ETF弱势与集中度控制 | 完整继承V3，暂不叠加板块卖出 | `_v4` |
 
-四个账户共享模型候选池和交易成本，任一版本装配或交易异常均独立降级，不影响其他版本。比较时不能只看绝对净值，应联合成本后收益、最大回撤、可成交率、过滤率、执行滑点和退出后反事实。
+四个账户共享模型候选池、交易成本和二阶段买入：14:50 执行 `primary`，仅未成交账户在 14:53 执行 `retry`，14:55 后关闭；阶段状态跨重启持久化且分别形成审计。仓位取剩余名额均分、ATR 单笔风险额度和单票净值上限的最小值，融合预期收益只做 0.75-1.25 倍有限调整，缺 ATR 时退回固定止损口径。任一版本装配或交易异常均独立降级，不影响其他版本。
 
 ## 8.1 V2 赛马账户
 
@@ -199,9 +199,9 @@ REALTIME_PAPER_VWAP_BREAK=0.02
 
 V2 与 V1 的差异仅在执行端：
 
-- 与其他版本统一使用 `14:50-14:55` 买入窗口；
-- 资金按剩余名额动态分配，高价股买不起时余钱顺延给下一名；
-- 目标只数受 `paper_max_positions` 收缩，避免接近上限时闲置现金；
+- 与其他版本统一使用 `14:50 primary / 14:53 retry / 14:55 close` 二阶段买入；
+- 资金按 ATR 风险、融合预期收益、单票上限和剩余名额动态分配，高价股买不起时顺延下一名；
+- 目标只数受 `paper_max_positions` 收缩，风险额度之外的现金允许保留；
 - 浮盈达 `paper_breakeven_arm` 后回落至成本附近触发 `breakeven_stop`；
 - 持有多日后按 `paper_take_profit_tighten` 收窄止盈阈值；
 - 曾封涨停后开板且有浮盈触发 `limit_open`；
@@ -213,8 +213,14 @@ V2 与 V1 的差异仅在执行端：
 
 ```text
 REALTIME_PAPER_V2=true
+REALTIME_PAPER_BUY_RETRY_START=1453
 REALTIME_PAPER_BUY_END=1455
 REALTIME_PAPER_MAX_POSITIONS=4
+REALTIME_PAPER_RISK_PER_TRADE=0.015
+REALTIME_PAPER_MAX_POSITION_WEIGHT=0.40
+REALTIME_PAPER_ALLOCATION_ATR_K=2.0
+REALTIME_PAPER_ALLOCATION_TARGET_RETURN=0.02
+REALTIME_PAPER_SECTOR_MAX_POSITIONS=2
 REALTIME_PAPER_BREAKEVEN_ARM=0.03
 REALTIME_PAPER_BREAKEVEN_MARGIN=0.005
 REALTIME_PAPER_TAKE_PROFIT_TIGHTEN=0.03
@@ -301,11 +307,12 @@ V1/V2/V3/V4 的持仓都由 `config.paper_state_files()` 纳入保护性订阅�
 - rank、score、adj 和分项贡献；
 - 实时价、开盘价、昨收、VWAP、盘口失衡、价差和涨停状态；
 - 入场过滤、未进入 Top2、资金不足或实际成交；
+- `primary/retry` 阶段、ATR 风险距离、信号系数、预算上限与集中度原因；
 - 成交股数、价格、成本和账户前后状态。
 
 ### 零成交也是有效样本
 
-买入窗口正常执行但没有成交时，各版本仍会写入每日唯一的决策事件。`decision_status` 用于区分：
+买入阶段正常执行但没有成交时，各版本仍会按 `trade_date + attempt_stage` 写入唯一决策事件，因此同日最多有 primary/retry 两条。`decision_status` 用于区分：
 
 | 状态 | 含义 |
 |---|---|
@@ -329,6 +336,12 @@ REALTIME_EFFECT_SHUTDOWN_GRACE_SEC=3
 
 心跳中的 `effects_pending`、`effects_done`、`effects_dropped` 分别表示待处理、已处理和因队列满而丢弃的副作用任务。`effects_dropped` 非零通常表示通知服务持续超时，需要先检查推送通道，再决定是否调整队列容量。
 
+### Realtime 权重影子评估
+
+`python -m realtime.weight_shadow` 只读包含 `target_ret_1d` 的历史预测，按滚动窗口执行 Ridge/ElasticNet/ExtraTrees 非负约束堆叠和确定性进化搜索。结果写入 `logs/realtime/weight_shadow/manifest.json` 及 `versions/<version>.json`，状态为 `shadow/eligible/rejected`。
+
+影子 manifest 固定 `publishable=false`、`auto_apply=false`，至少积累 20 个样本外交易日才可能进入 `eligible`，且仍要求人工审核。该命令不写 `active_quant_model.json`，不修改 `notify.env` 权重，不被 daily/intraday/weekly/monthly 模型任务读取。
+
 ## 10. 运行与验证
 
 在远端宿主机 `/www/A` 执行：
@@ -347,6 +360,9 @@ docker compose exec -T scheduler python -m realtime.selftest
 # 虚拟数据流回归
 bash run_sim_streams.sh
 
+# 手工运行 realtime-only 权重影子评估（只产出建议，不自动应用）
+docker compose exec -T scheduler python -m realtime.weight_shadow
+
 # 查看运行时关键参数（只打印非密钥字段）
 docker compose exec -T scheduler python -c "from realtime.config import load; c=load(); print(c.paper_time_cap_start, c.paper_buy_start, c.sell_horizon, c.paper_cost)"
 ```
@@ -357,13 +373,13 @@ docker compose exec -T scheduler python -c "from realtime.config import load; c=
 |---|---|---|
 | 当日预测 | 14:50前预测最大日期等于交易日 | V3/V4会记录 `预测非当日` 并拒绝新仓 |
 | 实时行情 | 14:50附近心跳 `active=True` 且 `recv` 持续增长 | 买入窗口可能未获得有效盘口 |
-| 四版决策 | 每版当日各有一个 `paper_buy_decision*` 事件 | 缺失版本未执行买入腿或审计写入失败 |
+| 四版决策 | 每版有 primary；未成交版本另有 retry 事件 | 缺失阶段表示买入腿未执行或审计写入失败 |
 | ETF行情 | `sector_recv > 0`，ETF强/中/弱分布可见 | V4标记 `sector_quote_unavailable` 并安全退化为V3 |
 | 异步副作用 | `effects_dropped=0` | 非零表示通知/账本队列持续拥塞 |
 
 `paper_state_v3.json` 和 `paper_state_v4.json` 在首次买入决策保存时才创建；仅在部署后、买入窗口前不存在不代表故障。排查零成交优先运行 `./restart.sh diag`，再查看对应版本决策事件，不应只检查成交流水。
 
-当前虚拟数据流回归为 **89 PASS / 0 FAIL**，覆盖模型池封闭、重排有界、A 股 T+1、五级卖出、保护性订阅、原始预期成本安全边际门、14:50 到期卖出、14:50-14:55 买入窗口、决策 trace 和反事实幂等补齐；V2 的账户隔离、零成交审计、跌停顺延、名额收缩和保护性止盈；V3 的当日预测、新鲜度、`ask1/bid1` 成交、ATR 三类退出和跌停流动性；V4 的完整ETF代码、精确主行业映射、置信度门控、相对弱势过滤、安全降级和独立审计；以及 V1-V4 同场买入、独立落盘、跨日重启恢复、风险卖出和交易 ID 隔离的完整生命周期。
+当前虚拟数据流回归为 **106 PASS / 0 FAIL**，覆盖模型池封闭、重排有界、A 股 T+1、五级卖出、保护性订阅、融合预期成本安全边际门、二阶段买入及跨重启恢复、决策 trace 和反事实幂等补齐；V1-V4 的 ATR 风险预算、融合收益有限加权、整手约束和 V4 行业集中度；V2-V4 的账户隔离与执行差异；四版同场买卖完整生命周期；NaN/Inf、全模型异常、无效盘口、损坏状态文件故障注入；以及 realtime-only 滚动约束、进化权重、20 日 OOS 和禁止 active model 写入。
 
 ## 11. 部署纪律
 

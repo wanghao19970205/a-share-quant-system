@@ -237,9 +237,14 @@ class V2PaperTrader(_V1):
                 audit.update({"entry_decision": "filtered", "entry_filter_reason": skip})
                 print(f"{self._prefix()} 跳过候选 {code}：{skip}", flush=True)
                 continue
-            # V2 动态分配：剩余资金 / 剩余名额
-            alloc = self._state.get("cash", 0.0) / max(1, remaining_slots)
-            budget = min(alloc, self._state.get("cash", 0.0))
+            budget, allocation = self._allocation_budget(
+                code, exp, px, remaining_slots)
+            audit["allocation"] = allocation
+            if budget <= 0:
+                audit.update({"entry_decision": "allocation_blocked",
+                              "entry_filter_reason": allocation.get(
+                                  "allocation_factor_reason") or "风险预算为零"})
+                continue
             shares = int(budget / (px * (1 + self._cost / 2.0)) // 100) * 100
             if shares <= 0:
                 audit["entry_decision"] = "insufficient_lot_cash"
@@ -262,13 +267,13 @@ class V2PaperTrader(_V1):
             audit.update({
                 "entry_decision": "bought", "position_id": position_id,
                 "shares": shares, "fill_price": round(px, 3),
-                "allocated_cash": alloc, "cost_basis": round(cost_basis, 2),
+                "allocated_cash": budget, "cost_basis": round(cost_basis, 2),
             })
             bought.append(
                 f"{self._label(code)} @{px:.2f} {self._exp_str(code, exp)} {shares}股")
             if len(self._state["positions"]) >= self._max_positions:
                 break
-        self._state["last_buy_date"] = _today()
+        self._finish_buy_attempt(len(bought))
         self._save_state()
         self._record_buy_decision(trace, account_before, len(bought),
                                   target_n=target_n)
@@ -295,14 +300,17 @@ class V2PaperTrader(_V1):
             status = "insufficient_cash_or_lot"
         else:
             status = "no_ranked_candidate"
+        stage = self._current_buy_stage or "direct"
         record = {
             "schema_version": 2, "event_type": "paper_buy_decision_v2",
-            "event_id": f"paper-buy-decision-v2:{_today()}",
-            "trade_date": _today(), "decision_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "event_id": f"paper-buy-decision-v2:{_today()}:{stage}",
+            "trade_date": _today(), "attempt_stage": stage,
+            "decision_time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "decision_status": status,
             "paper_config": {
                 "buy_n": self._buy_n, "target_n": target,
                 "buy_start": self._buy_start,
+                "buy_retry_start": self._buy_retry_start,
                 "buy_end": self._buy_end,
                 "time_cap_start": self._time_cap_start, "cost_roundtrip": self._cost,
                 "max_positions": self._max_positions,
@@ -317,6 +325,10 @@ class V2PaperTrader(_V1):
                 "entry_rich": self._entry_rich,
                 "entry_ask_strong": self._entry_ask_strong,
                 "entry_spread": self._entry_spread,
+                "risk_per_trade": self._risk_per_trade,
+                "max_position_weight": self._max_position_weight,
+                "allocation_atr_k": self._allocation_atr_k,
+                "allocation_target_return": self._allocation_target_return,
             },
             "account_before": account_before,
             "account_after": {

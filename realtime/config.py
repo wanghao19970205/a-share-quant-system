@@ -169,6 +169,8 @@ class RealtimeConfig:
     paper_buy_n: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_N", 2))
     paper_buy_start: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_START", 1450))
     paper_buy_end: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_END", 1455))
+    paper_buy_retry_start: int = field(
+        default_factory=lambda: _env_int("REALTIME_PAPER_BUY_RETRY_START", 1453))
     paper_time_cap_start: int = field(
         default_factory=lambda: _env_int("REALTIME_PAPER_TIME_CAP_START", 1450))
     paper_start_equity: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_START_EQUITY", 100000.0))
@@ -198,7 +200,20 @@ class RealtimeConfig:
     # V2 与 V1 在同一引擎内并行，读取独立状态文件（_v2 后缀），共享 ctx、notifier
     # 和公共买入窗口；V2 额外增加保护性止盈、动态分配、持仓上限和跌停阻塞。
     paper_v2_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_V2", True))
-    paper_max_positions: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_MAX_POSITIONS", 4))
+    paper_max_positions: int = field(default_factory=lambda: max(
+        1, _env_int("REALTIME_PAPER_MAX_POSITIONS", 4)))
+    # 公共仓位预算：每笔最大亏损占净值 1.5%，单票市值不超过净值 40%。
+    # ATR 可用时按 2ATR 风险距离定仓；缺失时退回既有硬止损比例。
+    paper_risk_per_trade: float = field(default_factory=lambda: max(
+        0.0, _env_float("REALTIME_PAPER_RISK_PER_TRADE", 0.015)))
+    paper_max_position_weight: float = field(default_factory=lambda: min(1.0, max(
+        0.01, _env_float("REALTIME_PAPER_MAX_POSITION_WEIGHT", 0.40))))
+    paper_allocation_atr_k: float = field(default_factory=lambda: max(
+        0.1, _env_float("REALTIME_PAPER_ALLOCATION_ATR_K", 2.0)))
+    paper_allocation_target_return: float = field(default_factory=lambda: max(
+        0.0001, _env_float("REALTIME_PAPER_ALLOCATION_TARGET_RETURN", 0.02)))
+    paper_sector_max_positions: int = field(default_factory=lambda: max(
+        1, _env_int("REALTIME_PAPER_SECTOR_MAX_POSITIONS", 2)))
     paper_breakeven_arm: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_BREAKEVEN_ARM", 0.03))
     paper_breakeven_margin: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_BREAKEVEN_MARGIN", 0.005))
     paper_take_profit_tighten: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_TAKE_PROFIT_TIGHTEN", 0.03))
@@ -255,6 +270,20 @@ class RealtimeConfig:
     # 对融合收益按历史同档实际兑现重标定展示值 + 胜率；不改变 pred 百分位排序主序。
     calib_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_CALIB", True))
     calib_bins: int = field(default_factory=lambda: _env_int("REALTIME_CALIB_BINS", 20))
+
+    # ---- Realtime 权重影子评估（只读，不自动晋级）----------------------------
+    weight_shadow_predictions_file: Path = field(default_factory=lambda: Path(
+        os.environ.get("REALTIME_WEIGHT_SHADOW_PREDICTIONS", "")
+        or (Path(_qconfig.QUANT_DIR) / "active_quant_short_predictions.parquet")))
+    weight_shadow_dir: Path = field(default_factory=lambda: Path(
+        os.environ.get("REALTIME_WEIGHT_SHADOW_DIR", "")
+        or (_realtime_dir() / "weight_shadow")))
+    weight_shadow_train_days: int = field(default_factory=lambda: max(
+        10, _env_int("REALTIME_WEIGHT_SHADOW_TRAIN_DAYS", 60)))
+    weight_shadow_min_oos_days: int = field(default_factory=lambda: max(
+        20, _env_int("REALTIME_WEIGHT_SHADOW_MIN_OOS_DAYS", 20)))
+    weight_shadow_rebalance_days: int = field(default_factory=lambda: max(
+        1, _env_int("REALTIME_WEIGHT_SHADOW_REBALANCE_DAYS", 5)))
 
     # ---- 账本 ----------------------------------------------------------------
     ledger_dir: Path = field(

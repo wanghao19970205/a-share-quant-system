@@ -32,6 +32,7 @@ import datetime as _dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -82,6 +83,10 @@ class PaperTrader:
         self._buy_start = int(getattr(cfg, "paper_buy_start", 1450))
         self._buy_end = max(
             self._buy_start, min(int(getattr(cfg, "paper_buy_end", 1455)), 1500))
+        self._buy_retry_start = max(
+            self._buy_start,
+            min(int(getattr(cfg, "paper_buy_retry_start", 1453)), self._buy_end))
+        self._current_buy_stage: Optional[str] = None
         self._time_cap_start = int(getattr(cfg, "paper_time_cap_start", 1450))
         self._start_equity = float(getattr(cfg, "paper_start_equity", 100000.0))
         self._cost = float(getattr(cfg, "paper_cost", 0.002))
@@ -96,6 +101,15 @@ class PaperTrader:
         self._entry_rich = float(getattr(cfg, "paper_entry_rich", 0.01))
         self._entry_ask_strong = float(getattr(cfg, "paper_entry_ask_strong", 0.2))
         self._entry_spread = float(getattr(cfg, "paper_entry_spread", 0.006))
+        # 仓位预算只属于实时模拟盘，不回写模型或例行训练配置。
+        self._risk_per_trade = max(0.0, float(
+            getattr(cfg, "paper_risk_per_trade", 0.015)))
+        self._max_position_weight = min(1.0, max(0.01, float(
+            getattr(cfg, "paper_max_position_weight", 0.40))))
+        self._allocation_atr_k = max(0.1, float(
+            getattr(cfg, "paper_allocation_atr_k", 2.0)))
+        self._allocation_target_return = max(0.0001, float(
+            getattr(cfg, "paper_allocation_target_return", 0.02)))
         self._scorer = RerankScorer(cfg, ctx)  # 与 RankBoard 共用的盘中重排打分器
         base_state = Path(getattr(cfg, "paper_state_file", "")
                           or (Path(getattr(cfg, "ledger_dir", ".")) / "paper_state.json"))
@@ -127,6 +141,8 @@ class PaperTrader:
                     s.setdefault("start_equity", self._start_equity)
                     s.setdefault("realized_pnl", 0.0)
                     s.setdefault("last_buy_date", "")
+                    s.setdefault("buy_attempt_date", "")
+                    s.setdefault("buy_attempt_stages", [])
                     # 兼容旧状态：老持仓无 peak 字段 → 用买入价初始化。
                     for pos in s.get("positions", []):
                         pos.setdefault("peak", pos.get("buy_price", 0.0))
@@ -134,7 +150,8 @@ class PaperTrader:
             except Exception as e:  # noqa: BLE001 - 状态损坏不拦启动，重开新账户
                 print(f"[paper] 读状态失败(重开新账户)：{type(e).__name__}", flush=True)
         return {"cash": self._start_equity, "start_equity": self._start_equity,
-                "realized_pnl": 0.0, "last_buy_date": "", "positions": []}
+                "realized_pnl": 0.0, "last_buy_date": "", "buy_attempt_date": "",
+                "buy_attempt_stages": [], "positions": []}
 
     def _save_state(self) -> None:
         try:
@@ -263,7 +280,11 @@ class PaperTrader:
         """该票最新实时价（无快照/无价则 None）。"""
         snap = self._ctx.snapshot_of(code)
         last = getattr(snap, "last", None) if snap is not None else None
-        return float(last) if last else None
+        try:
+            price = float(last)
+        except (TypeError, ValueError):
+            return None
+        return price if math.isfinite(price) and price > 0 else None
 
     def _atr_of(self, code: str) -> Optional[float]:
         """该票 ATR 绝对值（元）：优先 ref.atr，缺则 atr_pct*pre_close 兜底，都无则 None。
@@ -276,14 +297,20 @@ class PaperTrader:
         if ref is None:
             return None
         atr = getattr(ref, "atr", None)
-        if atr:
-            return float(atr)
+        try:
+            numeric_atr = float(atr)
+        except (TypeError, ValueError):
+            numeric_atr = 0.0
+        if math.isfinite(numeric_atr) and numeric_atr > 0:
+            return numeric_atr
         atr_pct = getattr(ref, "atr_pct", None)
         snap = self._ctx.snapshot_of(code)
         pre_close = getattr(snap, "pre_close", None) if snap is not None else None
-        if atr_pct and pre_close:
-            return float(atr_pct) * float(pre_close)
-        return None
+        try:
+            fallback = float(atr_pct) * float(pre_close)
+        except (TypeError, ValueError):
+            return None
+        return fallback if math.isfinite(fallback) and fallback > 0 else None
 
     def _equity(self) -> float:
         """当前总净值 = 现金 + 持仓按最新价市值（缺价的持仓用成本价兜底）。"""
@@ -300,19 +327,45 @@ class PaperTrader:
         return f"净值¥{eq:,.0f}（{ret:+.2%}）持仓{len(self._state.get('positions', []))}只"
 
     # ---- 主入口 --------------------------------------------------------------
+    def _buy_attempts_today(self) -> set[str]:
+        if self._state.get("buy_attempt_date") != _today():
+            return set()
+        return {str(value) for value in self._state.get("buy_attempt_stages", [])}
+
+    def _buy_stage(self, t: int) -> Optional[str]:
+        if not self._buy_start <= t <= self._buy_end:
+            return None
+        return "primary" if t < self._buy_retry_start else "retry"
+
+    def _finish_buy_attempt(self, bought_count: int) -> None:
+        """记录本轮阶段；成交或完成 retry 后关闭当日买入腿。"""
+        stage = self._current_buy_stage or "direct"
+        stages = self._buy_attempts_today()
+        stages.add(stage)
+        self._state["buy_attempt_date"] = _today()
+        self._state["buy_attempt_stages"] = sorted(stages)
+        if bought_count > 0 or stage in {"retry", "direct"}:
+            self._state["last_buy_date"] = _today()
+
     def maybe_trade(self, now_hhmm: Optional[int] = None) -> None:
-        """每轮心跳跑一次：卖出腿【全交易时段】评估出场，买入腿仅收盘前窗口建仓。"""
+        """每轮心跳评估卖出；买入在 14:50 初筛、14:53 对未成交账户复评。"""
         if not getattr(self._cfg, "paper_trade_enabled", True):
             return
         t = now_hhmm if now_hhmm is not None else (
             _dt.datetime.now().hour * 100 + _dt.datetime.now().minute)
         # 风险退出全天有效；纯到期退出只在收盘前执行，保持训练的 close→close 口径。
         self._run_sells(t)
-        # 买入腿：只在 [buy_start, buy_end] 窗内、且当日未建过仓时建仓。
-        if self._buy_start <= t <= self._buy_end:
-            if not (self._acted_today and self._state.get("last_buy_date") == _today()):
-                self._run_buys()
-                self._acted_today = True
+        stage = self._buy_stage(t)
+        if stage is None or self._state.get("last_buy_date") == _today():
+            return
+        if stage in self._buy_attempts_today():
+            return
+        self._current_buy_stage = stage
+        try:
+            self._run_buys()
+        finally:
+            self._current_buy_stage = None
+        self._acted_today = self._state.get("last_buy_date") == _today()
 
     # ---- 出场评估 ------------------------------------------------------------
     def _exit_decision(self, pos: dict, px: float, held: int,
@@ -435,14 +488,16 @@ class PaperTrader:
             status = "insufficient_cash_or_lot"
         else:
             status = "no_ranked_candidate"
+        stage = self._current_buy_stage or "direct"
         record = {
             "schema_version": 1, "event_type": "paper_buy_decision",
-            "event_id": f"paper-buy-decision:{_today()}",
-            "trade_date": _today(), "decision_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "event_id": f"paper-buy-decision:{_today()}:{stage}",
+            "trade_date": _today(), "attempt_stage": stage,
+            "decision_time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "decision_status": status,
             "paper_config": {
                 "buy_n": self._buy_n, "buy_start": self._buy_start,
-                "buy_end": self._buy_end,
+                "buy_retry_start": self._buy_retry_start, "buy_end": self._buy_end,
                 "time_cap_start": self._time_cap_start, "cost_roundtrip": self._cost,
                 "rank_pool_n": getattr(self._cfg, "rank_pool_n", 30),
                 "rank_min_raw_return": getattr(self._cfg, "rank_min_raw_return", 0.0),
@@ -450,6 +505,10 @@ class PaperTrader:
                 "entry_rich": self._entry_rich,
                 "entry_ask_strong": self._entry_ask_strong,
                 "entry_spread": self._entry_spread,
+                "risk_per_trade": self._risk_per_trade,
+                "max_position_weight": self._max_position_weight,
+                "allocation_atr_k": self._allocation_atr_k,
+                "allocation_target_return": self._allocation_target_return,
             },
             "account_before": account_before,
             "account_after": {
@@ -461,8 +520,46 @@ class PaperTrader:
         }
         self._upsert_jsonl(self._decisions_file, "event_id", record)
 
+    def _allocation_factor(self, code: str) -> tuple[float, Optional[str]]:
+        """子版本可按组合上下文缩放预算；0 表示阻断该候选。"""
+        return 1.0, None
+
+    def _allocation_budget(self, code: str, exp: float, px: float,
+                           remaining_slots: int) -> tuple[float, dict]:
+        """按组合净值、ATR 风险和模型预期计算可执行的单票现金预算。"""
+        cash = max(0.0, float(self._state.get("cash", 0.0)))
+        equity = max(0.0, float(self._equity()))
+        equal_budget = cash / max(1, int(remaining_slots))
+        position_cap = equity * self._max_position_weight
+        atr = self._atr_of(code)
+        if atr is not None and px > 0:
+            risk_pct = max(self._cost, self._allocation_atr_k * atr / px)
+            risk_source = "atr"
+        else:
+            risk_pct = max(self._cost, self._stop_loss if self._stop_loss > 0 else 0.05)
+            risk_source = "stop_loss_fallback"
+        signal_factor = min(1.25, max(0.75, math.sqrt(
+            max(0.0, float(exp)) / self._allocation_target_return)))
+        risk_budget_cash = equity * self._risk_per_trade * signal_factor
+        risk_position_cap = risk_budget_cash / risk_pct if risk_pct > 0 else position_cap
+        allocation_factor, factor_reason = self._allocation_factor(code)
+        budget = max(0.0, min(cash, equal_budget, position_cap,
+                              risk_position_cap) * max(0.0, allocation_factor))
+        return budget, {
+            "allocation_method": "risk_budget_v1",
+            "equal_budget": round(equal_budget, 2),
+            "position_cap": round(position_cap, 2),
+            "risk_position_cap": round(risk_position_cap, 2),
+            "risk_budget_cash": round(risk_budget_cash, 2),
+            "risk_pct": round(risk_pct, 6), "risk_source": risk_source,
+            "allocation_atr": atr, "signal_factor": round(signal_factor, 4),
+            "allocation_factor": round(max(0.0, allocation_factor), 4),
+            "allocation_factor_reason": factor_reason,
+            "budget": round(budget, 2),
+        }
+
     def _run_buys(self) -> None:
-        """当日尚未建仓则按【重排后 score】降序买 Top-N，买前过滤追高票，均分现金。"""
+        """按重排主序买入，并以风险预算、单票上限和整手约束确定仓位。"""
         if self._state.get("last_buy_date") == _today():
             return
         positions = self._state.get("positions", [])
@@ -475,7 +572,7 @@ class PaperTrader:
         ranked_rows = self._scorer.ranked(
             exclude=held_codes, require_price=True, drop_limit_up=True, trace=trace)
         trace_by_code = {rec["code"]: rec for rec in trace}
-        alloc = self._state.get("cash", 0.0) / self._buy_n
+        remaining_slots = self._buy_n
         bought: list[str] = []
         for row in ranked_rows:
             code, exp, px = row.code, row.exp, row.px
@@ -488,7 +585,14 @@ class PaperTrader:
                 audit.update({"entry_decision": "filtered", "entry_filter_reason": skip})
                 print(f"[paper] 跳过追高候选 {code}：{skip}", flush=True)
                 continue
-            budget = min(alloc, self._state.get("cash", 0.0))
+            budget, allocation = self._allocation_budget(
+                code, exp, px, remaining_slots)
+            audit["allocation"] = allocation
+            if budget <= 0:
+                audit.update({"entry_decision": "allocation_blocked",
+                              "entry_filter_reason": allocation.get(
+                                  "allocation_factor_reason") or "风险预算为零"})
+                continue
             shares = int(budget / (px * (1 + self._cost / 2.0)) // 100) * 100
             if shares <= 0:
                 audit["entry_decision"] = "insufficient_lot_cash"
@@ -512,8 +616,9 @@ class PaperTrader:
                 "shares": shares, "fill_price": round(px, 3),
                 "allocated_cash": budget, "cost_basis": round(cost_basis, 2),
             })
+            remaining_slots -= 1
             bought.append(f"{self._label(code)} @{px:.2f} {self._exp_str(code, exp)} {shares}股")
-        self._state["last_buy_date"] = _today()
+        self._finish_buy_attempt(len(bought))
         self._save_state()
         self._record_buy_decision(trace, account_before, len(bought))
         if bought:

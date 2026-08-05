@@ -7,6 +7,7 @@ V3 保持 V2 的模型候选池、动态资金分配、买入窗口、持仓上�
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import time
 from typing import Optional
 
@@ -58,7 +59,7 @@ class V3PaperTrader(V2PaperTrader):
                 number = float(value)
             except (TypeError, ValueError):
                 return None
-            return number if number > 0 else None
+            return number if math.isfinite(number) and number > 0 else None
 
         return snap, age, _positive(getattr(snap, "bid_price1", None)), _positive(
             getattr(snap, "ask_price1", None))
@@ -86,11 +87,21 @@ class V3PaperTrader(V2PaperTrader):
             return "卖一已到涨停价", None
         bid_volume = getattr(snap, "bid_volume1", None)
         ask_volume = getattr(snap, "ask_volume1", None)
-        if bid_volume is None or ask_volume is None or bid_volume <= 0 or ask_volume <= 0:
+        try:
+            bid_volume = float(bid_volume)
+            ask_volume = float(ask_volume)
+        except (TypeError, ValueError):
+            return "一档挂单量无效", None
+        if (not math.isfinite(bid_volume) or not math.isfinite(ask_volume) or
+                bid_volume <= 0 or ask_volume <= 0):
             return "一档挂单量无效", None
         imbalance = getattr(snap, "bid_ask_imbalance", None)
-        if imbalance is None or imbalance < 0:
-            return f"买盘未确认({imbalance if imbalance is not None else '缺失'})", None
+        try:
+            imbalance = float(imbalance)
+        except (TypeError, ValueError):
+            return "买盘未确认(缺失)", None
+        if not math.isfinite(imbalance) or imbalance < 0:
+            return f"买盘未确认({imbalance})", None
         inherited = super()._entry_skip(code, exp, ask)
         if inherited:
             return inherited, None
@@ -167,8 +178,14 @@ class V3PaperTrader(V2PaperTrader):
                 print(f"{self._prefix()} 跳过候选 {code}：{skip}", flush=True)
                 continue
             fill_price = quote["ask"]
-            alloc = self._state.get("cash", 0.0) / max(1, remaining_slots)
-            budget = min(alloc, self._state.get("cash", 0.0))
+            budget, allocation = self._allocation_budget(
+                code, exp, fill_price, remaining_slots)
+            audit["allocation"] = allocation
+            if budget <= 0:
+                audit.update({"entry_decision": "allocation_blocked",
+                              "entry_filter_reason": allocation.get(
+                                  "allocation_factor_reason") or "风险预算为零"})
+                continue
             shares = int(budget / (fill_price * (1 + self._cost / 2.0)) // 100) * 100
             if shares <= 0:
                 audit["entry_decision"] = "insufficient_lot_cash"
@@ -202,14 +219,14 @@ class V3PaperTrader(V2PaperTrader):
                 "shares": shares, "fill_price": round(fill_price, 3),
                 "fill_source": "ask1", "quote_age_sec": age,
                 "quoted_ask_volume1_raw": quote["ask_volume1"], "entry_atr": entry_atr,
-                "allocated_cash": alloc, "cost_basis": round(cost_basis, 2),
+                "allocated_cash": budget, "cost_basis": round(cost_basis, 2),
                 **self._entry_extra(code, quote),
             })
             bought.append(
                 f"{self._label(code)} @{fill_price:.2f} {self._exp_str(code, exp)} {shares}股")
             if len(self._state["positions"]) >= self._max_positions:
                 break
-        self._state["last_buy_date"] = _today()
+        self._finish_buy_attempt(len(bought))
         self._save_state()
         self._record_buy_decision(trace, account_before, len(bought), target_n=target_n)
         if bought:
@@ -233,10 +250,11 @@ class V3PaperTrader(V2PaperTrader):
             status = "insufficient_cash_or_lot"
         else:
             status = "no_ranked_candidate"
+        stage = self._current_buy_stage or "direct"
         paper_config = {
             "buy_n": self._buy_n, "target_n": target,
-            "buy_start": self._buy_start, "buy_end": self._buy_end,
-            "time_cap_start": self._time_cap_start,
+            "buy_start": self._buy_start, "buy_retry_start": self._buy_retry_start,
+            "buy_end": self._buy_end, "time_cap_start": self._time_cap_start,
             "cost_roundtrip": self._cost, "max_positions": self._max_positions,
             "quote_max_age_sec": self._quote_max_age, "atr_k": self._atr_k,
             "entry_imbalance_min": 0.0, "fill_buy": "ask1", "fill_sell": "bid1",
@@ -245,12 +263,17 @@ class V3PaperTrader(V2PaperTrader):
             "rank_raw_safety_margin": getattr(self._cfg, "rank_raw_safety_margin", 0.001),
             "entry_rich": self._entry_rich,
             "entry_spread": self._entry_spread,
+            "risk_per_trade": self._risk_per_trade,
+            "max_position_weight": self._max_position_weight,
+            "allocation_atr_k": self._allocation_atr_k,
+            "allocation_target_return": self._allocation_target_return,
         }
         paper_config.update(self._paper_config_extra())
         record = {
             "schema_version": self._VERSION, "event_type": self._EVENT_TYPE,
-            "event_id": f"{self._EVENT_ID_PREFIX}:{_today()}",
-            "trade_date": _today(), "decision_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "event_id": f"{self._EVENT_ID_PREFIX}:{_today()}:{stage}",
+            "trade_date": _today(), "attempt_stage": stage,
+            "decision_time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "decision_status": status,
             "paper_config": paper_config,
             "account_before": account_before,

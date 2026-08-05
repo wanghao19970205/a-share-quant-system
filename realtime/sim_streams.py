@@ -23,7 +23,7 @@ from pathlib import Path
 import pandas as pd
 
 from realtime import paper_trader as paper_mod
-from realtime.snapshot import Snapshot
+from realtime.snapshot import Snapshot, from_mapping
 from realtime.strategy import StrategyContext, default_strategies
 from realtime.rerank import RerankScorer
 from realtime.paper_trader import PaperTrader
@@ -34,6 +34,7 @@ from realtime.sector_etf import SectorETFContext
 from realtime.feed import subscription_code
 from realtime.reference import RefRow, _load_expected_return, expected_return_text
 from realtime.watchlist import load_codes
+from realtime.weight_shadow import evaluate as evaluate_weight_shadow
 
 # ---- 轻量断言框架 ----------------------------------------------------------
 _PASS = 0
@@ -69,9 +70,15 @@ class Cfg:
     sector_meta_file = ""
     paper_buy_n = 2
     paper_buy_start = 1450
+    paper_buy_retry_start = 1453
     paper_buy_end = 1455
     paper_time_cap_start = 1450
     paper_max_positions = 4
+    paper_risk_per_trade = 0.015
+    paper_max_position_weight = 0.40
+    paper_allocation_atr_k = 2.0
+    paper_allocation_target_return = 0.02
+    paper_sector_max_positions = 2
     paper_breakeven_arm = 0.03
     paper_breakeven_margin = 0.005
     paper_take_profit_tighten = 0.03
@@ -561,10 +568,10 @@ def scenario_M():
     held = [p["code"] for p in trader._state["positions"]]
     print(f"     V2持仓={held}")
     check("000946" in held, "V2 高价股资金不足名额顺延到下一只")
-    # 名义等额分配但高价股只买得起 100 股(¥45,045)，余钱集中到第二只
-    total_shares = sum(p["shares"] for p in trader._state["positions"])
-    check(total_shares >= 5500,
-          f"V2 动态分配总股数 ≥ 5500（实际 {total_shares}）")
+    # 高价股超出单票风险额度不可买；下一只也受 40% 净值与单笔风险预算约束。
+    invested = sum(p["cost_basis"] for p in trader._state["positions"])
+    check(35000 <= invested <= 40000,
+          f"V2 风险预算把单票投入限制在净值 35%-40%（实际 ¥{invested:.0f}）")
 
     # 场景 2：V2 继承四版公共买窗，不再保留独立的 14:57 上限。
     trader2 = V2PaperTrader(
@@ -681,7 +688,7 @@ def scenario_M():
     check(len(still_held) == 1 and rolls == 1,
           "V2 跌停同日多次心跳只累加 1 次，不误触发强制平仓")
 
-    # 场景 9：持仓上限收缩目标只数，避免接近上限时资金闲置
+    # 场景 9：持仓上限收缩目标只数，但单票仍服从风险预算而不强行满仓
     refs9 = {"000953": RefRow(expected_return=0.05, calibrated_net_return=0.01),
              "000954": RefRow(expected_return=0.04, calibrated_net_return=0.01)}
     ctx9 = build_ctx(refs9, [mk_snap("000953", 10.0, vwap=10.0),
@@ -694,8 +701,8 @@ def scenario_M():
     trader9.maybe_trade(1455)
     new_pos = [p for p in trader9._state["positions"] if p["code"] != "000955"]
     print(f"     上限2已持1只 → 新建{len(new_pos)}只 股数={[p['shares'] for p in new_pos]}")
-    check(len(new_pos) == 1 and new_pos[0]["shares"] >= 9000,
-          "V2 剩余 1 个名额时全额投入，不按 buy_n 均分闲置现金")
+    check(len(new_pos) == 1 and 3500 <= new_pos[0]["shares"] <= 4000,
+          "V2 剩余 1 个名额时仍受单票风险预算约束并保留现金")
 
     # 场景 10：订阅保护覆盖 V2 持仓
     cfg10 = new_cfg()
@@ -1107,6 +1114,222 @@ def scenario_Q():
           "买入审计同时保留收益融合各腿和无量纲融合排序字段")
 
 
+# ============================================================================
+# R. 故障注入：NaN/Inf/坏状态/无效盘口不得崩溃或产生非法成交
+# ============================================================================
+def scenario_R():
+    print("\n== R. 四版故障注入（异常模型值 + 无效行情 + 损坏状态）==")
+    sanitized = from_mapping({
+        "code": "000991", "last": float("inf"), "pre_close": 10.0,
+        "bid_price1": float("nan"), "ask_price1": float("-inf"),
+        "bid_volume1": float("inf"), "ask_volume1": 1000,
+    })
+    check(sanitized.last is None and sanitized.bid_price1 is None and
+          sanitized.ask_price1 is None and sanitized.bid_volume1 is None,
+          "Snapshot 适配层屏蔽 NaN/Inf，不把极值送入交易层")
+
+    cfg_model = new_cfg()
+    cfg_model.predictions_file = Path(cfg_model.ledger_dir) / "bad_predictions.parquet"
+    pd.DataFrame([
+        {"code": "000991", "date": "2026-08-05", "ridge_pred": float("inf"),
+         "elastic_pred": 0.01, "extra_trees_pred": 0.01, "pred": 2.0},
+        {"code": "000992", "date": "2026-08-05", "ridge_pred": float("nan"),
+         "elastic_pred": float("inf"), "extra_trees_pred": float("-inf"), "pred": 3.0},
+        {"code": "000993", "date": "2026-08-05", "ridge_pred": 0.004,
+         "elastic_pred": 0.004, "extra_trees_pred": 0.004, "pred": float("inf")},
+    ]).to_parquet(cfg_model.predictions_file, index=False)
+    returns, _, components, scores, percentiles = _load_expected_return(cfg_model)
+    check(returns["000991"] == 0.01 and "ridge_pred" not in
+          components["000991"]["returns"] and "000992" not in returns,
+          "异常收益腿被逐行剔除；可用模型重归一化，全异常股票安全跳过")
+    check("000993" in returns and "000993" not in scores and
+          "000993" not in percentiles,
+          "无穷融合排序分不冒充有效百分位，收益腿仍可独立降级")
+
+    cfg = new_cfg(paper_buy_n=1)
+    root = Path(cfg.ledger_dir)
+    cfg.sector_meta_file = root / "missing_sector_meta.parquet"
+    for suffix in ("", "_v2", "_v3", "_v4"):
+        (root / f"paper_state{suffix}.json").write_text("{broken", encoding="utf-8")
+    today = _dt.date.today().strftime("%Y-%m-%d")
+    refs = {"000994": RefRow(expected_return=0.02, model_score=2.0,
+                              model_rank_pct=0.99, atr=0.2,
+                              prediction_date=today)}
+    ctx = build_ctx(refs, [from_mapping({
+        "code": "000994", "last": float("inf"), "pre_close": 10.0,
+        "bid_price1": float("nan"), "ask_price1": float("inf"),
+        "bid_volume1": float("inf"), "ask_volume1": -1,
+    })])
+    notifier = FakeNotifier()
+    sector = SectorETFContext(cfg)
+    traders = {
+        "V1": PaperTrader(cfg, ctx, notifier),
+        "V2": V2PaperTrader(cfg, ctx, notifier),
+        "V3": V3PaperTrader(cfg, ctx, notifier),
+        "V4": V4PaperTrader(cfg, ctx, notifier, sector),
+    }
+    check(all(t._state["cash"] == cfg.paper_start_equity and
+              not t._state["positions"] for t in traders.values()),
+          "四版损坏状态文件均隔离恢复为空仓现金账户")
+    for trader in traders.values():
+        trader.maybe_trade(1450)
+    check(all(not t._state["positions"] for t in traders.values()),
+          "四版遇到无有效 last/ask1 时均不买入且主循环不崩")
+
+    for version, trader in traders.items():
+        trader._state["positions"] = [{
+            "position_id": f"fault-{version}", "code": "000994",
+            "buy_date": "2020-01-02", "buy_time": "14:50:00",
+            "buy_price": 10.0, "shares": 100, "cost_basis": 1001.0,
+            "peak": 10.0, "peak_bid": 10.0, "entry_atr": 0.2,
+        }]
+        trader._run_sells(1450)
+    check(all(len(t._state["positions"]) == 1 for t in traders.values()),
+          "四版缺失有效 last/bid1 时均保留持仓，不产生非法卖出流水")
+
+
+# ============================================================================
+# S. 二阶段买入：初筛零成交后仅在 14:53 复评，状态跨重启持久化
+# ============================================================================
+def scenario_S():
+    print("\n== S. 四版二阶段买入（primary 14:50 + retry 14:53）==")
+    today = _dt.date.today().strftime("%Y-%m-%d")
+    refs = {"000995": RefRow(
+        expected_return=0.02, model_score=2.0, model_rank_pct=0.99,
+        atr=0.2, prediction_date=today)}
+    cfg = new_cfg(paper_buy_n=1, paper_entry_ask_strong=0.2)
+    cfg.sector_meta_file = Path(cfg.ledger_dir) / "missing_sector_meta.parquet"
+    ctx = build_ctx(refs, [mk_snap("000995", 10.0, vwap=10.0, imb=-0.8)])
+    sector = SectorETFContext(cfg)
+
+    def make_traders():
+        return {
+            "V1": PaperTrader(cfg, ctx, FakeNotifier()),
+            "V2": V2PaperTrader(cfg, ctx, FakeNotifier()),
+            "V3": V3PaperTrader(cfg, ctx, FakeNotifier()),
+            "V4": V4PaperTrader(cfg, ctx, FakeNotifier(), sector),
+        }
+
+    primary = make_traders()
+    for trader in primary.values():
+        trader.maybe_trade(1450)
+        trader.maybe_trade(1451)
+    check(all(not t._state["positions"] and
+              t._state.get("buy_attempt_stages") == ["primary"] and
+              not t._state.get("last_buy_date") for t in primary.values()),
+          "四版 primary 全过滤后保持未成交，阶段内心跳不重复执行")
+    check(all(len(t._read_jsonl(t._decisions_file)) == 1 and
+              t._read_jsonl(t._decisions_file)[0].get("attempt_stage") == "primary"
+              for t in primary.values()),
+          "四版 primary 零成交各自落一条独立审计")
+
+    ctx.update(mk_snap("000995", 10.0, vwap=10.0, imb=0.8))
+    restarted = make_traders()
+    for trader in restarted.values():
+        trader.maybe_trade(1453)
+        trader.maybe_trade(1454)
+    check(all(len(t._state["positions"]) == 1 and
+              t._state.get("buy_attempt_stages") == ["primary", "retry"] and
+              t._state.get("last_buy_date") == today for t in restarted.values()),
+          "四版重启后读取 primary 状态，仅在 retry 成交且不重复买入")
+    check(all([r.get("attempt_stage") for r in t._read_jsonl(t._decisions_file)] ==
+              ["primary", "retry"] for t in restarted.values()),
+          "四版 primary/retry 审计主键互不覆盖")
+
+    cfg_fill = new_cfg(paper_buy_n=1)
+    cfg_fill.sector_meta_file = Path(cfg_fill.ledger_dir) / "missing_sector_meta.parquet"
+    fill_ctx = build_ctx(refs, [mk_snap("000995", 10.0, vwap=10.0, imb=0.8)])
+    fill_sector = SectorETFContext(cfg_fill)
+    filled = {
+        "V1": PaperTrader(cfg_fill, fill_ctx, FakeNotifier()),
+        "V2": V2PaperTrader(cfg_fill, fill_ctx, FakeNotifier()),
+        "V3": V3PaperTrader(cfg_fill, fill_ctx, FakeNotifier()),
+        "V4": V4PaperTrader(cfg_fill, fill_ctx, FakeNotifier(), fill_sector),
+    }
+    for trader in filled.values():
+        trader.maybe_trade(1450)
+        trader.maybe_trade(1453)
+    check(all(len(t._state["positions"]) == 1 and
+              t._state.get("buy_attempt_stages") == ["primary"] and
+              len(t._read_jsonl(t._decisions_file)) == 1 for t in filled.values()),
+          "四版 primary 已成交后关闭当日买入腿，不再执行 retry")
+
+
+# ============================================================================
+# T. 风险预算：ATR 降仓、收益有限加权、V4 行业集中度
+# ============================================================================
+def scenario_T():
+    print("\n== T. 风险预算仓位（ATR + 融合收益 + 行业集中度）==")
+    cfg = new_cfg(paper_risk_per_trade=0.01, paper_max_position_weight=0.8)
+    refs = {
+        "000996": RefRow(expected_return=0.02, atr=0.1),
+        "000997": RefRow(expected_return=0.02, atr=0.5),
+    }
+    ctx = build_ctx(refs, [mk_snap("000996", 10.0), mk_snap("000997", 10.0)])
+    trader = PaperTrader(cfg, ctx, FakeNotifier())
+    low_atr_budget, low_detail = trader._allocation_budget("000996", 0.02, 10.0, 1)
+    high_atr_budget, high_detail = trader._allocation_budget("000997", 0.02, 10.0, 1)
+    check(low_atr_budget > high_atr_budget and
+          low_detail["risk_source"] == high_detail["risk_source"] == "atr",
+          "同预期收益下高 ATR 候选自动降仓")
+
+    weak_budget, _ = trader._allocation_budget("000997", 0.005, 10.0, 1)
+    strong_budget, strong_detail = trader._allocation_budget("000997", 0.08, 10.0, 1)
+    check(strong_budget > weak_budget and strong_detail["signal_factor"] == 1.25,
+          "融合收益提高风险额度但信号加权封顶 1.25 倍")
+
+    cfg_v4 = new_cfg(paper_sector_max_positions=2)
+    cfg_v4.sector_meta_file = Path(cfg_v4.ledger_dir) / "missing_sector_meta.parquet"
+    sector = SectorETFContext(cfg_v4)
+    v4 = V4PaperTrader(cfg_v4, ctx, FakeNotifier(), sector)
+    sector_mark = {"etf_code": "512800.SH", "stock_industry": "股份制银行Ⅲ"}
+    v4._sector_entry_cache["000996"] = sector_mark
+    v4._state["positions"] = [
+        {"code": f"held{i}", "buy_price": 10.0, "shares": 100,
+         "sector_etf": sector_mark} for i in range(2)]
+    blocked_budget, blocked_detail = v4._allocation_budget("000996", 0.02, 10.0, 1)
+    check(blocked_budget == 0 and "行业集中度上限" in str(
+              blocked_detail["allocation_factor_reason"]),
+          "V4 同行业已达上限时阻断新增仓位并保留审计原因")
+
+
+# ============================================================================
+# U. Realtime 权重影子：滚动约束 + 进化搜索 + 版本化人工晋级
+# ============================================================================
+def scenario_U():
+    print("\n== U. Realtime 权重影子评估（不写 active model）==")
+    root = Path(tempfile.mkdtemp(prefix="sim_weight_shadow_"))
+    source = root / "historical_predictions.parquet"
+    output = root / "weight_shadow"
+    rows = []
+    dates = pd.bdate_range("2026-05-01", periods=35)
+    for day_index, date in enumerate(dates):
+        for code_index in range(16):
+            signal = (code_index - 7.5) / 1000.0
+            rows.append({
+                "code": str(code_index).zfill(6), "date": date,
+                "ridge_pred": -signal + ((day_index % 3) - 1) * 0.0001,
+                "elastic_pred": ((code_index * 7 + day_index) % 11 - 5) / 1000.0,
+                "extra_trees_pred": signal,
+                "target_ret_1d": signal,
+            })
+    pd.DataFrame(rows).to_parquet(source, index=False)
+    manifest = evaluate_weight_shadow(
+        source, output, train_days=10, min_oos_days=20,
+        rebalance_days=5, cost=0.0)
+    check(manifest["oos"]["candidate"]["days"] >= 20 and
+          manifest["proposed_weights"]["extra_trees_pred"] > 0.6,
+          "滚动约束与进化搜索识别有效 ExtraTrees 收益腿并形成 20 日以上 OOS")
+    check(manifest["state"] == "eligible" and
+          manifest["promotion"]["manual_review_required"] and
+          not manifest["auto_apply"] and not manifest["publishable"],
+          "影子胜出只标记 eligible，仍要求人工晋级且禁止自动应用")
+    version_file = output / "versions" / f"{manifest['version']}.json"
+    forbidden = list(output.rglob("active_quant_model.json"))
+    check((output / "manifest.json").exists() and version_file.exists() and not forbidden,
+          "影子 manifest 当前指针与版本文件原子落盘，不生成 active model 产物")
+
+
 def main() -> int:
     print("=" * 68)
     print(" 虚拟数据流验证：实时层重排/模拟盘/出场逻辑")
@@ -1114,7 +1337,8 @@ def main() -> int:
     for fn in (scenario_A, scenario_B, scenario_C, scenario_D,
                scenario_E, scenario_F, scenario_G, scenario_H,
                scenario_I, scenario_J, scenario_K, scenario_L,
-               scenario_M, scenario_N, scenario_O, scenario_P, scenario_Q):
+               scenario_M, scenario_N, scenario_O, scenario_P, scenario_Q,
+               scenario_R, scenario_S, scenario_T, scenario_U):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

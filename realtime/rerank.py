@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Optional
 
 from .reference import net_return_after_cost
@@ -141,13 +142,21 @@ class RerankScorer:
             if clean in exclude:
                 _mark(code, "excluded_held")
                 continue
-            exp = getattr(r, "expected_return", None)
-            if exp is None:
+            raw_exp = getattr(r, "expected_return", None)
+            if raw_exp is None:
                 _mark(code, "excluded_missing_expected_return")
+                continue
+            try:
+                exp = float(raw_exp)
+            except (TypeError, ValueError):
+                _mark(code, "excluded_invalid_expected_return")
+                continue
+            if not math.isfinite(exp):
+                _mark(code, "excluded_invalid_expected_return")
                 continue
             if exp <= 0:
                 _mark(code, "excluded_nonpositive_expected_return",
-                      expected_return=float(exp))
+                      expected_return=exp)
                 continue
             calibrated = getattr(r, "calibrated_return", None)
             calibrated_net = getattr(r, "calibrated_net_return", None)
@@ -156,6 +165,19 @@ class RerankScorer:
                 calibrated_net = net_return_after_cost(gross, self._cost)
             model_score = getattr(r, "model_score", None)
             model_rank_pct = getattr(r, "model_rank_pct", None)
+            try:
+                model_score = float(model_score)
+            except (TypeError, ValueError):
+                model_score = None
+            if model_score is not None and not math.isfinite(model_score):
+                model_score = None
+            try:
+                model_rank_pct = float(model_rank_pct)
+            except (TypeError, ValueError):
+                model_rank_pct = None
+            if (model_rank_pct is not None and
+                    (not math.isfinite(model_rank_pct) or not 0 <= model_rank_pct <= 1)):
+                model_rank_pct = None
             values = {
                 "expected_return": float(exp),
                 "raw_net_return": float(net_return_after_cost(float(exp), self._cost)),

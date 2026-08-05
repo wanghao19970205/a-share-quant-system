@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -135,6 +136,7 @@ def _ensemble_return_series(df, cfg: RealtimeConfig):
         if column not in df.columns:
             continue
         values = pd.to_numeric(df[column], errors="coerce")
+        values = values.where(values.map(math.isfinite))
         available = values.notna()
         numerator = numerator.add(values.fillna(0.0) * weight, fill_value=0.0)
         denominator = denominator.add(available.astype(float) * weight, fill_value=0.0)
@@ -178,6 +180,7 @@ def _load_expected_return(
     expected_returns = _ensemble_return_series(df, cfg)
     raw_scores = (pd.to_numeric(df["pred"], errors="coerce")
                   if "pred" in df.columns else pd.Series(float("nan"), index=df.index))
+    raw_scores = raw_scores.where(raw_scores.map(math.isfinite))
     rank_pct = raw_scores.rank(method="average", pct=True)
     configured_weights = _return_model_weights(cfg)
     returns: dict[str, float] = {}
@@ -187,15 +190,19 @@ def _load_expected_return(
     codes = df["code"].astype(str).str.zfill(6)
     for index, (code, expected, model_score, percentile) in enumerate(zip(
             codes, expected_returns, raw_scores, rank_pct)):
-        if expected != expected:
+        if not math.isfinite(float(expected)):
             continue
         row = df.iloc[index]
         model_returns = {}
         available_weights = {}
         for column, weight in configured_weights.items():
             raw = row.get(column)
-            if raw is not None and raw == raw:
-                model_returns[column] = float(raw)
+            try:
+                numeric = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                model_returns[column] = numeric
                 available_weights[column] = float(weight)
         total = sum(available_weights.values())
         normalized_weights = ({key: value / total
@@ -354,9 +361,13 @@ def _build_calibration(cfg: RealtimeConfig):
     inner_edges = list(edges[1:-1])  # 用于 np.searchsorted 定位分档
 
     def lookup(expected_return):
-        if expected_return is None or expected_return != expected_return:  # None/NaN
+        try:
+            numeric = float(expected_return)
+        except (TypeError, ValueError):
             return None, None
-        b = int(np.searchsorted(inner_edges, float(expected_return), side="right"))
+        if not math.isfinite(numeric):
+            return None, None
+        b = int(np.searchsorted(inner_edges, numeric, side="right"))
         b = min(b, idx[-1])  # 落在最右开区间外时归入最高档
         return cal_by_bin.get(b), wr_by_bin.get(b)
 

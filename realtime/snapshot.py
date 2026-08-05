@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+import math
 from typing import Any, Mapping, Optional
 
 
@@ -41,8 +42,8 @@ def _coerce_float(v: Any) -> Optional[float]:
         f = float(v)
     except (TypeError, ValueError):
         return None
-    # 屏蔽券商用极值/0 表示的空档位
-    if f != f:  # NaN
+    # 屏蔽 NaN/Inf；上层再按字段语义判断 0/负值是否合法。
+    if not math.isfinite(f):
         return None
     return f
 
