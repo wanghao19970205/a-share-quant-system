@@ -39,7 +39,6 @@ class V2PaperTrader(_V1):
         super().__init__(cfg, ctx, notifier, name_map)
         # V2 新增参数（在 super().__init__ 之后读取，cfg 为不可变 dataclass）。
         self._max_positions = int(getattr(cfg, "paper_max_positions", 4))
-        self._buy_end = max(1455, min(int(getattr(cfg, "paper_buy_end", 1457)), 1500))
         self._breakeven_arm = float(getattr(cfg, "paper_breakeven_arm", 0.03))
         self._breakeven_margin = float(getattr(cfg, "paper_breakeven_margin", 0.005))
         self._take_profit_tighten = float(getattr(
@@ -313,7 +312,8 @@ class V2PaperTrader(_V1):
                 "take_profit_tighten": self._take_profit_tighten,
                 "limit_down_roll_max": self._limit_down_roll_max,
                 "rank_pool_n": getattr(self._cfg, "rank_pool_n", 30),
-                "rank_min_net_return": getattr(self._cfg, "rank_min_net_return", 0.0),
+                "rank_min_raw_return": getattr(self._cfg, "rank_min_raw_return", 0.0),
+                "rank_raw_safety_margin": getattr(self._cfg, "rank_raw_safety_margin", 0.001),
                 "entry_rich": self._entry_rich,
                 "entry_ask_strong": self._entry_ask_strong,
                 "entry_spread": self._entry_spread,

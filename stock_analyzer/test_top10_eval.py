@@ -56,6 +56,49 @@ class Top10CacheFingerprintTest(unittest.TestCase):
                 }
                 self.assertFalse(top10_eval._same_input(entry, self.frame))
 
+    def test_ranking_frames_expands_only_all_a_to_top30(self):
+        frame = pd.DataFrame({
+            "code": [f"600{index:03d}" for index in range(40)],
+            "date": ["2026-08-05"] * 40,
+            "rank": list(range(1, 41)),
+            "pred": [float(40 - index) for index in range(40)],
+        })
+        whitelist = frame.iloc[:15].copy()
+        whitelist["watch_rank"] = list(range(1, 16))
+        innovation_codes = set(frame.iloc[20:35]["code"])
+
+        with mock.patch.object(top10_eval.quant_signal, "latest_frame", return_value=frame), \
+                mock.patch.object(top10_eval.quant_signal, "watchlist_frame", return_value=whitelist), \
+                mock.patch.object(top10_eval, "_innovation_codes", return_value=innovation_codes), \
+                mock.patch.object(top10_eval.stock_meta, "enrich_frame", side_effect=lambda value, **_: value):
+            groups = top10_eval.ranking_frames()
+
+        self.assertEqual(len(groups["白名单"]), 10)
+        self.assertEqual(len(groups["全A"]), 30)
+        self.assertEqual(len(groups["创新药"]), 10)
+        self.assertEqual(groups["全A"]["rank"].tolist(), list(range(1, 31)))
+        self.assertEqual(groups["创新药"]["rank"].tolist(), list(range(21, 31)))
+
+    def test_refresh_publishes_quant_snapshot_before_external_evaluation(self):
+        all_a = pd.DataFrame({
+            "code": [f"600{index:03d}" for index in range(30)],
+            "date": ["2026-08-05"] * 30,
+            "rank": list(range(1, 31)),
+            "pred": [float(30 - index) for index in range(30)],
+        })
+        frames = {"白名单": pd.DataFrame(), "全A": all_a, "创新药": pd.DataFrame()}
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"SNAPSHOT_DIR": directory}), \
+                mock.patch.object(top10_eval, "ranking_frames", return_value=frames), \
+                mock.patch.object(top10_eval.candidate_eval, "latest_quotes",
+                                  side_effect=RuntimeError("external failure")):
+            with self.assertRaises(RuntimeError):
+                top10_eval.refresh()
+            snapshot = __import__("json").loads(
+                (Path(directory) / "mobile_snapshot.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(snapshot["groups"]["全A"]["rows"]), 30)
+
     def test_refresh_uses_configured_workers_and_reports_timing(self):
         frames = {
             "白名单": self.frame,

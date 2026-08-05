@@ -79,7 +79,9 @@ class PaperTrader:
         self._notifier = notifier
         self._name_map = name_map or {}
         self._buy_n = max(1, getattr(cfg, "paper_buy_n", 2))
-        self._buy_start = int(getattr(cfg, "paper_buy_start", 1455))
+        self._buy_start = int(getattr(cfg, "paper_buy_start", 1450))
+        self._buy_end = max(
+            self._buy_start, min(int(getattr(cfg, "paper_buy_end", 1455)), 1500))
         self._time_cap_start = int(getattr(cfg, "paper_time_cap_start", 1450))
         self._start_equity = float(getattr(cfg, "paper_start_equity", 100000.0))
         self._cost = float(getattr(cfg, "paper_cost", 0.002))
@@ -306,8 +308,8 @@ class PaperTrader:
             _dt.datetime.now().hour * 100 + _dt.datetime.now().minute)
         # 风险退出全天有效；纯到期退出只在收盘前执行，保持训练的 close→close 口径。
         self._run_sells(t)
-        # 买入腿：只在收盘前 [buy_start, 收盘] 窗内、且当日未建过仓时建仓。
-        if self._buy_start <= t <= 1500:
+        # 买入腿：只在 [buy_start, buy_end] 窗内、且当日未建过仓时建仓。
+        if self._buy_start <= t <= self._buy_end:
             if not (self._acted_today and self._state.get("last_buy_date") == _today()):
                 self._run_buys()
                 self._acted_today = True
@@ -440,9 +442,11 @@ class PaperTrader:
             "decision_status": status,
             "paper_config": {
                 "buy_n": self._buy_n, "buy_start": self._buy_start,
+                "buy_end": self._buy_end,
                 "time_cap_start": self._time_cap_start, "cost_roundtrip": self._cost,
                 "rank_pool_n": getattr(self._cfg, "rank_pool_n", 30),
-                "rank_min_net_return": getattr(self._cfg, "rank_min_net_return", 0.0),
+                "rank_min_raw_return": getattr(self._cfg, "rank_min_raw_return", 0.0),
+                "rank_raw_safety_margin": getattr(self._cfg, "rank_raw_safety_margin", 0.001),
                 "entry_rich": self._entry_rich,
                 "entry_ask_strong": self._entry_ask_strong,
                 "entry_spread": self._entry_spread,
@@ -557,9 +561,9 @@ class PaperTrader:
     def _rank(self, exclude: Optional[set] = None) -> list:
         """按【重排后 score】降序返回可买候选 [(code, exp, price)]。
 
-        候选池 = 模型 expected_return>0 的 Top-rank_pool_n，经 RerankScorer 盘中微调
-        （模型分锚定 + 盘中有界纠偏），并要求有实时价、剔除封涨停、排除已持仓。
-        返回三元组兼容 _run_buys；exp 恒为原始 ridge_pred（记账/展示用）。
+        候选池先过三模型融合收益门，再按融合 pred 百分位取 Top-rank_pool_n，经
+        RerankScorer 盘中有界纠偏，并要求有实时价、剔除封涨停、排除已持仓。
+        返回三元组兼容 _run_buys；exp 为同量纲融合收益率（成本门/记账/展示用）。
         """
         rows = self._scorer.ranked(exclude=exclude or set(),
                                    require_price=True, drop_limit_up=True)

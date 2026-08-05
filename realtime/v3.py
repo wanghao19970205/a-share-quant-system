@@ -241,7 +241,8 @@ class V3PaperTrader(V2PaperTrader):
             "quote_max_age_sec": self._quote_max_age, "atr_k": self._atr_k,
             "entry_imbalance_min": 0.0, "fill_buy": "ask1", "fill_sell": "bid1",
             "rank_pool_n": getattr(self._cfg, "rank_pool_n", 30),
-            "rank_min_net_return": getattr(self._cfg, "rank_min_net_return", 0.0),
+            "rank_min_raw_return": getattr(self._cfg, "rank_min_raw_return", 0.0),
+            "rank_raw_safety_margin": getattr(self._cfg, "rank_raw_safety_margin", 0.001),
             "entry_rich": self._entry_rich,
             "entry_spread": self._entry_spread,
         }

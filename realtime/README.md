@@ -40,28 +40,29 @@
 
 1. 全部模拟盘账户持仓（`paper_state.json` 与启用时的 `paper_state_v2.json`）；
 2. `realtime_holdings.txt` 中的人工持仓；
-3. `mobile_snapshot.json` 中手机端 Top10 组；
-4. Top10 缺失时使用最新预测文件；
+3. `mobile_snapshot.json` 中固定候选组（白名单 Top10、全A Top30、创新药 Top10）；
+4. 固定候选快照缺失时使用最新预测文件；
 5. 全部缺失时使用兜底股票池。
 
 模拟盘和人工持仓属于保护性订阅，优先于候选清单。即使保护性持仓数量超过 `REALTIME_MAX_SUBSCRIBE`，也不能因截断而失去报价和卖出能力。
 
-引擎监听 Top10、人工持仓和模拟盘状态文件的 mtime。代码集合发生变化时使用 `execv` 自我重启，重新建立订阅。
+引擎监听固定候选快照、人工持仓和模拟盘状态文件的 mtime。代码集合发生变化时使用 `execv` 自我重启，重新建立订阅。
 
 ## 4. 预期收益口径
 
-- `expected_return`：Ridge 的原始 `ridge_pred`，单位为小数收益率，用于候选池和排序。
-- `calibrated_return`：历史同预测分档的实际毛收益均值，只用于解释和交易经济性校验。
-- `calibrated_net_return`：按模拟盘买卖各半成本模型扣除 round-trip 成本后的净收益。
-- `pred`：融合后的无量纲排序分，不得当作收益率展示或用于成本判断。
+- `expected_return`：`30% Ridge + 20% ElasticNet + 50% ExtraTrees` 的同量纲融合收益率，用于成本安全边际门和收益展示；缺模型腿时按可用权重归一化。
+- `return_components`：三条收益模型的原始值、实际归一化权重和降级来源，写入买入审计。
+- `calibrated_return`：历史同融合收益分档的实际毛收益均值，只用于展示和审计，不再直接作为买入硬门。
+- `calibrated_net_return`：按模拟盘买卖各半成本模型扣除 round-trip 成本后的净收益，仅作历史兑现参考。
+- `pred`：包含 LightGBM、IC、ElasticNet、ExtraTrees 的现役无量纲融合分，转换为当日全A百分位后作为实时排序主序；不得当作收益率展示或用于成本判断。
 
 通知展示格式为：
 
 ```text
-历史净+0.38%(毛+0.58% 胜率52%)
+模型净+0.30%(原始毛+0.50%;历史校准+0.58% 胜率52%)
 ```
 
-缺少历史校准时回退为模型原始收益扣成本后的净收益。
+买入硬门使用三模型融合收益覆盖成本和安全边际；缺少历史校准时只是不显示历史校准参考。
 
 ## 5. 候选池与盘中重排
 
@@ -70,20 +71,32 @@
 候选必须依次满足：
 
 1. 不在排除集合中，例如当前已持仓；
-2. `expected_return > 0`；
-3. `calibrated_net_return > REALTIME_RANK_MIN_NET_RETURN`；
-4. 按原始 `expected_return` 进入模型 Top `REALTIME_RANK_POOL_N`；
+2. 融合 `expected_return >= max(REALTIME_RANK_MIN_RAW_RETURN, paper_cost + REALTIME_RANK_RAW_SAFETY_MARGIN)`；
+3. 历史 `calibrated_net_return` 只保留用于展示和审计；
+4. 按融合 `pred` 的当日全A百分位进入模型 Top `REALTIME_RANK_POOL_N`；缺 `pred` 时退回 Ridge 主序；
 5. 买入腿要求有实时价且未封涨停。
 
 默认值：
 
 ```text
+REALTIME_ENSEMBLE_RETURN=true
+REALTIME_ENSEMBLE_RIDGE_WEIGHT=0.30
+REALTIME_ENSEMBLE_ELASTIC_WEIGHT=0.20
+REALTIME_ENSEMBLE_EXTRA_TREES_WEIGHT=0.50
 REALTIME_RANK_POOL_N=30
-REALTIME_RANK_MIN_NET_RETURN=0
+REALTIME_RANK_MIN_RAW_RETURN=0
+REALTIME_RANK_RAW_SAFETY_MARGIN=0.001
 REALTIME_PAPER_COST=0.002
 ```
 
 ### 5.2 重排公式
+
+```text
+model_anchor = percentile_rank(pred)       # 当日全A，范围 0-1
+score = model_anchor + clamp(adj, -cap, +cap) * rank_scale
+```
+
+旧预测文件缺少 `pred` 时降级为：
 
 ```text
 score = expected_return * (1 + clamp(adj, -cap, +cap))
@@ -93,7 +106,8 @@ score = expected_return * (1 + clamp(adj, -cap, +cap))
 
 | 参数 | 默认值 | 作用 |
 |---|---:|---|
-| `REALTIME_RERANK_CAP` | 0.30 | 总调整限制为正负 30% |
+| `REALTIME_RERANK_CAP` | 0.30 | 盘中调整值限制为正负 0.30 |
+| `REALTIME_RERANK_INTRADAY_RANK_SCALE` | 0.10 | 将盘中调整换算成最多约 3 个百分位点的主序位移 |
 | `REALTIME_RERANK_W_VWAP` | 0.35 | 低于 VWAP 加分，高于 VWAP 减分 |
 | `REALTIME_RERANK_W_IMB` | 0.30 | 买盘强加分，卖盘强减分 |
 | `REALTIME_RERANK_W_SPREAD` | 0.15 | 盘口窄加分，盘口宽减分 |
@@ -105,12 +119,12 @@ score = expected_return * (1 + clamp(adj, -cap, +cap))
 
 ## 6. 模拟盘买入
 
-买入窗口为 14:55-15:00，每个交易日只执行一次。
+V1-V4 统一买入窗口为 14:50-14:55（闭区间），每个交易日每版只执行一次。
 
 执行顺序：
 
 1. 14:50 后先处理旧仓风险和到期卖出；
-2. 14:55 后重新读取当日模型候选；
+2. 同一轮卖出腿完成后，在 14:50-14:55 内读取当日模型候选；
 3. 按重排后的 `score` 降序检查候选；
 4. 买入通过过滤的前 2 只；
 5. 现金按目标只数等额分配，股数向下取整到 100 股；
@@ -126,7 +140,7 @@ score = expected_return * (1 + clamp(adj, -cap, +cap))
 | `spread_pct >= 0.6%` | 跳过 |
 | 封涨停 | 跳过 |
 
-如果候选被过滤，会继续检查下一名。若旧仓在 14:50 卖出后，同一股票仍是 14:55 的有效 Top2，可以重新买入，相当于用新预测决定是否续持。
+如果候选被过滤，会继续检查下一名。若旧仓在 14:50 卖出后，同一股票仍是当轮有效 Top2，可以重新买入，相当于用新预测决定是否续持。
 
 ## 7. 模拟盘卖出
 
@@ -145,7 +159,8 @@ A 股 T+1 是总前提：买入当日不可卖出。到 T+1 后按以下优先�
 ```text
 REALTIME_SELL_HORIZON=1
 REALTIME_PAPER_TIME_CAP_START=1450
-REALTIME_PAPER_BUY_START=1455
+REALTIME_PAPER_BUY_START=1450
+REALTIME_PAPER_BUY_END=1455
 REALTIME_PAPER_STOP_LOSS=0.05
 REALTIME_PAPER_TAKE_PROFIT=0.09
 REALTIME_PAPER_TRAIL_K=3.0
@@ -165,7 +180,7 @@ REALTIME_PAPER_VWAP_BREAK=0.02
 
 `GapCalibrate` 类仍保留用于显式实验，但不进入默认装配。
 
-信号策略负责账本和通知，不直接替代 `PaperTrader` 的成交判断。
+信号策略不直接替代 `PaperTrader` 的成交判断。生产默认 `REALTIME_SIGNAL_PUSH=false`：六类通用信号和行业 ETF 状态只写账本、不发 Push；仅保留 RankBoard 的 Top 榜和 V1-V4 模拟盘买卖 Push。需要临时恢复通用信号提醒时，显式设置 `REALTIME_SIGNAL_PUSH=true`，再由 `REALTIME_NOTIFY_KINDS` 控制白名单。
 
 ### V1-V4 赛马总览
 
@@ -184,7 +199,7 @@ REALTIME_PAPER_VWAP_BREAK=0.02
 
 V2 与 V1 的差异仅在执行端：
 
-- 买入窗收窄到 `14:55-14:57`，规避收盘集合竞价成交价偏差；
+- 与其他版本统一使用 `14:50-14:55` 买入窗口；
 - 资金按剩余名额动态分配，高价股买不起时余钱顺延给下一名；
 - 目标只数受 `paper_max_positions` 收缩，避免接近上限时闲置现金；
 - 浮盈达 `paper_breakeven_arm` 后回落至成本附近触发 `breakeven_stop`；
@@ -198,7 +213,7 @@ V2 与 V1 的差异仅在执行端：
 
 ```text
 REALTIME_PAPER_V2=true
-REALTIME_PAPER_BUY_END=1457
+REALTIME_PAPER_BUY_END=1455
 REALTIME_PAPER_MAX_POSITIONS=4
 REALTIME_PAPER_BREAKEVEN_ARM=0.03
 REALTIME_PAPER_BREAKEVEN_MARGIN=0.005
@@ -281,7 +296,8 @@ V1/V2/V3/V4 的持仓都由 `config.paper_state_files()` 纳入保护性订阅�
 买入决策审计记录：
 
 - 模型池排除原因；
-- 原始、校准毛收益和校准净收益；
+- 三模型融合收益、各腿原始值、归一化权重、校准毛收益和校准净收益；
+- 无量纲融合 `pred` 原始分、当日全A百分位；
 - rank、score、adj 和分项贡献；
 - 实时价、开盘价、昨收、VWAP、盘口失衡、价差和涨停状态；
 - 入场过滤、未进入 Top2、资金不足或实际成交；
@@ -339,15 +355,15 @@ docker compose exec -T scheduler python -c "from realtime.config import load; c=
 
 | 检查项 | 正常标准 | 异常时的含义 |
 |---|---|---|
-| 当日预测 | 14:55前预测最大日期等于交易日 | V3/V4会记录 `预测非当日` 并拒绝新仓 |
-| 实时行情 | 14:55附近心跳 `active=True` 且 `recv` 持续增长 | 买入窗口可能未获得有效盘口 |
+| 当日预测 | 14:50前预测最大日期等于交易日 | V3/V4会记录 `预测非当日` 并拒绝新仓 |
+| 实时行情 | 14:50附近心跳 `active=True` 且 `recv` 持续增长 | 买入窗口可能未获得有效盘口 |
 | 四版决策 | 每版当日各有一个 `paper_buy_decision*` 事件 | 缺失版本未执行买入腿或审计写入失败 |
 | ETF行情 | `sector_recv > 0`，ETF强/中/弱分布可见 | V4标记 `sector_quote_unavailable` 并安全退化为V3 |
 | 异步副作用 | `effects_dropped=0` | 非零表示通知/账本队列持续拥塞 |
 
 `paper_state_v3.json` 和 `paper_state_v4.json` 在首次买入决策保存时才创建；仅在部署后、买入窗口前不存在不代表故障。排查零成交优先运行 `./restart.sh diag`，再查看对应版本决策事件，不应只检查成交流水。
 
-当前虚拟数据流回归为 **68 PASS / 0 FAIL**，覆盖模型池封闭、重排有界、A 股 T+1、五级卖出、保护性订阅、成本后净收益门、14:50 到期卖出、14:55 买入、决策 trace 和反事实幂等补齐；V2 的账户隔离、零成交审计、跌停顺延、名额收缩和保护性止盈；V3 的当日预测、新鲜度、`ask1/bid1` 成交、ATR 三类退出和跌停流动性；以及 V4 的完整ETF代码、精确主行业映射、置信度门控、相对弱势过滤、安全降级和独立审计。
+当前虚拟数据流回归为 **89 PASS / 0 FAIL**，覆盖模型池封闭、重排有界、A 股 T+1、五级卖出、保护性订阅、原始预期成本安全边际门、14:50 到期卖出、14:50-14:55 买入窗口、决策 trace 和反事实幂等补齐；V2 的账户隔离、零成交审计、跌停顺延、名额收缩和保护性止盈；V3 的当日预测、新鲜度、`ask1/bid1` 成交、ATR 三类退出和跌停流动性；V4 的完整ETF代码、精确主行业映射、置信度门控、相对弱势过滤、安全降级和独立审计；以及 V1-V4 同场买入、独立落盘、跨日重启恢复、风险卖出和交易 ID 隔离的完整生命周期。
 
 ## 11. 部署纪律
 

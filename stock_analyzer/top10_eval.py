@@ -1,4 +1,4 @@
-"""Persisted LLM ranking for the fixed Top10 views.
+"""Persisted LLM ranking for fixed candidate views.
 
 The scheduler runs this after a successful quant model publish. UIs only read the
 published JSON; individual-stock analysis remains an on-demand live request.
@@ -18,8 +18,9 @@ import pandas as pd
 from stock_analyzer import all_a_meta, candidate_eval, data, quant_signal, screener, stock_meta
 
 _GROUPS = ("白名单", "全A", "创新药")
+_GROUP_LIMITS = {"白名单": 10, "全A": 30, "创新药": 10}
 _MAIN_PREFIXES = ("600", "601", "603", "605", "000", "001", "002", "003")
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 
 
 def _worker_count() -> int:
@@ -140,11 +141,14 @@ def ranking_frames() -> dict[str, pd.DataFrame]:
         return {group: pd.DataFrame() for group in _GROUPS}
     whitelist = _safe(lambda: quant_signal.watchlist_frame(profile="short_stable", style="short_1_3"), pd.DataFrame())
     if whitelist is not None and not whitelist.empty:
-        whitelist = whitelist.sort_values("watch_rank", na_position="last").head(10).copy()
+        whitelist = whitelist.sort_values("watch_rank", na_position="last").head(
+            _GROUP_LIMITS["白名单"]).copy()
     else:
         whitelist = pd.DataFrame()
-    all_a = frame[frame["code"].astype(str).str.startswith(_MAIN_PREFIXES)].sort_values("rank").head(10).copy()
-    innovation = frame[frame["code"].isin(_innovation_codes())].sort_values("rank").head(10).copy()
+    all_a = frame[frame["code"].astype(str).str.startswith(_MAIN_PREFIXES)].sort_values(
+        "rank").head(_GROUP_LIMITS["全A"]).copy()
+    innovation = frame[frame["code"].isin(_innovation_codes())].sort_values(
+        "rank").head(_GROUP_LIMITS["创新药"]).copy()
     if not all_a.empty:
         all_a = stock_meta.enrich_frame(all_a, remote=False, use_all_a_meta=True)
     if not innovation.empty:
@@ -193,12 +197,16 @@ def _same_input(entry: dict, frame: pd.DataFrame, quotes: dict[str, dict] | None
 
 
 def refresh(key: str = "", model: str = "", base_url: str = "") -> dict:
-    """Evaluate changed fixed Top10 groups and atomically publish their results."""
+    """Evaluate changed fixed candidate groups and atomically publish their results."""
     started = time.perf_counter()
     cache = _read_cache()
     ranking_started = time.perf_counter()
     frames = ranking_frames()
     ranking_seconds = time.perf_counter() - ranking_started
+    # 量化候选先独立发布，不能被后续券商原生库/LLM 评估崩溃拖住。LLM 缓存可稍后补齐，
+    # 但实时订阅与模拟盘必须立即拿到白名单10/全A30/创新药10的最新 rows。
+    if any(frame is not None and not frame.empty for frame in frames.values()):
+        _write_mobile_snapshot(frames, cache)
     summary = {"updated": [], "skipped": [], "failed": []}
     changed = {}
     for group, frame in frames.items():
@@ -314,7 +322,7 @@ def _run_worker(key: str, model: str, base_url: str) -> None:
 def main() -> None:
     import argparse
     import subprocess
-    parser = argparse.ArgumentParser(description="Refresh persisted LLM rankings for fixed Top10 groups")
+    parser = argparse.ArgumentParser(description="Refresh persisted LLM rankings for fixed candidate groups")
     parser.add_argument("--worker", action="store_true", help="内部标志：TGW 全量模式子进程，勿手工传")
     parser.add_argument("--key", default="")
     parser.add_argument("--model", default="")

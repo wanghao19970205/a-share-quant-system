@@ -4,8 +4,8 @@
 过白名单+冷却；RankBoard 是【跨票汇总】，主动按模型预期收益排名并配盘中量标注，走
 notifier.push 低层派发（不过白名单），自带节奏控制 + 指纹去重防刷屏。
 
-排序主序 = 盘中重排后 score（RerankScorer：模型 expected_return 锚定 + 盘中有界微调）；
-候选池 = 模型看多且历史校准净收益覆盖成本的 Top-rank_pool_n，重排只在池内微调名次，
+排序主序 = 盘中重排后 score（RerankScorer：现役融合 pred 百分位锚定 + 盘中有界微调）；
+候选池先通过三模型融合收益成本安全边际门，再按融合模型取 Top-rank_pool_n；重排只在池内微调，
 不造新 alpha。
 
 只读 ctx 内存状态（最新快照 + VWAP + ref），盘中绝不碰 quant_data。缺 expected_return
@@ -114,10 +114,10 @@ class RankBoard:
         return True
 
     def _rank(self) -> list:
-        """盘中重排后取 Top-N。候选池 = 模型看多且校准净收益达标的 Top-rank_pool_n，
+        """盘中重排后取 Top-N。候选池先过三模型融合收益门，再按融合 pred 取 Top-rank_pool_n，
         经 RerankScorer 盘中微调后按 score 降序，取前 rank_top_n 展示。
 
-        排序主序 = 重排后 score（模型分锚定 + 盘中有界微调），展示预期%仍用校准值。
+        排序主序 = 重排后 score（融合百分位锚定 + 盘中有界微调），预期%仍用 Ridge 口径。
 
         与 PaperTrader 买入腿同口径 drop_limit_up=True：封涨停/一字板当下买不进，
         摆在榜首无意义（且 last 顶死涨停价恒定 → 指纹不变 → 榜单假性「不更新」）。

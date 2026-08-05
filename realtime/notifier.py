@@ -47,7 +47,9 @@ class Notifier:
 
     # ---- 对外 ----------------------------------------------------------------
     def notify(self, sig: Signal) -> bool:
-        """推送一条信号。返回是否实际发出（被白名单过滤/节流/干跑则 False）。"""
+        """推送一条通用信号；关闭时返回 False，调用方仍会将信号写入账本。"""
+        if not getattr(self._cfg, "signal_push_enabled", False):
+            return False
         # 白名单过滤：只推 notify_kinds 内的 kind（空集=不过滤）。被挡的仍会记账。
         if self._cfg.notify_kinds and sig.kind not in self._cfg.notify_kinds:
             return False

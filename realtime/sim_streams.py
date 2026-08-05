@@ -32,7 +32,7 @@ from realtime.v3 import V3PaperTrader
 from realtime.v4 import V4PaperTrader
 from realtime.sector_etf import SectorETFContext
 from realtime.feed import subscription_code
-from realtime.reference import RefRow, expected_return_text
+from realtime.reference import RefRow, _load_expected_return, expected_return_text
 from realtime.watchlist import load_codes
 
 # ---- 轻量断言框架 ----------------------------------------------------------
@@ -68,8 +68,8 @@ class Cfg:
     paper_v4_sector_mapping_min_confidence = 0.8
     sector_meta_file = ""
     paper_buy_n = 2
-    paper_buy_start = 1455
-    paper_buy_end = 1457
+    paper_buy_start = 1450
+    paper_buy_end = 1455
     paper_time_cap_start = 1450
     paper_max_positions = 4
     paper_breakeven_arm = 0.03
@@ -97,7 +97,14 @@ class Cfg:
     rerank_w_imb = 0.30
     rerank_w_gap = 0.0
     rerank_w_spread = 0.15
-    rank_min_net_return = 0.0
+    rerank_intraday_rank_scale = 0.10
+    rank_raw_safety_margin = 0.001
+    rank_min_raw_return = 0.0
+    rank_min_net_return = 0.0  # 兼容旧审计字段，不再作为硬门
+    ensemble_return_enabled = True
+    ensemble_ridge_weight = 0.30
+    ensemble_elastic_weight = 0.20
+    ensemble_extra_trees_weight = 0.50
 
 
 class FakeNotifier:
@@ -394,26 +401,45 @@ def scenario_H():
     check(codes == ["600941", "000766"],
           "全部模拟盘持仓优先订阅，max_subscribe 截断也不丢报价")
 
+    cfg30 = new_cfg()
+    root30 = Path(cfg30.ledger_dir)
+    cfg30.mobile_snapshot_file = root30 / "mobile_snapshot.json"
+    cfg30.holdings_file = root30 / "missing_holdings.txt"
+    cfg30.predictions_file = root30 / "missing_predictions.parquet"
+    cfg30.universe_file = root30 / "missing_universe.txt"
+    cfg30.max_subscribe = 100
+    all_a_rows = [{"code": f"600{index:03d}"} for index in range(30)]
+    cfg30.mobile_snapshot_file.write_text(json.dumps({
+        "groups": {
+            "白名单": {"rows": all_a_rows[:10]},
+            "全A": {"rows": all_a_rows},
+            "创新药": {"rows": all_a_rows[20:30]},
+        }
+    }, ensure_ascii=False), encoding="utf-8")
+    top30_codes = load_codes(cfg30)
+    check(len(top30_codes) == 30 and top30_codes[-1] == "600029",
+          "模拟盘订阅完整读取全A Top30，跨组重复代码只保留一次")
+
 
 # ============================================================================
 # I. 成本后净预期门：毛收益不能覆盖 round-trip 成本的票不入池
 # ============================================================================
 def scenario_I():
-    """验证成本后净收益门过滤毛正净负候选。"""
-    print("\n== I. 成本后净预期门（过滤毛正净负候选）==")
+    """验证原始预期覆盖成本+安全边际，校准值不再硬过滤。"""
+    print("\n== I. 原始预期收益门（成本 + 安全边际）==")
     refs = {
-        "000910": RefRow(expected_return=0.0030, calibrated_return=0.00156,
+        "000910": RefRow(expected_return=0.0025, calibrated_return=0.00156,
                           calibrated_net_return=-0.00044, win_rate=0.49),
-        "000911": RefRow(expected_return=0.0050, calibrated_return=0.00578,
-                          calibrated_net_return=0.00377, win_rate=0.52),
+        "000911": RefRow(expected_return=0.0050, calibrated_return=0.00156,
+                          calibrated_net_return=-0.00044, win_rate=0.52),
     }
     snaps = [mk_snap("000910", 10.0), mk_snap("000911", 10.0)]
     rows = RerankScorer(new_cfg(), build_ctx(refs, snaps)).ranked()
-    check([r.code for r in rows] == ["000911"], "仅校准净收益覆盖成本的候选入榜")
-    text = expected_return_text(refs["000910"], 0.0030, 0.002)
+    check([r.code for r in rows] == ["000911"], "原始预期覆盖 0.20% 成本 + 0.10% 安全边际")
+    text = expected_return_text(refs["000910"], 0.0025, 0.002)
     print(f"     展示={text}")
-    check("历史净-0.04%" in text and "毛+0.16%" in text,
-          "展示同时给出扣费净收益与历史毛收益，不再四舍五入成模糊 +0.1%")
+    check("模型净+0.05%" in text and "历史校准+0.16%" in text,
+          "展示同时给出原始模型净收益与历史校准收益")
 
 
 # ============================================================================
@@ -451,11 +477,18 @@ def scenario_K():
 
     refs = {"000930": RefRow(expected_return=0.05, calibrated_net_return=0.01)}
     ctx = build_ctx(refs, [mk_snap("000930", 10.0, vwap=10.0)])
-    buyer = PaperTrader(new_cfg(paper_buy_n=1), ctx, FakeNotifier())
-    buyer.maybe_trade(1450)
-    check(not buyer._state["positions"], "14:50 先完成旧仓到期腿，不提前建立新仓")
-    buyer.maybe_trade(1455)
-    check(len(buyer._state["positions"]) == 1, "14:55 后才按收盘口径建立新仓")
+    before = PaperTrader(new_cfg(paper_buy_n=1), ctx, FakeNotifier())
+    before.maybe_trade(1449)
+    check(not before._state["positions"], "14:49 尚未进入买入窗口")
+    at_start = PaperTrader(new_cfg(paper_buy_n=1), ctx, FakeNotifier())
+    at_start.maybe_trade(1450)
+    check(len(at_start._state["positions"]) == 1, "14:50 先执行卖出腿，再允许按收盘口径建仓")
+    at_end = PaperTrader(new_cfg(paper_buy_n=1), ctx, FakeNotifier())
+    at_end.maybe_trade(1455)
+    check(len(at_end._state["positions"]) == 1, "14:55 仍在买入窗口闭区间内")
+    after = PaperTrader(new_cfg(paper_buy_n=1), ctx, FakeNotifier())
+    after.maybe_trade(1456)
+    check(not after._state["positions"], "14:56 已超过买入窗口，不再建仓")
 
 
 # ============================================================================
@@ -467,7 +500,7 @@ def scenario_L():
     refs = {
         "000940": RefRow(expected_return=0.06, calibrated_net_return=0.01),
         "000941": RefRow(expected_return=0.05, calibrated_net_return=0.01),
-        "000942": RefRow(expected_return=0.04, calibrated_net_return=-0.001),
+        "000942": RefRow(expected_return=0.0025, calibrated_net_return=-0.001),
     }
     snaps = [
         mk_snap("000940", 10.2, vwap=10.0),
@@ -482,8 +515,9 @@ def scenario_L():
           "买入快照记录高于 VWAP 的过滤原因")
     check(by_code["000941"]["entry_decision"] == "bought",
           "买入快照记录最终成交、股数和成本")
-    check(by_code["000942"]["status"] == "excluded_net_return_gate",
-          "买入快照记录模型池前置净收益门槛")
+    check(by_code["000942"]["status"] == "excluded_raw_return_gate" and
+          by_code["000942"]["raw_min_return"] == 0.003,
+          "买入快照记录原始预期成本安全边际门槛")
 
     trade = {
         "action": "sell", "time": "2026-08-04 14:50:00", "code": "000941",
@@ -511,11 +545,11 @@ def scenario_L():
 
 
 # ============================================================================
-# M. V2 赛马对照：动态分配 + 保护止盈 + 买窗到 1457
+# M. V2 赛马对照：动态分配 + 保护止盈 + 统一买窗
 # ============================================================================
 def scenario_M():
-    """验证 V2 端到端：资金利用率提升 / 保护性止盈不误触发 / 买窗到 14:57。"""
-    print("\n== M. V2 赛马（动态分配 + 保护止盈 + 买窗 1457）==")
+    """验证 V2 端到端：资金利用率提升 / 保护性止盈不误触发 / 统一买窗。"""
+    print("\n== M. V2 赛马（动态分配 + 保护止盈 + 买窗 1450-1455）==")
     refs = {
         "000945": RefRow(expected_return=0.05, calibrated_net_return=0.01),
         "000946": RefRow(expected_return=0.04, calibrated_net_return=0.01),
@@ -523,7 +557,7 @@ def scenario_M():
     snaps = [mk_snap("000945", 450.0, vwap=450.0), mk_snap("000946", 10.0, vwap=10.0)]
     trader = V2PaperTrader(
         new_cfg(paper_buy_n=2), build_ctx(refs, snaps), FakeNotifier())
-    trader.maybe_trade(1456)
+    trader.maybe_trade(1455)
     held = [p["code"] for p in trader._state["positions"]]
     print(f"     V2持仓={held}")
     check("000946" in held, "V2 高价股资金不足名额顺延到下一只")
@@ -532,10 +566,11 @@ def scenario_M():
     check(total_shares >= 5500,
           f"V2 动态分配总股数 ≥ 5500（实际 {total_shares}）")
 
-    # 场景 2：V2 买窗收窄配置生效（地板值 1455）
+    # 场景 2：V2 继承四版公共买窗，不再保留独立的 14:57 上限。
     trader2 = V2PaperTrader(
-        new_cfg(paper_buy_n=1, paper_buy_end=1450), build_ctx(refs, snaps), FakeNotifier())
-    check(trader2._buy_end >= 1455, f"V2 buy_end 铁底 1455（got {trader2._buy_end}）")
+        new_cfg(paper_buy_n=1), build_ctx(refs, snaps), FakeNotifier())
+    check(trader2._buy_start == 1450 and trader2._buy_end == 1455,
+          f"V2 继承公共买窗 1450-1455（got {trader2._buy_start}-{trader2._buy_end}）")
 
     # 场景 3：保护性止盈完整校验
     cfg_v2 = new_cfg()
@@ -572,7 +607,7 @@ def scenario_M():
         [mk_snap("000947", 10.0, pre_close=10.0, vwap=10.0,
                  imb=-1.0, spread=0.001)])
     v2_audit = V2PaperTrader(cfg_audit, ctx_audit, FakeNotifier())
-    v2_audit._now_hhmm = 1456
+    v2_audit._now_hhmm = 1455
     v2_audit._run_buys()
     zero_decision = json.loads(v2_audit._decisions_file.read_text().splitlines()[-1])
     check(zero_decision["event_type"] == "paper_buy_decision_v2" and
@@ -656,7 +691,7 @@ def scenario_M():
     trader9._state["positions"] = [{
         "code": "000955", "buy_price": 10.0, "peak": 10.0, "shares": 100,
         "cost_basis": 1001.0, "buy_date": yesterday, "buy_time": "14:56:00"}]
-    trader9.maybe_trade(1456)
+    trader9.maybe_trade(1455)
     new_pos = [p for p in trader9._state["positions"] if p["code"] != "000955"]
     print(f"     上限2已持1只 → 新建{len(new_pos)}只 股数={[p['shares'] for p in new_pos]}")
     check(len(new_pos) == 1 and new_pos[0]["shares"] >= 9000,
@@ -699,7 +734,7 @@ def scenario_N():
     ]
     cfg = new_cfg(paper_buy_n=1)
     trader = V3PaperTrader(cfg, build_ctx(refs, snaps), FakeNotifier())
-    trader.maybe_trade(1456)
+    trader.maybe_trade(1455)
     held = trader._state["positions"]
     check([p["code"] for p in held] == ["000961"],
           "V3 过滤非当日预测并顺延买入下一名")
@@ -852,7 +887,7 @@ def scenario_O():
         mk_snap("000972", 10.0, pre_close=10.0, vwap=10.0, imb=0.2, spread=0.001),
     ])
     trader = V4PaperTrader(cfg, ctx, FakeNotifier(), sector)
-    trader._now_hhmm = 1456
+    trader._now_hhmm = 1455
     trader._run_buys()
     held = [p["code"] for p in trader._state["positions"]]
     check(held == ["000971"], "V4 过滤弱势半导体候选并顺延买入中性银行候选")
@@ -896,6 +931,182 @@ def scenario_O():
           "V4 持仓进入保护性订阅并优先于候选名单")
 
 
+# ============================================================================
+# P. 四版联合生命周期：同场买入、持久化重启、跨日卖出
+# ============================================================================
+def scenario_P():
+    print("\n== P. V1-V4 联合买卖生命周期（隔离账户 + 重启恢复 + 跨日平仓）==")
+    cfg = new_cfg(paper_buy_n=1)
+    root = Path(cfg.ledger_dir)
+    cfg.sector_meta_file = root / "all_a_stock_meta.parquet"
+    pd.DataFrame([{
+        "code": "000980", "a_industry": "股份制银行Ⅲ",
+        "a_industries": "股份制银行Ⅲ、银行Ⅱ、银行",
+    }]).to_parquet(cfg.sector_meta_file, index=False)
+
+    sector = SectorETFContext(cfg)
+    now = time.time()
+    sector.update(Snapshot(code="510300.SH", last=10.0, pre_close=10.0), now=now)
+    sector.update(Snapshot(code="512800.SH", last=10.01, pre_close=10.0), now=now)
+
+    today = _dt.date.today().strftime("%Y-%m-%d")
+    refs = {"000980": RefRow(
+        expected_return=0.05, calibrated_net_return=0.01,
+        atr=0.2, prediction_date=today,
+    )}
+    ctx = build_ctx(refs, [
+        mk_snap("000980", 10.0, pre_close=10.0, vwap=10.0,
+                imb=0.2, spread=0.001),
+    ])
+    notifier = FakeNotifier()
+    traders = {
+        "V1": PaperTrader(cfg, ctx, notifier),
+        "V2": V2PaperTrader(cfg, ctx, notifier),
+        "V3": V3PaperTrader(cfg, ctx, notifier),
+        "V4": V4PaperTrader(cfg, ctx, notifier, sector),
+    }
+    check(all(t._buy_start == 1450 and t._buy_end == 1455
+              for t in traders.values()),
+          "V1-V4 统一使用 14:50-14:55 买入窗口")
+
+    for trader in traders.values():
+        trader.maybe_trade(1455)
+
+    check(all(len(t._state["positions"]) == 1 for t in traders.values()),
+          "V1-V4 在各自买入窗口均成功建立 1 只独立持仓")
+    buy_prices = {version: t._state["positions"][0]["buy_price"]
+                  for version, t in traders.items()}
+    check(buy_prices["V1"] == 10.0 and buy_prices["V2"] == 10.0 and
+          buy_prices["V3"] > 10.0 and buy_prices["V4"] > 10.0,
+          "V1/V2 按 last 买入，V3/V4 按 ask1 买入")
+
+    expected_decisions = {
+        "V1": (1, "paper_buy_decision"),
+        "V2": (2, "paper_buy_decision_v2"),
+        "V3": (3, "paper_buy_decision_v3"),
+        "V4": (4, "paper_buy_decision_v4"),
+    }
+    decision_ok = True
+    for version, trader in traders.items():
+        decision = json.loads(trader._decisions_file.read_text().splitlines()[-1])
+        expected_schema, expected_event = expected_decisions[version]
+        decision_ok = decision_ok and (
+            decision["schema_version"] == expected_schema and
+            decision["event_type"] == expected_event and
+            decision["decision_status"] == "bought" and
+            decision["account_after"]["bought_count"] == 1
+        )
+    check(decision_ok, "四版买入决策分别写入独立 schema、事件类型和成交结果")
+    check(len({str(t._state_file) for t in traders.values()}) == 4 and
+          len({str(t._decisions_file) for t in traders.values()}) == 4 and
+          all(t._state_file.exists() for t in traders.values()),
+          "四版状态与买入审计文件互不串写且均已持久化")
+
+    # 将同一批已落盘持仓推进到历史交易日，再重建对象模拟盘中进程重启。
+    for trader in traders.values():
+        trader._state["positions"][0]["buy_date"] = "2020-01-02"
+        trader._save_state()
+    ctx.update(mk_snap("000980", 9.4, pre_close=10.0, vwap=9.6,
+                       imb=0.2, spread=0.001))
+    restarted = {
+        "V1": PaperTrader(cfg, ctx, notifier),
+        "V2": V2PaperTrader(cfg, ctx, notifier),
+        "V3": V3PaperTrader(cfg, ctx, notifier),
+        "V4": V4PaperTrader(cfg, ctx, notifier, sector),
+    }
+    check(all(len(t._state["positions"]) == 1 for t in restarted.values()),
+          "四版重启后均从各自状态文件恢复原持仓")
+
+    for trader in restarted.values():
+        trader.maybe_trade(1030)
+
+    check(all(not t._state["positions"] for t in restarted.values()),
+          "V1-V4 在 T+1 风险退出时均完成平仓，无持仓卡死")
+    check(all(not json.loads(t._state_file.read_text())["positions"]
+              for t in restarted.values()),
+          "四版卖出后磁盘状态与内存一致，重启不会重复卖出")
+
+    trades = {
+        version: json.loads(trader._trades_file.read_text().splitlines()[-1])
+        for version, trader in restarted.items()
+    }
+    check(trades["V1"]["exit_reason"] == "stop_loss" and
+          trades["V2"]["exit_reason"] == "stop_loss" and
+          trades["V3"]["exit_reason"] == "atr_stop" and
+          trades["V4"]["exit_reason"] == "atr_stop",
+          "V1/V2 触发百分比止损，V3/V4 触发 ATR 止损")
+    check("sell_fill_source" not in trades["V1"] and
+          "sell_fill_source" not in trades["V2"] and
+          trades["V3"].get("sell_fill_source") == "bid1" and
+          trades["V4"].get("sell_fill_source") == "bid1",
+          "V1/V2 按 last 卖出，V3/V4 按 bid1 卖出")
+    v4_sector = trades["V4"].get("sector_etf_at_entry") or {}
+    check(v4_sector.get("etf_code") == "512800.SH" and
+          v4_sector.get("mapping_source") == "exact_primary",
+          "V4 平仓流水保留入场行业 ETF 与精确映射归因")
+    check(len({trades[v]["trade_id"] for v in trades}) == 4,
+          "四版 position/trade ID 独立，卖出流水不会互相覆盖")
+
+
+# ============================================================================
+# Q. 双融合实时主序：三模型收益门 + 融合 pred 百分位排序
+# ============================================================================
+def scenario_Q():
+    print("\n== Q. 双融合实时主序（三模型收益门 + pred 百分位排序）==")
+    cfg = new_cfg()
+    cfg.predictions_file = Path(cfg.ledger_dir) / "predictions.parquet"
+    pd.DataFrame([
+        {"code": "000981", "date": "2026-08-04", "ridge_pred": 0.02,
+         "elastic_pred": None, "extra_trees_pred": None, "pred": 99.0},
+        {"code": "000981", "date": "2026-08-05", "ridge_pred": 0.004,
+         "elastic_pred": 0.005, "extra_trees_pred": 0.006, "pred": 2.1},
+        {"code": "000982", "date": "2026-08-05", "ridge_pred": 0.009,
+         "elastic_pred": 0.008, "extra_trees_pred": 0.007, "pred": 1.3},
+        {"code": "000983", "date": "2026-08-05", "ridge_pred": 0.0029,
+         "elastic_pred": 0.0029, "extra_trees_pred": 0.0029, "pred": 2.5},
+        {"code": "000984", "date": "2026-08-05", "ridge_pred": 0.004,
+         "elastic_pred": None, "extra_trees_pred": None, "pred": 0.5},
+    ]).to_parquet(cfg.predictions_file, index=False)
+    returns, date, components, scores, percentiles = _load_expected_return(cfg)
+    check(date == "2026-08-05" and abs(returns["000982"] - 0.0078) < 1e-12,
+          "参考层按 30% Ridge + 20% ElasticNet + 50% ExtraTrees 融合收益")
+    check(returns["000984"] == 0.004 and
+          components["000984"]["source"] == "single_model_fallback" and
+          components["000984"]["weights"] == {"ridge_pred": 1.0},
+          "收益模型缺值时按可用权重归一化并安全退回 Ridge")
+    check(scores["000983"] == 2.5 and percentiles["000983"] == 1.0 and
+          percentiles["000981"] == 0.75,
+          "参考层把无量纲 pred 转为当日全A百分位，不冒充收益率")
+
+    refs = {
+        "000981": RefRow(expected_return=0.0053,
+                         return_components=components["000981"],
+                         model_score=2.1, model_rank_pct=0.99),
+        "000982": RefRow(expected_return=0.0078,
+                         return_components=components["000982"],
+                         model_score=1.3, model_rank_pct=0.95),
+        "000983": RefRow(expected_return=0.0029,
+                         return_components=components["000983"],
+                         model_score=2.5, model_rank_pct=1.00),
+    }
+    snaps = [
+        mk_snap("000981", 10.0, imb=0.0, spread=0.005),
+        mk_snap("000982", 10.0, imb=0.0, spread=0.005),
+        mk_snap("000983", 10.0, imb=0.0, spread=0.005),
+    ]
+    trace: list[dict] = []
+    rows = RerankScorer(new_cfg(), build_ctx(refs, snaps)).ranked(trace=trace)
+    check([row.code for row in rows] == ["000981", "000982"],
+          "无量纲融合 pred 百分位主序优先于融合收益率高低")
+    by_code = {item["code"]: item for item in trace}
+    check(by_code["000983"]["status"] == "excluded_raw_return_gate",
+          "排序融合分最高但融合收益不足 0.30% 的候选仍被阻断")
+    check(by_code["000981"]["model_score"] == 2.1 and
+          by_code["000981"]["model_rank_pct"] == 0.99 and
+          by_code["000981"]["return_components"] == components["000981"],
+          "买入审计同时保留收益融合各腿和无量纲融合排序字段")
+
+
 def main() -> int:
     print("=" * 68)
     print(" 虚拟数据流验证：实时层重排/模拟盘/出场逻辑")
@@ -903,7 +1114,7 @@ def main() -> int:
     for fn in (scenario_A, scenario_B, scenario_C, scenario_D,
                scenario_E, scenario_F, scenario_G, scenario_H,
                scenario_I, scenario_J, scenario_K, scenario_L,
-               scenario_M, scenario_N, scenario_O):
+               scenario_M, scenario_N, scenario_O, scenario_P, scenario_Q):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

@@ -294,7 +294,8 @@ class Engine:
         if self._cfg.paper_trade_enabled:
             self._paper = PaperTrader(self._cfg, self._ctx, self._notifier, name_map)
             print(f"[engine] 模拟盘就绪：{self._paper.summary()}，"
-                  f"{self._cfg.paper_time_cap_start} 后到期卖、{self._cfg.paper_buy_start} 后买 "
+                  f"{self._cfg.paper_time_cap_start} 后到期卖、买窗"
+                  f"{self._paper._buy_start}-{self._paper._buy_end} "
                   f"Top{self._cfg.paper_buy_n}（T+{self._cfg.sell_horizon}）", flush=True)
         if getattr(self._cfg, "paper_v2_enabled", True):
             # V2 是赛马对照账户，其初始化异常绝不能拖垮已装配好的 V1 现役策略。

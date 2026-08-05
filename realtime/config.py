@@ -102,14 +102,14 @@ class RealtimeConfig:
     """一份实时层运行配置。字段全部可被环境变量覆盖。"""
 
     # ---- 订阅清单来源 --------------------------------------------------------
-    # 主路径：手机 UI 的 3 个 Top10 名单（白名单/全A/创新药），即 top10_eval 落盘的
+    # 主路径：手机 UI 的 3 个固定名单（白名单 Top10/全A Top30/创新药 Top10），即 top10_eval 落盘的
     # mobile_snapshot.json。每次 top10-eval 跑完重写；引擎盘中检测其变化即自动重载订阅。
     # 默认取 SNAPSHOT_DIR（容器 /app/snapshots 已挂载持久），可用 REALTIME_MOBILE_SNAPSHOT 覆盖。
     mobile_snapshot_file: Path = field(
         default_factory=lambda: Path(
             os.environ.get("REALTIME_MOBILE_SNAPSHOT", "")
             or (Path(os.environ.get("SNAPSHOT_DIR", "snapshots")) / "mobile_snapshot.json")))
-    # 兜底：最新一期短线预测（Top10 快照缺失时退回按模型分取 top，保旧行为不空订阅）。
+    # 兜底：最新一期短线预测（固定候选快照缺失时退回按模型分取 top，保旧行为不空订阅）。
     predictions_file: Path = field(
         default_factory=lambda: Path(_qconfig.QUANT_DIR)
         / "active_quant_short_predictions.parquet")
@@ -130,15 +130,15 @@ class RealtimeConfig:
     watchlist_reload: bool = field(default_factory=lambda: _env_bool("REALTIME_WATCHLIST_RELOAD", True))
 
     # ---- 实时买入候选榜（RankBoard）----------------------------------------
-    # 跨票聚合器：模型看多且校准净收益覆盖成本后取 Top-N，配盘中量拼 digest 推送。
-    # 排序仍由模型 alpha 决定，盘中信号只做有界纠偏；仅榜单指纹变化才推。
+    # 跨票聚合器：同量纲融合收益门后按融合 pred 百分位取 Top-N，配盘中量拼 digest 推送。
+    # 排序仍由批准的融合 alpha 决定，盘中信号只做有界纠偏；仅榜单指纹变化才推。
     rank_board_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_RANK_BOARD", True))
     rank_interval_sec: int = field(default_factory=lambda: _env_int("REALTIME_RANK_INTERVAL", 300))
     rank_top_n: int = field(default_factory=lambda: _env_int("REALTIME_RANK_TOP_N", 5))
 
     # ---- 盘中动态重排（RerankScorer，RankBoard + PaperTrader 共用）----------
-    # 候选池 = 模型看多且校准净收益达标的 Top-rank_pool_n；绝不拉池外票。
-    # score = exp*(1+clamp(adj,±rerank_cap))：模型分为主序，盘中信号只在 ±cap 内微调名次。
+    # 候选池先过三模型融合收益门，再按现役融合 pred 的全A日内百分位取 Top-rank_pool_n。
+    # 盘中 adj 只在融合主序上做有限位移；缺 pred 的旧产物退回 Ridge 主序。
     # VWAP位置/买卖失衡/盘口价差全 env 可调；旧高开惩罚保留开关但默认关闭。
     rerank_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_RERANK", True))
     rank_pool_n: int = field(default_factory=lambda: _env_int("REALTIME_RANK_POOL_N", 30))
@@ -148,16 +148,27 @@ class RealtimeConfig:
     # 离线 IC 已确认高开是正向隔夜动量，旧的“高开吃预期”惩罚方向错误，默认关闭。
     rerank_w_gap: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_W_GAP", 0.0))
     rerank_w_spread: float = field(default_factory=lambda: _env_float("REALTIME_RERANK_W_SPREAD", 0.15))
-    # 历史分档校准后扣 round-trip 成本的最低净收益；默认至少覆盖交易成本。
+    # 融合 pred 主序使用当日全A百分位；盘中 adj 最多移动约 cap*scale 个百分点。
+    rerank_intraday_rank_scale: float = field(
+        default_factory=lambda: max(
+            0.0, _env_float("REALTIME_RERANK_INTRADAY_RANK_SCALE", 0.10)))
+    # 买入候选门：使用原始模型预期收益覆盖往返成本，并保留安全边际。
+    # 历史校准值只用于展示/审计，不再作为硬过滤，避免分桶平台效应压平原始预测。
+    rank_raw_safety_margin: float = field(
+        default_factory=lambda: max(0.0, _env_float("REALTIME_RANK_RAW_SAFETY_MARGIN", 0.001)))
+    rank_min_raw_return: float = field(
+        default_factory=lambda: max(0.0, _env_float("REALTIME_RANK_MIN_RAW_RETURN", 0.0)))
+    # 兼容旧配置字段；不再参与候选硬门。
     rank_min_net_return: float = field(
         default_factory=lambda: _env_float("REALTIME_RANK_MIN_NET_RETURN", 0.0))
 
     # ---- 实时模拟盘（PaperTrader）------------------------------------------
-    # T+N 到期腿在收盘前执行，随后从净收益达标候选中按模型分买 Top-N，保持 close→close 口径。
+    # T+N 到期腿在收盘前执行，随后从三模型融合收益门后的候选中买 Top-N，保持 close→close 口径。
     # 风险退出（止损/止盈/移动止盈/VWAP破位）不受 time_cap_start 限制，T+1 全天有效。
     paper_trade_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_TRADE", True))
     paper_buy_n: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_N", 2))
-    paper_buy_start: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_START", 1455))
+    paper_buy_start: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_START", 1450))
+    paper_buy_end: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_END", 1455))
     paper_time_cap_start: int = field(
         default_factory=lambda: _env_int("REALTIME_PAPER_TIME_CAP_START", 1450))
     paper_start_equity: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_START_EQUITY", 100000.0))
@@ -184,10 +195,9 @@ class RealtimeConfig:
     paper_entry_spread: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_ENTRY_SPREAD", 0.006))
 
     # ---- V2 模拟盘（赛马对照）------------------------------------------------
-    # V2 与 V1 在同一引擎内并行，读取独立状态文件（_v2 后缀），共享 ctx 与 notifier。
-    # V1 现役策略完全不动；V2 在这里增加保护性止盈、动态分配、持仓上限、买窗收窄和跌停阻塞。
+    # V2 与 V1 在同一引擎内并行，读取独立状态文件（_v2 后缀），共享 ctx、notifier
+    # 和公共买入窗口；V2 额外增加保护性止盈、动态分配、持仓上限和跌停阻塞。
     paper_v2_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_V2", True))
-    paper_buy_end: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_BUY_END", 1457))
     paper_max_positions: int = field(default_factory=lambda: _env_int("REALTIME_PAPER_MAX_POSITIONS", 4))
     paper_breakeven_arm: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_BREAKEVEN_ARM", 0.03))
     paper_breakeven_margin: float = field(default_factory=lambda: _env_float("REALTIME_PAPER_BREAKEVEN_MARGIN", 0.005))
@@ -228,9 +238,21 @@ class RealtimeConfig:
             "REALTIME_SECTOR_META_FILE", "") or
             (Path(os.environ.get("SNAPSHOT_DIR", "snapshots")) / "all_a_stock_meta.parquet")))
 
-    # ---- 预期收益历史校准（Top-N 展示重标定）------------------------------
-    # ridge_pred 强正则收缩偏保守，按历史同档实际兑现(target_ret_{h}d)重标定展示值 + 胜率。
-    # 只改展示、不改排序主序（排序仍按原始 ridge_pred）。样本不足/无 target 列则降级回退原始值。
+    # ---- 同量纲预期收益融合 + 历史校准 -------------------------------------
+    # Ridge / ElasticNet / ExtraTrees 都直接回归 target_ret_{h}d，可融合为收益率；
+    # LightGBM、IC 和 pred 是无量纲排序分，绝不进入收益融合。
+    ensemble_return_enabled: bool = field(
+        default_factory=lambda: _env_bool("REALTIME_ENSEMBLE_RETURN", True))
+    ensemble_ridge_weight: float = field(
+        default_factory=lambda: max(
+            0.0, _env_float("REALTIME_ENSEMBLE_RIDGE_WEIGHT", 0.30)))
+    ensemble_elastic_weight: float = field(
+        default_factory=lambda: max(
+            0.0, _env_float("REALTIME_ENSEMBLE_ELASTIC_WEIGHT", 0.20)))
+    ensemble_extra_trees_weight: float = field(
+        default_factory=lambda: max(
+            0.0, _env_float("REALTIME_ENSEMBLE_EXTRA_TREES_WEIGHT", 0.50)))
+    # 对融合收益按历史同档实际兑现重标定展示值 + 胜率；不改变 pred 百分位排序主序。
     calib_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_CALIB", True))
     calib_bins: int = field(default_factory=lambda: _env_int("REALTIME_CALIB_BINS", 20))
 
@@ -247,6 +269,9 @@ class RealtimeConfig:
     pushdeer_key: str = field(default_factory=lambda: os.environ.get("PUSHDEER_KEY", "").strip())
     pushdeer_endpoint: str = field(
         default_factory=lambda: os.environ.get("PUSHDEER_ENDPOINT", "https://api2.pushdeer.com").strip())
+    # 默认只保留 RankBoard 和 V1-V4 模拟盘的低层 push；逐票/ETF Signal 继续记账但不推送。
+    signal_push_enabled: bool = field(
+        default_factory=lambda: _env_bool("REALTIME_SIGNAL_PUSH", False))
     notify_cooldown_sec: int = field(default_factory=lambda: _env_int("REALTIME_NOTIFY_COOLDOWN", 300))
     notify_kinds: frozenset = field(default_factory=_parse_notify_kinds)
 

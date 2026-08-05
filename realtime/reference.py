@@ -2,8 +2,8 @@
 
 盘中策略需要两类"昨天就能算好"的基准，用来校准模型给的静态价位：
 - ATR(14)：日线真实波幅均值，供 ATR 吊灯止损计算跟踪止损线。
-- expected_return：模型对该票的预期收益（ridge_pred），供开盘跳空校准判断
-  "高开是否已吃掉预期空间"。
+- expected_return：Ridge/ElasticNet/ExtraTrees 同量纲融合收益率，供成本门和收益展示。
+- model_rank_pct：现役融合 pred 的当日全A百分位，供实时候选主序。
 
 只在引擎启动时读一次 price 仓库 + 预测文件，构建 {code: RefRow} 字典；
 盘中完全不再碰 quant_data，避免与业务数据链路抢 IO。
@@ -22,7 +22,10 @@ from .config import RealtimeConfig
 class RefRow:
     atr: Optional[float] = None          # ATR(14) 绝对值（元）
     atr_pct: Optional[float] = None      # ATR / 昨收，便于缺 ATR 时按比例兜底
-    expected_return: Optional[float] = None  # 模型预期收益（ridge_pred 原始小数，供排序）
+    expected_return: Optional[float] = None  # 三模型融合收益率（成本门/收益展示）
+    return_components: Optional[dict] = None  # Ridge/Elastic/ExtraTrees 各腿及归一化权重
+    model_score: Optional[float] = None       # 现役融合 pred 原始分（无量纲，仅审计）
+    model_rank_pct: Optional[float] = None    # 融合 pred 当日全A百分位（实时排序主序）
     calibrated_return: Optional[float] = None  # ridge_pred 历史分档的实际毛收益均值
     calibrated_net_return: Optional[float] = None  # 按模拟盘成交成本扣费后的历史净收益
     win_rate: Optional[float] = None     # 该分档历史 (target>0) 胜率（仅展示用）
@@ -38,14 +41,17 @@ def net_return_after_cost(gross_return: float, roundtrip_cost: float) -> float:
 
 def expected_return_text(ref: Optional[RefRow], raw_return: float,
                          roundtrip_cost: float) -> str:
-    """展示清晰的净收益、毛收益和历史胜率，避免把毛收益误称为可得预期。"""
+    """同时展示原始模型净收益和历史校准收益，避免两种口径混成一个数。"""
     calibrated = getattr(ref, "calibrated_return", None) if ref is not None else None
     win_rate = getattr(ref, "win_rate", None) if ref is not None else None
-    gross = float(calibrated) if calibrated is not None else float(raw_return)
-    net = net_return_after_cost(gross, roundtrip_cost)
-    source = "历史净" if calibrated is not None else "模型净"
+    raw = float(raw_return)
+    raw_net = net_return_after_cost(raw, roundtrip_cost)
+    if calibrated is None:
+        return f"模型净{raw_net:+.2%}(原始毛{raw:+.2%})"
+    calibrated_gross = float(calibrated)
     win_text = f" 胜率{win_rate:.0%}" if win_rate is not None else ""
-    return f"{source}{net:+.2%}(毛{gross:+.2%}{win_text})"
+    return (f"模型净{raw_net:+.2%}(原始毛{raw:+.2%};"
+            f"历史校准{calibrated_gross:+.2%}{win_text})")
 
 
 def _atr14(px, n: int = 14) -> tuple[Optional[float], Optional[float]]:
@@ -103,47 +109,109 @@ def _load_atr_map(cfg: RealtimeConfig, codes: list[str]) -> dict[str, tuple]:
     return out
 
 
-def _load_expected_return(cfg: RealtimeConfig) -> tuple[dict[str, float], Optional[str]]:
-    """从最新一期预测取每票预期收益和预测日期，只认 ridge_pred。
+_RETURN_MODEL_COLUMNS = ("ridge_pred", "elastic_pred", "extra_trees_pred")
 
-    注意：绝不退回融合分 `pred`。`pred` 是各腿 z-score 的加权排序分（无量纲），
-    与「预期收益率」量纲不同；GapCalibrate 用 expected_return 算 gap/exp 与判 exp<=0，
-    若拿排序分冒充收益率会产生错误的跳空纠偏告警。缺 ridge_pred 时返回空 map
-    → expected_return=None → 相关策略自动降级不触发。
+
+def _return_model_weights(cfg: RealtimeConfig) -> dict[str, float]:
+    """返回同量纲收益模型权重；关闭融合时只使用 Ridge。"""
+    if not getattr(cfg, "ensemble_return_enabled", True):
+        return {"ridge_pred": 1.0}
+    weights = {
+        "ridge_pred": float(getattr(cfg, "ensemble_ridge_weight", 0.30)),
+        "elastic_pred": float(getattr(cfg, "ensemble_elastic_weight", 0.20)),
+        "extra_trees_pred": float(getattr(cfg, "ensemble_extra_trees_weight", 0.50)),
+    }
+    positive = {key: max(0.0, value) for key, value in weights.items() if value > 0}
+    return positive or {"ridge_pred": 1.0}
+
+
+def _ensemble_return_series(df, cfg: RealtimeConfig):
+    """逐行融合同一收益标签的模型；缺值时按该行可用权重重新归一化。"""
+    import pandas as pd
+
+    numerator = pd.Series(0.0, index=df.index)
+    denominator = pd.Series(0.0, index=df.index)
+    for column, weight in _return_model_weights(cfg).items():
+        if column not in df.columns:
+            continue
+        values = pd.to_numeric(df[column], errors="coerce")
+        available = values.notna()
+        numerator = numerator.add(values.fillna(0.0) * weight, fill_value=0.0)
+        denominator = denominator.add(available.astype(float) * weight, fill_value=0.0)
+    return numerator.div(denominator.where(denominator > 0))
+
+
+def _load_expected_return(
+        cfg: RealtimeConfig,
+) -> tuple[dict[str, float], Optional[str], dict[str, dict],
+           dict[str, float], dict[str, float]]:
+    """读取同量纲融合收益和现役融合 pred 的当日全A百分位。
+
+    `expected_return` 只融合 Ridge/ElasticNet/ExtraTrees 三条 target_ret 回归腿；`pred` 包含
+    LightGBM/IC 等无量纲信号，只转换成 [0,1] 百分位用于排序主序。
     """
     path = cfg.predictions_file
     if not path.exists():
-        return {}, None
+        return {}, None, {}, {}, {}
     try:
         import pandas as pd
     except Exception:  # noqa: BLE001
-        return {}, None
+        return {}, None, {}, {}, {}
+    requested = ["code", "date", "pred", *_RETURN_MODEL_COLUMNS]
     try:
-        df = pd.read_parquet(path, columns=["code", "date", "ridge_pred"])
+        df = pd.read_parquet(path, columns=requested)
     except Exception:  # noqa: BLE001
-        # 列裁剪失败（老/变体文件无 ridge_pred/date 列）→ 退回读全表，仍只认 ridge_pred。
         try:
             df = pd.read_parquet(path)
         except Exception:  # noqa: BLE001
-            return {}, None
-    if "code" not in df.columns or "ridge_pred" not in df.columns:
-        return {}, None
+            return {}, None, {}, {}, {}
+    if "code" not in df.columns or not any(
+            column in df.columns for column in _RETURN_MODEL_COLUMNS):
+        return {}, None, {}, {}, {}
     prediction_date = None
     if "date" in df.columns:
         d = pd.to_datetime(df["date"], errors="coerce")
         latest = d.max()
         if latest == latest:
             prediction_date = latest.strftime("%Y-%m-%d")
-            df = df[d == latest]
-    out: dict[str, float] = {}
-    for code, val in zip(df["code"].astype(str).str.zfill(6), df["ridge_pred"]):
-        try:
-            f = float(val)
-        except (TypeError, ValueError):
+            df = df[d == latest].copy()
+    expected_returns = _ensemble_return_series(df, cfg)
+    raw_scores = (pd.to_numeric(df["pred"], errors="coerce")
+                  if "pred" in df.columns else pd.Series(float("nan"), index=df.index))
+    rank_pct = raw_scores.rank(method="average", pct=True)
+    configured_weights = _return_model_weights(cfg)
+    returns: dict[str, float] = {}
+    components: dict[str, dict] = {}
+    model_scores: dict[str, float] = {}
+    model_rank_pct: dict[str, float] = {}
+    codes = df["code"].astype(str).str.zfill(6)
+    for index, (code, expected, model_score, percentile) in enumerate(zip(
+            codes, expected_returns, raw_scores, rank_pct)):
+        if expected != expected:
             continue
-        if f == f:  # not NaN
-            out[code] = f
-    return out, prediction_date
+        row = df.iloc[index]
+        model_returns = {}
+        available_weights = {}
+        for column, weight in configured_weights.items():
+            raw = row.get(column)
+            if raw is not None and raw == raw:
+                model_returns[column] = float(raw)
+                available_weights[column] = float(weight)
+        total = sum(available_weights.values())
+        normalized_weights = ({key: value / total
+                               for key, value in available_weights.items()}
+                              if total > 0 else {})
+        returns[code] = float(expected)
+        components[code] = {
+            "source": ("same_target_weighted" if len(model_returns) > 1
+                       else "single_model_fallback"),
+            "returns": model_returns,
+            "weights": normalized_weights,
+        }
+        if model_score == model_score and percentile == percentile:
+            model_scores[code] = float(model_score)
+            model_rank_pct[code] = float(percentile)
+    return returns, prediction_date, components, model_scores, model_rank_pct
 
 
 def _load_hold_days(cfg: RealtimeConfig) -> dict[str, int]:
@@ -228,16 +296,11 @@ def _trading_days_between(start, end) -> int:
 
 
 def _build_calibration(cfg: RealtimeConfig):
-    """从历史预测表建 ridge_pred → 实际兑现（均值/胜率）的分档查找函数。
+    """从历史预测表建融合收益 → 实际兑现（均值/胜率）的分档查找函数。
 
-    背景：ridge_pred 是 Ridge 对 T+N 收益率小数的回归拟合，强正则收缩 + 短线实现分布
-    右偏厚尾 → 点估计系统性偏保守（展示「预期+1%」的票日内常涨更多）。这里用同一份
-    预测文件的历史行（含已实现 target_ret_{h}d）按 ridge_pred 等频分档，求每档实际
-    兑现的平均收益与胜率，把裸 ridge_pred 重标定成「该档历史真实兑现」用于展示。
-
-    数据源 = cfg.predictions_file（即 _load_expected_return 读的同一份，零新增依赖）。
-    只读两列，丢最新未实现日（target NaN）。样本不足/无 target 列 → 返回 None（优雅降级，
-    展示回退原始 ridge_pred）。返回 lookup(ridge)->(cal_return, win_rate)。
+    使用与实时收益门完全相同的 Ridge/ElasticNet/ExtraTrees 权重逐行融合，再按融合收益
+    等频分档，统计 target_ret_{h}d 的实际均值和胜率。模型列缺失时与实时加载一致，按
+    该行可用权重归一化；样本不足时返回 None，展示直接回退融合原始收益。
     """
     if not getattr(cfg, "calib_enabled", True):
         return None
@@ -257,22 +320,24 @@ def _build_calibration(cfg: RealtimeConfig):
         cols = set(head.columns)
     except Exception:  # noqa: BLE001
         return None
-    if "ridge_pred" not in cols:
+    return_columns = [column for column in _RETURN_MODEL_COLUMNS if column in cols]
+    if not return_columns:
         return None
     target_col = next((c for c in candidates if c in cols), None)
     if target_col is None:
         return None
     try:
-        df = pd.read_parquet(path, columns=["ridge_pred", target_col])
+        df = pd.read_parquet(path, columns=[*return_columns, target_col])
     except Exception:  # noqa: BLE001
         return None
-    df = df.dropna(subset=["ridge_pred", target_col])
+    df["_expected_return"] = _ensemble_return_series(df, cfg)
+    df = df.dropna(subset=["_expected_return", target_col])
     if len(df) < 500:  # 样本太少，校准不稳，降级
         return None
     bins = max(4, int(getattr(cfg, "calib_bins", 20)))
     try:
-        # 等频分位分档；重复边界（ridge_pred 大量并列）时 duplicates="drop" 自动减档。
-        codes, edges = pd.qcut(df["ridge_pred"], q=bins, labels=False,
+        # 等频分位分档；重复边界较多时 duplicates="drop" 自动减档。
+        codes, edges = pd.qcut(df["_expected_return"], q=bins, labels=False,
                                retbins=True, duplicates="drop")
     except Exception:  # noqa: BLE001
         return None
@@ -280,7 +345,7 @@ def _build_calibration(cfg: RealtimeConfig):
     grp = df.groupby("_bin")[target_col]
     means = grp.mean()
     wins = df.assign(_w=(df[target_col] > 0)).groupby("_bin")["_w"].mean()
-    # 按分档序号排序后对均值做累积最大值 → 保证「ridge 越高，校准收益不降」的单调性
+    # 按分档序号排序后对均值做累积最大值 → 保证「融合收益越高，校准收益不降」的单调性
     # （零依赖替代保序回归；短线个别档因样本噪声反转时抹平）。
     idx = sorted(means.index)
     mono = np.maximum.accumulate([float(means[i]) for i in idx])
@@ -288,10 +353,10 @@ def _build_calibration(cfg: RealtimeConfig):
     wr_by_bin = {b: float(wins[b]) for b in idx}
     inner_edges = list(edges[1:-1])  # 用于 np.searchsorted 定位分档
 
-    def lookup(ridge):
-        if ridge is None or ridge != ridge:  # None/NaN
+    def lookup(expected_return):
+        if expected_return is None or expected_return != expected_return:  # None/NaN
             return None, None
-        b = int(np.searchsorted(inner_edges, float(ridge), side="right"))
+        b = int(np.searchsorted(inner_edges, float(expected_return), side="right"))
         b = min(b, idx[-1])  # 落在最右开区间外时归入最高档
         return cal_by_bin.get(b), wr_by_bin.get(b)
 
@@ -304,13 +369,14 @@ def _build_calibration(cfg: RealtimeConfig):
 def build(cfg: RealtimeConfig, codes: list[str]) -> dict[str, RefRow]:
     """构建 {code: RefRow}。任何来源缺失都优雅返回可用子集，不抛异常。"""
     atr_map = _load_atr_map(cfg, codes)
-    ret_map, prediction_date = _load_expected_return(cfg)
+    ret_map, prediction_date, return_components, model_scores, model_rank_pct = (
+        _load_expected_return(cfg))
     hold_map = _load_hold_days(cfg)
     calib = None
     try:
         calib = _build_calibration(cfg)
     except Exception as e:  # noqa: BLE001 - 校准失败只降级展示，不拦启动
-        print(f"[reference] 校准表构建失败(展示回退原始 ridge_pred)：{type(e).__name__}", flush=True)
+        print(f"[reference] 校准表构建失败(展示回退融合原始收益)：{type(e).__name__}", flush=True)
     if calib is not None:
         print(f"[reference] 预期收益校准就绪：{calib.n_bins} 档 / {calib.n_rows} 行历史 "
               f"（口径 {calib.target_col}）", flush=True)
@@ -322,6 +388,9 @@ def build(cfg: RealtimeConfig, codes: list[str]) -> dict[str, RefRow]:
         net = (net_return_after_cost(cal, cfg.paper_cost) if cal is not None else None)
         ref[code] = RefRow(atr=atr, atr_pct=atr_pct,
                            expected_return=exp,
+                           return_components=return_components.get(code),
+                           model_score=model_scores.get(code),
+                           model_rank_pct=model_rank_pct.get(code),
                            calibrated_return=cal, calibrated_net_return=net,
                            win_rate=wr, hold_days=hold_map.get(code),
                            prediction_date=prediction_date)

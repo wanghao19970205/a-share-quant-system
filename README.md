@@ -21,7 +21,7 @@
 | 📥 **数据采集** | A 股日线 / 估值 / 财务 / 资金流 / 事件 / 新闻；AmazingData 券商源优先，AKShare 兜底 |
 | 🧠 **模型训练** | 主板活跃池 walk-forward 滚动训练；Ridge + LightGBM Ranker + ElasticNet + ExtraTrees 融合 |
 | 🔬 **晋级评估** | CatBoost 等候选模型先跑影子实验（RankIC / 相关性 / 留出期收益 / 稳定性），过门槛才升级 |
-| 📊 **回测发布** | 短线 / 波段预测发布、Top10 跟踪评估、成本口径回测 |
+| 📊 **回测发布** | 短线 / 波段预测发布、固定候选组跟踪评估、成本口径回测 |
 | ⚡ **盘中实时层** | 单会话订阅个股与行业 ETF Level-1 快照；V1/V2/V3/V4 独立账户并行赛马、动态重排与异动推送 |
 | 📰 **新闻情绪** | Qwen 结构化标注（无 Key 时降级本地规则）；舆情因子经 ablation 评估决定是否入模 |
 | 🖥️ **可视化** | Streamlit 桌面端（8501）+ 移动端（8502）双界面 |
@@ -96,7 +96,7 @@
 ├── stock_analyzer/            # 📊 行情/指标/新闻/快照/预测展示层
 │   ├── amazingdata_source.py  #   券商数据源（批量拉行情+复权因子）
 │   ├── news_*.py              #   新闻采集/入库/标注/情绪
-│   ├── top10_eval.py          #   Top10 候选跟踪评估
+│   ├── top10_eval.py          #   固定候选组评估（白10/全A30/创新药10）
 │   └── sectors.py all_a_meta.py  #  行业/概念板块映射
 │
 ├── quant/                     # 🧠 因子/训练/回测/融合/晋级评估
@@ -122,7 +122,7 @@
 │   ├── strategy.py            #   信号策略骨架
 │   ├── snapshot.py            #   Snapshot 数据模型+盘口微结构派生量
 │   ├── reference.py           #   启动期静态基准（校准用）
-│   ├── watchlist.py           #   订阅清单（Top10 ∪ 持仓）
+│   ├── watchlist.py           #   订阅清单（固定候选组 ∪ 持仓）
 │   ├── notifier.py            #   推送通道（Bark/Server酱/PushDeer）
 │   └── ledger.py              #   独立账本（JSONL，与业务数据隔离）
 │
@@ -296,7 +296,7 @@ docker exec -d a-scheduler-1 /app/docker/scheduler_jobs.sh daily-light
 | 时间 | 任务 | 说明 |
 |---|---|---|
 | 交易日 09:20 | `realtime` | 拉起盘中实时层引擎（常驻至收盘自动退出） |
-| 交易日 09-14 每 10min | `realtime` | 🐕 **watchdog 自愈**：引擎被重训 OOM 挤死则自动重拉，保障 14:50 到期卖出与 14:55 买入 |
+| 交易日 09-14 每 10min | `realtime` | 🐕 **watchdog 自愈**：引擎被重训 OOM 挤死则自动重拉，保障 14:50 到期卖出与 14:50-14:55 买入 |
 | 交易日 10:30 / 13:30 | `intraday-light` | 盘中轻量刷新（训练最近 6 窗） |
 | 交易日 11:40 | `daily-light` | 盘中快速日更 + 短线/波段训练 + 发布 |
 | 周一~周四 15:05 | `daily-light` | 收盘后快速日更 |
@@ -359,7 +359,7 @@ docker exec -it a-scheduler-1 sh -lc 'cd /app && python -m py_compile \
 <details>
 <summary><b>实时层引擎被重训 OOM 连坐（watchdog 自愈）</b></summary>
 
-- **现象**：引擎（内存很轻）被 10:30/13:30 盘中重训（峰值 ~9.5GB 撞 16GB 物理墙）连坐 OOM kill，导致当日 14:50 到期卖出与 14:55 买入腿缺失。
+- **现象**：引擎（内存很轻）被 10:30/13:30 盘中重训（峰值 ~9.5GB 撞 16GB 物理墙）连坐 OOM kill，导致当日 14:50 到期卖出与 14:50-14:55 买入腿缺失。
 - **修复**：cron 交易时段每 10 分钟扫 `/proc`——引擎活着零副作用 SKIP，死了 10 分钟内自动重拉。分钟错开 :20 避免与 09:20 首拉起双引擎。
 </details>
 

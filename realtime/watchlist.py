@@ -1,4 +1,4 @@
-"""订阅清单加载：保护模拟盘/人工持仓，再合并 Top10 候选并按上限夹紧。"""
+"""订阅清单加载：保护模拟盘/人工持仓，再合并固定候选组并按上限夹紧。"""
 from __future__ import annotations
 
 import json
@@ -7,8 +7,8 @@ from typing import Iterable
 
 from .config import RealtimeConfig
 
-# mobile_snapshot.json 里的三个固定分组（与 stock_analyzer.top10_eval._GROUPS 一致）。
-_TOP10_GROUPS = ("白名单", "全A", "创新药")
+# mobile_snapshot.json 里的三个固定分组（白名单 Top10/全A Top30/创新药 Top10）。
+_CANDIDATE_GROUPS = ("白名单", "全A", "创新药")
 
 
 def _norm(code: str) -> str:
@@ -60,8 +60,8 @@ def _read_lines(path: Path) -> list[str]:
     return out
 
 
-def _read_top10_groups(path: Path) -> list[str]:
-    """读手机 UI 快照 mobile_snapshot.json，取三名单(白名单/全A/创新药)的股票代码。
+def _read_candidate_groups(path: Path) -> list[str]:
+    """读手机 UI 快照 mobile_snapshot.json，取三组固定候选的股票代码。
 
     结构：{"groups": {"<组名>": {"rows": [{"code": "600519", ...}, ...]}}}。
     按组序、组内 rows 序去重收集代码。文件缺失/损坏/结构异常都返回 []（交给上层兜底）。
@@ -76,7 +76,7 @@ def _read_top10_groups(path: Path) -> list[str]:
     if not isinstance(groups, dict):
         return []
     out: list[str] = []
-    for name in _TOP10_GROUPS:
+    for name in _CANDIDATE_GROUPS:
         entry = groups.get(name) or {}
         rows = entry.get("rows") if isinstance(entry, dict) else None
         if not isinstance(rows, list):
@@ -94,7 +94,7 @@ def _read_top10_groups(path: Path) -> list[str]:
 def _read_predictions(path: Path) -> list[str]:
     """读最新一期短线预测，按预测分 pred 降序返回代码列表（模型看多最强在前）。
 
-    仅作 Top10 快照缺失时的兜底：预测文件是全 A 打分表（每日数千只），必须按分排序，
+    仅作固定候选快照缺失时的兜底：预测文件是全 A 打分表（每日数千只），必须按分排序，
     才能在 max_subscribe 夹紧时保住"最强的 N 只"，而不是代码号最小的 N 只。
     """
     if not path.exists():
@@ -125,7 +125,7 @@ def load_codes(cfg: RealtimeConfig) -> list[str]:
     """返回去重后的订阅代码列表（6 位）。
 
     模拟盘和人工持仓必须有实时价才能执行风控/卖出，因此优先于候选名单，不能在
-    max_subscribe 截断时被挤掉。候选来源仍保持 Top10 -> 预测 -> 兜底池的原有顺序。
+    max_subscribe 截断时被挤掉。候选来源保持固定候选组 -> 预测 -> 兜底池的顺序。
     """
     ordered: list[str] = []
     seen: set[str] = set()
@@ -140,15 +140,15 @@ def load_codes(cfg: RealtimeConfig) -> list[str]:
     for state_file in _paper_state_files(cfg):
         paper_positions.extend(_read_paper_positions(state_file))
     holdings = _read_lines(cfg.holdings_file)
-    top10 = _read_top10_groups(cfg.mobile_snapshot_file)
+    candidates = _read_candidate_groups(cfg.mobile_snapshot_file)
 
     _extend(paper_positions)
     _extend(holdings)
     protected_count = len(ordered)
-    _extend(top10)
+    _extend(candidates)
 
-    # Top10 快照缺失/为空：退回按预测分取 top，持仓仍保持最高优先级。
-    if not top10:
+    # 固定候选快照缺失/为空：退回按预测分取 top，持仓仍保持最高优先级。
+    if not candidates:
         _extend(_read_predictions(cfg.predictions_file))
 
     if not ordered:

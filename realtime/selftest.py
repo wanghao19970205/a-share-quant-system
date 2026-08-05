@@ -6,8 +6,9 @@
     1) 各模块 import
     2) Snapshot 字段映射 + 派生量（涨停判定/失衡度）
     3) 订阅清单加载（读到几只）
-    4) DummyFeed → 策略 → notifier(干跑) → ledger 全链路
-    5) 直接喂"封涨停"快照，验证信号产出 + 账本落盘
+    4) Push 分类：通用信号关闭，Top 榜和模拟盘保留
+    5) DummyFeed → 策略 → notifier(干跑) → ledger 全链路
+    6) 直接喂"封涨停"快照，验证信号产出 + 账本落盘
 全程 dry_run，不登录券商、不发网络请求、不碰 quant_data。
 """
 from __future__ import annotations
@@ -53,8 +54,23 @@ def main() -> int:
                                     HoldingExpiry, StrategyContext, default_strategies)
     from realtime.reference import RefRow
     from realtime.engine import Engine
+    from realtime.notifier import Notifier
 
     cfg = load()
+
+    # 1a) 默认只保留低层 Top/模拟盘 push；通用 Signal 被抑制但不影响后续账本链路。
+    notifier_probe = Notifier(cfg)
+    pushed: list[tuple[str, str]] = []
+    notifier_probe.push = lambda title, body: pushed.append((title, body)) or True
+    signal_suppressed = not notifier_probe.notify(Signal(code="000001", kind="limit_up"))
+    notifier_probe.push("[实时榜] Top5", "test")
+    notifier_probe.push("[模拟盘V4] 买入", "test")
+    if signal_suppressed and [title for title, _ in pushed] == [
+            "[实时榜] Top5", "[模拟盘V4] 买入"]:
+        _ok("Push 分类正确：通用信号关闭，Top 榜和模拟盘保留")
+    else:
+        _fail(f"Push 分类异常：signal_suppressed={signal_suppressed} pushed={pushed}")
+        errors += 1
 
     # 2) Snapshot 映射 + 派生量
     row = {"symbol": "600519", "last_price": 11.0, "prev_close": 10.0,

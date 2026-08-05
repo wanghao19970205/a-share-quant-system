@@ -4,10 +4,10 @@
 容易漂移。这里抽成唯一打分器，两处复用——保证「你看到的榜单」与「模拟盘实际买的」是同一序。
 
 设计原则（守 strategy/RankBoard 既定「模型选强票入池，盘中只做纠偏」）：
-  - 候选池 = 模型 expected_return(ridge_pred) > 0 且历史校准净收益覆盖成本的票，
-    再按模型分取 Top-{rank_pool_n}（默认30）。盘中信号绝不把池外票拉进来。
-  - 重排分 score = exp * (1 + clamp(adj, -cap, +cap))：模型分是主序标尺，盘中 adj 只在
-    有界范围（默认 ±30%）里对同池票微调名次——模型分差距大的票次序翻不动，差距小的才被盘中量分出高下。
+  - 候选池先用 Ridge/ElasticNet/ExtraTrees 融合收益覆盖成本和安全边际，再按现役融合 pred 的当日全A百分位
+    取 Top-{rank_pool_n}（默认30）；历史校准净收益仅供展示/审计。
+  - 重排主序 = 融合 pred 百分位 + 有界盘中位移。盘口只在相邻模型候选间纠偏，不把池外票
+    拉进来；旧预测缺 pred 时退回 ridge_pred * (1 + adj) 的原行为。
 
 盘中调整分 adj（各分项先归一到 [-1,1]，再加权求和，最后 clamp 到 ±cap）——只用现成的、
 只读 ctx 内存态的量，缺某项即跳过该项（不崩、不误判）：
@@ -32,9 +32,11 @@ class RankRow:
     """一只票的重排结果。score 为重排后主序键，exp 为原始模型预期（展示/兜底用）。"""
 
     code: str
-    exp: float                        # 原始 expected_return（ridge_pred），恒保留
-    score: float                      # 重排后排序键 = exp*(1+clamp(adj))
+    exp: float                        # 三模型融合 expected_return（收益门/展示），恒保留
+    score: float                      # 重排后排序键（融合百分位主序；缺失时回退 Ridge）
     adj: float                        # 盘中调整幅度（已 clamp 到 ±cap）
+    model_score: Optional[float] = None     # 现役融合 pred 原始分（无量纲）
+    model_rank_pct: Optional[float] = None  # 融合 pred 当日全A百分位
     reasons: list = field(default_factory=list)  # 命中的加减分项（供展示「为何上/下移」）
     px: Optional[float] = None        # 最新实时价（require_price 时必有，否则可能 None）
 
@@ -54,8 +56,12 @@ class RerankScorer:
         self._w_imb = float(getattr(cfg, "rerank_w_imb", 0.30))
         self._w_gap = float(getattr(cfg, "rerank_w_gap", 0.0))
         self._w_spread = float(getattr(cfg, "rerank_w_spread", 0.15))
+        self._rank_scale = max(
+            0.0, float(getattr(cfg, "rerank_intraday_rank_scale", 0.10)))
         self._cost = max(0.0, float(getattr(cfg, "paper_cost", 0.002)))
-        self._min_net = float(getattr(cfg, "rank_min_net_return", 0.0))
+        self._raw_safety = max(0.0, float(getattr(cfg, "rank_raw_safety_margin", 0.001)))
+        configured_min = max(0.0, float(getattr(cfg, "rank_min_raw_return", 0.0)))
+        self._min_raw = max(configured_min, self._cost + self._raw_safety)
 
     # ---- 盘中调整分 --------------------------------------------------------
     def _intraday_adj(self, code: str, exp: float, px: Optional[float]) -> tuple[float, list]:
@@ -113,7 +119,7 @@ class RerankScorer:
                trace: Optional[list[dict]] = None) -> list[RankRow]:
         """返回按 score 降序的 RankRow 列表。
 
-        - 候选池：模型看多且校准净收益达标的票，按模型分取 Top-{rank_pool_n}。
+        - 候选池：同量纲融合收益覆盖成本和安全边际，再按融合 pred 百分位取 Top-{rank_pool_n}；历史校准只做展示/审计。
         - require_price=True：仅保留有实时价的票（买入腿用，买不了的剔除）。
         - drop_limit_up=True：剔除封涨停票（14:50 买不进）。
         - exclude：按 6 位纯代码排除（如已持仓）。
@@ -128,8 +134,8 @@ class RerankScorer:
             if trace is not None:
                 audit[_digits(code)] = {"code": _digits(code), "status": status, **values}
 
-        # 先取模型池（expected_return>0，按模型分降序 Top-pool_n）
-        pool: list[tuple[str, float]] = []
+        # 同量纲融合收益先做可交易门；池内主序使用已批准融合 pred 的当日全A百分位。
+        pool: list[tuple[str, float, Optional[float], Optional[float]]] = []
         for code, r in ref.items():
             clean = _digits(code)
             if clean in exclude:
@@ -148,24 +154,36 @@ class RerankScorer:
             if calibrated_net is None:
                 gross = float(calibrated) if calibrated is not None else float(exp)
                 calibrated_net = net_return_after_cost(gross, self._cost)
+            model_score = getattr(r, "model_score", None)
+            model_rank_pct = getattr(r, "model_rank_pct", None)
             values = {
                 "expected_return": float(exp),
+                "raw_net_return": float(net_return_after_cost(float(exp), self._cost)),
+                "raw_min_return": float(self._min_raw),
+                "return_components": getattr(r, "return_components", None),
+                "model_score": (float(model_score) if model_score is not None else None),
+                "model_rank_pct": (float(model_rank_pct)
+                                   if model_rank_pct is not None else None),
                 "calibrated_return": (float(calibrated) if calibrated is not None else None),
                 "calibrated_net_return": float(calibrated_net),
             }
-            if float(calibrated_net) <= self._min_net:
-                _mark(code, "excluded_net_return_gate", **values)
+            if float(exp) < self._min_raw:
+                _mark(code, "excluded_raw_return_gate", **values)
                 continue
-            pool.append((code, float(exp)))
+            pool.append((code, float(exp), model_score, model_rank_pct))
             _mark(code, "model_pool", **values)
-        pool.sort(key=lambda kv: kv[1], reverse=True)
-        for code, _ in pool[self._pool_n:]:
+        pool.sort(key=lambda item: (
+            item[3] is not None,
+            float(item[3]) if item[3] is not None else float(item[1]),
+            float(item[1]),
+        ), reverse=True)
+        for code, _, _, _ in pool[self._pool_n:]:
             if trace is not None:
                 audit[_digits(code)]["status"] = "excluded_outside_model_top_pool"
         pool = pool[: self._pool_n]
 
         rows: list[RankRow] = []
-        for code, exp in pool:
+        for code, exp, model_score, model_rank_pct in pool:
             px = self._price_of(code)
             if require_price and px is None:
                 if trace is not None:
@@ -181,16 +199,29 @@ class RerankScorer:
                 adj, reasons = self._intraday_adj(code, exp, px)
             else:
                 adj, reasons = 0.0, []
-            score = exp * (1.0 + adj)
-            rows.append(RankRow(code=code, exp=exp, score=score, adj=adj,
-                                reasons=reasons, px=px))
-        # 主序 score 降序；score 相等时回退模型分（稳定）
-        rows.sort(key=lambda r: (r.score, r.exp), reverse=True)
+            if model_rank_pct is not None:
+                score = float(model_rank_pct) + self._rank_scale * adj
+            else:
+                score = exp * (1.0 + adj)
+            rows.append(RankRow(
+                code=code, exp=exp, score=score, adj=adj,
+                model_score=(float(model_score) if model_score is not None else None),
+                model_rank_pct=(float(model_rank_pct)
+                                if model_rank_pct is not None else None),
+                reasons=reasons, px=px))
+        # 主序 score 降序；并列时依次回退融合百分位和 Ridge 收益率。
+        rows.sort(key=lambda row: (
+            row.score,
+            row.model_rank_pct if row.model_rank_pct is not None else -1.0,
+            row.exp,
+        ), reverse=True)
         if trace is not None:
             for rank, row in enumerate(rows, 1):
                 audit[_digits(row.code)].update({
                     "status": "eligible_ranked", "rank": rank,
                     "score": float(row.score), "adj": float(row.adj),
+                    "model_score": row.model_score,
+                    "model_rank_pct": row.model_rank_pct,
                     "reasons": [[name, float(value)] for name, value in row.reasons],
                     "price": row.px,
                 })
