@@ -65,8 +65,9 @@ def main() -> int:
     signal_suppressed = not notifier_probe.notify(Signal(code="000001", kind="limit_up"))
     notifier_probe.push("[实时榜] Top5", "test")
     notifier_probe.push("[模拟盘V4] 买入", "test")
+    notifier_probe.push("[模拟盘V5] 买入", "test")
     if signal_suppressed and [title for title, _ in pushed] == [
-            "[实时榜] Top5", "[模拟盘V4] 买入"]:
+            "[实时榜] Top5", "[模拟盘V4] 买入", "[模拟盘V5] 买入"]:
         _ok("Push 分类正确：通用信号关闭，Top 榜和模拟盘保留")
     else:
         _fail(f"Push 分类异常：signal_suppressed={signal_suppressed} pushed={pushed}")

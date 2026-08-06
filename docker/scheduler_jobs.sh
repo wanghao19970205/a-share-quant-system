@@ -259,6 +259,23 @@ case "$job" in
     run_job sentiment-model "$LOG_DIR/sentiment-model.out.log" "$LOG_DIR/sentiment-model.err.log" \
         python -m stock_analyzer.sentiment_signal --months 12
     ;;
+  realtime-weight-shadow)
+    # 盘后独立评估 realtime 收益融合权重；只写 logs/realtime/weight_shadow，
+    # 不调用 quant 训练/发布，不改 active_quant_model.json，也不占用模型任务锁。
+    REALTIME_LEDGER_DIR="${REALTIME_LEDGER_DIR:-$LOG_DIR/realtime}"
+    REALTIME_ENV_FILE="${REALTIME_ENV_FILE:-$LOG_DIR/realtime/notify.env}"
+    export REALTIME_LEDGER_DIR REALTIME_ENV_FILE
+    mkdir -p "$REALTIME_LEDGER_DIR/weight_shadow"
+    exec 8>"/tmp/realtime-weight-shadow.lock"
+    if ! flock -n 8; then
+        clog "SKIP   job=realtime-weight-shadow reason=already-running"
+        exit 0
+    fi
+    run_job realtime-weight-shadow \
+      "$LOG_DIR/realtime-weight-shadow.out.log" \
+      "$LOG_DIR/realtime-weight-shadow.err.log" \
+      python -m realtime.weight_shadow
+    ;;
   realtime)
     # 交易日盘中实时层：常驻 python -m realtime.engine，订阅选股清单∪持仓的 Level-1 快照，
     # 异动/买卖点/持仓到期 → 推送(Bark/Server酱/PushDeer) + 独立账本(logs/realtime)。
@@ -313,7 +330,7 @@ case "$job" in
     done
     ;;
   *)
-    echo "usage: scheduler_jobs.sh {intraday-light|daily-light|weekly-full|monthly-factor|refresh-qfq|snapshots|news-daily|news-annotation|all-a-meta|top10-eval|sentiment-model|realtime|rotate}" >&2
+    echo "usage: scheduler_jobs.sh {intraday-light|daily-light|weekly-full|monthly-factor|refresh-qfq|snapshots|news-daily|news-annotation|all-a-meta|top10-eval|sentiment-model|realtime-weight-shadow|realtime|rotate}" >&2
     clog "ERROR  unknown job=$job"
     exit 2
     ;;

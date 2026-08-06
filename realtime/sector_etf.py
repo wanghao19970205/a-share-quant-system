@@ -147,11 +147,11 @@ class SectorETFContext:
         return "" if text.lower() in {"nan", "<na>"} else text
 
     def _load_stock_map(self, path: Path) -> dict[str, SectorETFSpec]:
-        if not self._enabled or not path.exists():
+        if not path.exists():
             return {}
         try:
             import pandas as pd
-            columns = ["code", "a_industry", "a_industries"]
+            columns = ["code", "a_industry", "a_industries", "a_concepts"]
             try:
                 df = pd.read_parquet(path, columns=columns)
             except Exception:
@@ -168,9 +168,11 @@ class SectorETFContext:
                 continue
             primary = self._clean_meta(row.get("a_industry"))
             hierarchy = self._clean_meta(row.get("a_industries"))
+            concepts = self._clean_meta(row.get("a_concepts"))
             self._stock_meta[code] = {
                 "stock_industry": primary,
                 "stock_industries": hierarchy,
+                "stock_concepts": concepts,
             }
             spec = self._by_primary_industry.get(primary)
             if spec is not None:
@@ -262,7 +264,7 @@ class SectorETFContext:
         digits = _digits(code)
         spec = self._stock_map.get(digits)
         meta = self._stock_meta.get(digits, {
-            "stock_industry": "", "stock_industries": ""})
+            "stock_industry": "", "stock_industries": "", "stock_concepts": ""})
         mapping = {
             "mapping_version": self.mapping_version,
             "mapping_source": "exact_primary" if spec is not None else "unmapped",

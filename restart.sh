@@ -17,7 +17,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # scheduler_jobs.sh 支持的全部任务（run 子命令校验用）
-JOBS="daily-light weekly-full intraday-light snapshots news-daily refresh-qfq monthly-factor all-a-meta sentiment-model rotate realtime"
+JOBS="daily-light weekly-full intraday-light snapshots news-daily refresh-qfq monthly-factor all-a-meta sentiment-model rotate realtime-weight-shadow realtime"
 
 # 探测 compose 命令：优先 docker compose(v2，远端)，回退 docker-compose(v1，本地旧环境)
 # 用数组存放，避免 zsh 默认不对未加引号变量做单词分割导致 "docker compose" 被当成单个命令名。

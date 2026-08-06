@@ -13,6 +13,7 @@ notifier.push 低层派发（不过白名单），自带节奏控制 + 指纹去
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import Optional
 
@@ -24,11 +25,12 @@ from .strategy import StrategyContext
 
 class RankBoard:
     def __init__(self, cfg, ctx: StrategyContext, notifier: Notifier,
-                 name_map: Optional[dict] = None):
+                 name_map: Optional[dict] = None, sector_ctx=None):
         self._cfg = cfg
         self._ctx = ctx
         self._notifier = notifier
         self._name_map = name_map or {}
+        self._sector_ctx = sector_ctx
         self._top_n = max(1, getattr(cfg, "rank_top_n", 5))
         self._interval = max(30, getattr(cfg, "rank_interval_sec", 300))
         self._last_emit = 0.0
@@ -43,6 +45,40 @@ class RankBoard:
             digits = str(code).split(".", 1)[0].strip().zfill(6)
             name = self._name_map.get(digits)
         return f"{code} {name}" if name else str(code)
+
+    @staticmethod
+    def _compact_items(value, limit: int = 2, item_chars: int = 10) -> list[str]:
+        """把本地元数据压成少量短标签，避免 Top5 推送正文过长。"""
+        text = "" if value is None else str(value).strip()
+        if not text or text.lower() in {"nan", "<na>"}:
+            return []
+        items: list[str] = []
+        for raw in re.split(r"[、,，;；|/]+", text):
+            item = raw.strip()
+            if item and item not in items:
+                items.append(item[:item_chars])
+            if len(items) >= limit:
+                break
+        return items
+
+    def _stock_meta_str(self, code: str) -> str:
+        """返回内存中的行业/概念展示串；元数据缺失时保持原榜单格式。"""
+        if self._sector_ctx is None:
+            return ""
+        try:
+            meta = self._sector_ctx.assessment_for_stock(code)
+        except Exception:  # noqa: BLE001 - 展示元数据异常不能阻断 RankBoard
+            return ""
+        industries = self._compact_items(
+            meta.get("stock_industry") or meta.get("stock_industries"), limit=1,
+            item_chars=12)
+        concepts = self._compact_items(meta.get("stock_concepts"), limit=2, item_chars=10)
+        parts = []
+        if industries:
+            parts.append(f"行业:{industries[0]}")
+        if concepts:
+            parts.append(f"概念:{'/'.join(concepts)}")
+        return (" [" + " ".join(parts) + "]") if parts else ""
 
     def _tags(self, code: str, _exp: float) -> tuple[list[str], str]:
         """按盘中量给一只票拼标注，返回 (标注列表, 用于指纹的稳定摘要串)。
@@ -123,7 +159,9 @@ class RankBoard:
         摆在榜首无意义（且 last 顶死涨停价恒定 → 指纹不变 → 榜单假性「不更新」）。
         剔掉后榜单由真正可买候选填充，随盘中量刷新；炸板则自然回榜。
         """
-        rows = self._scorer.ranked(drop_limit_up=True)
+        # 榜单必须基于本进程已收到的实时价；启动/热重载后无快照的“待开盘”票
+        # 无法判定是否封板，不能先放行再等下一轮纠正。
+        rows = self._scorer.ranked(require_price=True, drop_limit_up=True)
         return rows[: self._top_n]
 
     def _exp_str(self, code: str, exp: float) -> str:
@@ -156,7 +194,8 @@ class RankBoard:
             tags, fp = self._tags(code, exp)
             mark = marks[i] if i < len(marks) else f"{i + 1}."
             tag_str = (" " + " ".join(tags)) if tags else ""
-            lines.append(f"{mark} {self._label(code)} {self._exp_str(code, exp)}"
+            meta_str = self._stock_meta_str(code)
+            lines.append(f"{mark} {self._label(code)}{meta_str} {self._exp_str(code, exp)}"
                          f"{self._rerank_str(row)}{tag_str}")
             # 指纹并入 adj 粗分桶（0.05 一档），使盘中重排变化能触发推送但不因微抖动刷屏。
             adj_bucket = round(getattr(row, "adj", 0.0) / 0.05)

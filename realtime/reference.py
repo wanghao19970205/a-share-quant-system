@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import RealtimeConfig
+from .weight_manifest import load_active_manifest
 
 
 @dataclass
@@ -113,8 +114,7 @@ def _load_atr_map(cfg: RealtimeConfig, codes: list[str]) -> dict[str, tuple]:
 _RETURN_MODEL_COLUMNS = ("ridge_pred", "elastic_pred", "extra_trees_pred")
 
 
-def _return_model_weights(cfg: RealtimeConfig) -> dict[str, float]:
-    """返回同量纲收益模型权重；关闭融合时只使用 Ridge。"""
+def _configured_return_model_weights(cfg: RealtimeConfig) -> dict[str, float]:
     if not getattr(cfg, "ensemble_return_enabled", True):
         return {"ridge_pred": 1.0}
     weights = {
@@ -124,6 +124,16 @@ def _return_model_weights(cfg: RealtimeConfig) -> dict[str, float]:
     }
     positive = {key: max(0.0, value) for key, value in weights.items() if value > 0}
     return positive or {"ridge_pred": 1.0}
+
+
+def _return_model_weights(cfg: RealtimeConfig) -> dict[str, float]:
+    """优先使用 realtime 晋级权重；无效时退回环境配置，再退回 Ridge。"""
+    configured = _configured_return_model_weights(cfg)
+    active_path = getattr(cfg, "weight_active_manifest_file", None)
+    if not active_path or not getattr(cfg, "weight_auto_promote_enabled", True):
+        return configured
+    active = load_active_manifest(Path(active_path))
+    return dict(active["weights"]) if active is not None else configured
 
 
 def _ensemble_return_series(df, cfg: RealtimeConfig):
