@@ -13,6 +13,7 @@ import pandas as pd
 
 from quant import daily_update
 from quant import full_train_batched
+from quant import model as quant_model
 from quant import model_expansion_experiment as experiment
 from quant import scheduled_workflow
 from quant import shadow_leg_evaluation
@@ -118,11 +119,86 @@ class IntradaySourcePriorityTest(unittest.TestCase):
                 mock.patch.object(amazingdata_source, "_market") as market, \
                 mock.patch.object(amazingdata_source, "_ad", fake_ad), \
                 mock.patch.object(amazingdata_source, "sdk_call", side_effect=lambda fn, codes, **kwargs: query(codes, **kwargs)), \
-                mock.patch.dict(os.environ, {"AMAZINGDATA_KLINE_BATCH_SIZE": "2"}):
-            result = amazingdata_source.fetch_daily_batch(symbols, "20260720", "20260721")
+                mock.patch.dict(os.environ, {"AMAZINGDATA_KLINE_BATCH_SIZE": "2"}), \
+                mock.patch("builtins.print") as output:
+            result = amazingdata_source.fetch_daily_batch(
+                symbols, "20260720", "20260721",
+                progress_offset=1,
+                progress_total=4,
+            )
 
+        progress = [str(call.args[0]).split()[1] for call in output.call_args_list]
         self.assertEqual([len(chunk) for chunk in calls], [2, 2, 1])
+        self.assertEqual(progress, ["2/4", "3/4", "4/4"])
         self.assertEqual(set(result), set(symbols))
+
+    def test_latest_price_probe_uses_one_unadjusted_batch(self):
+        frames = {
+            "000001": pd.DataFrame({"date": pd.to_datetime(["2026-08-05"])}),
+            "600000": pd.DataFrame({"date": pd.to_datetime(["2026-08-06"])}),
+        }
+        with mock.patch.object(
+            daily_update.datafeed,
+            "broker_daily_prices",
+            return_value=frames,
+        ) as batch:
+            latest = daily_update._probe_latest_price_date(
+                ["000001", "600000"],
+                lookback_days=5,
+            )
+
+        self.assertEqual(latest, pd.Timestamp("2026-08-06").date())
+        self.assertEqual(batch.call_count, 1)
+        self.assertEqual(batch.call_args.kwargs["adjust"], "")
+
+    def test_force_latest_skips_remote_date_probe(self):
+        with mock.patch.object(daily_update.config, "ensure_dirs"), \
+                mock.patch.object(daily_update, "_refresh_mainboard_universe_isolated"), \
+                mock.patch.object(daily_update.datafeed, "universe", return_value=["600001"]), \
+                mock.patch.object(daily_update, "_probe_latest_price_date") as probe, \
+                mock.patch.object(daily_update, "_stale_codes", return_value=["600001"]), \
+                mock.patch.object(daily_update, "_update_prices_batched", return_value={
+                    "ok": 1, "fail": 0, "rows": 1, "failures": [],
+                }):
+            result = daily_update.run(
+                force_latest=True,
+                skip_valuation=True,
+                skip_events=True,
+                skip_snapshots=True,
+            )
+
+        probe.assert_not_called()
+        self.assertEqual(result["n_codes"], 1)
+        self.assertEqual(result["price"]["source_latest"], "")
+
+    def test_price_batch_reuses_dates_from_stale_scan(self):
+        today = pd.Timestamp.today().normalize()
+        old = pd.DataFrame({
+            "code": ["600001"],
+            "date": [today],
+            "open": [10.0], "high": [10.2], "low": [9.9], "close": [10.1],
+        })
+        fresh = old.drop(columns=["code"])
+        with mock.patch.object(daily_update, "_warmup_broker", return_value=True), \
+                mock.patch.object(
+                    daily_update.datafeed,
+                    "broker_daily_prices",
+                    return_value={"600001": fresh},
+                ), \
+                mock.patch.object(
+                    daily_update.warehouse,
+                    "load_price",
+                    return_value=old,
+                ) as load_price, \
+                mock.patch.object(daily_update.warehouse, "save_price"):
+            result = daily_update._update_prices_batched(
+                ["600001"],
+                batch_size=800,
+                local_dates={"600001": today.date()},
+            )
+
+        self.assertEqual(result["ok"], 1)
+        self.assertEqual(load_price.call_count, 1)
 
     def test_price_save_replaces_file_atomically(self):
         with tempfile.TemporaryDirectory() as directory, \
@@ -297,6 +373,51 @@ class PublishAccelerationTest(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertNotIn("legacy", fresh.columns)
         self.assertEqual(fresh["code"].tolist(), ["600001"])
+
+    def test_short_legacy_merge_reuses_identical_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            short = root / "short.parquet"
+            legacy = root / "legacy.parquet"
+            source = root / "source.parquet"
+            short.write_bytes(b"same-history")
+            legacy.write_bytes(b"same-history")
+            fresh = pd.DataFrame()
+
+            with mock.patch.object(
+                scheduled_workflow, "merge_active_predictions",
+            ) as merge, mock.patch.object(
+                scheduled_workflow, "_atomic_copy",
+            ) as copy:
+                mode = scheduled_workflow._merge_short_and_legacy(
+                    short, legacy, source, fresh)
+
+        self.assertEqual(mode, "shared-history")
+        merge.assert_called_once_with(
+            short, source, short, fresh_frame=fresh)
+        copy.assert_called_once_with(short, legacy)
+
+    def test_short_legacy_merge_preserves_different_histories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            short = root / "short.parquet"
+            legacy = root / "legacy.parquet"
+            source = root / "source.parquet"
+            short.write_bytes(b"short-history")
+            legacy.write_bytes(b"legacy-history")
+            fresh = pd.DataFrame()
+
+            with mock.patch.object(
+                scheduled_workflow, "merge_active_predictions",
+            ) as merge, mock.patch.object(
+                scheduled_workflow, "_atomic_copy",
+            ) as copy:
+                mode = scheduled_workflow._merge_short_and_legacy(
+                    short, legacy, source, fresh)
+
+        self.assertEqual(mode, "independent-history")
+        self.assertEqual(merge.call_count, 2)
+        copy.assert_not_called()
 
     def test_active_checks_can_reuse_price_latest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1242,6 +1363,64 @@ class ModelExpansionExperimentTest(unittest.TestCase):
         selected = experiment.select_regime_weights(returns, [0.0, 0.1], min_observations=20)
 
         self.assertEqual(selected, {"up": 0.1})
+
+
+class FutureLabelFeatureSafetyTest(unittest.TestCase):
+    def test_feature_columns_exclude_all_horizon_targets_and_execution_labels(self):
+        panel = pd.DataFrame({
+            "code": ["600001"],
+            "date": pd.to_datetime(["2026-08-07"]),
+            "ret_5d": [0.01],
+            "target_ret_1d": [0.02],
+            "target_ret_3d": [0.03],
+            "open_ret_3d": [0.04],
+            "tradable_ret_1d": [0.01],
+            "buyable_close": [True],
+            "adaptive_entry_buyable": [True],
+            "label_future_return": [0.02],
+            "future_return": [0.03],
+            "forward_return_5d": [0.04],
+            "fwd_ret_5d": [0.05],
+            "next_day_return": [0.06],
+            "realized_return_5d": [0.07],
+            "pnl_after_5d": [0.08],
+        })
+        self.assertEqual(engineering.feature_columns(panel, horizon=1), ["ret_5d"])
+
+    def test_training_boundary_rejects_unsafe_cached_factor(self):
+        with self.assertRaisesRegex(RuntimeError, "unsafe future-label factors"):
+            full_train_batched._reject_unsafe_factors(
+                ["ret_5d", "target_ret_3d"], "test window"
+            )
+
+    def test_open_targets_use_entry_offset_in_purge_span(self):
+        self.assertEqual(full_train_batched._purge_span("baseline", 1), 1)
+        self.assertEqual(full_train_batched._purge_span("tradable-label", 1), 1)
+        self.assertEqual(full_train_batched._purge_span("open-label", 1), 2)
+        self.assertEqual(full_train_batched._purge_span("open-buyin-mask", 1), 2)
+
+    def test_open_target_cache_signature_tracks_price_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            price_dir = root / "price"
+            price_dir.mkdir()
+            price = price_dir / "600001.parquet"
+            price.write_bytes(b"before")
+            with mock.patch.object(full_train_batched.config, "QUANT_DIR", root):
+                before = full_train_batched._price_source_signature()
+                price.write_bytes(b"after-price-update")
+                after = full_train_batched._price_source_signature()
+            self.assertNotEqual(before, after)
+
+    def test_shared_model_boundary_rejects_unknown_future_label(self):
+        frame = pd.DataFrame({
+            "code": ["600001"],
+            "date": pd.to_datetime(["2026-08-07"]),
+            "target_ret_1d": [0.01],
+            "future_return": [0.02],
+        })
+        with self.assertRaisesRegex(ValueError, "unsafe future-label model features"):
+            quant_model._xy(frame, ["future_return"], "target_ret_1d")
 
 
 if __name__ == "__main__":
