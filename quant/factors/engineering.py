@@ -519,12 +519,55 @@ def categorical_columns(panel: pd.DataFrame) -> list[str]:
     return cols
 
 
+_FORBIDDEN_FEATURE_PREFIXES = (
+    "target_",
+    "label_",
+    "adaptive_",
+    "open_ret_",
+    "tradable_ret_",
+    "future_",
+    "forward_",
+    "fwd_",
+    "next_",
+    "realized_",
+    "pnl_",
+    "sell_return_",
+    "exit_return_",
+    "holding_return_",
+)
+_FORBIDDEN_FEATURE_COLUMNS = {
+    "code",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "amount",
+    "entry_open_next",
+    "exit_open_h",
+    "buyable_next",
+    "buyable_close",
+}
+
+
+def is_forbidden_feature(column: str) -> bool:
+    name = str(column).lower()
+    return (
+        name in _FORBIDDEN_FEATURE_COLUMNS
+        or name.startswith(_FORBIDDEN_FEATURE_PREFIXES)
+        or name.endswith(("_target", "_label"))
+    )
+
+
 def feature_columns(panel: pd.DataFrame, horizon: int = 5) -> list[str]:
-    banned = {"code", "date", "target_ret_%dd" % horizon}
-    banned |= {"open", "high", "low", "close", "volume", "amount"}
-    # 回测成交口径列含未来信息，禁止作为特征
-    banned |= {"entry_open_next", "exit_open_h", "buyable_next", "open_ret_%dd" % horizon}
-    return [c for c in panel.columns if c not in banned and pd.api.types.is_numeric_dtype(panel[c])]
+    del horizon  # All horizons' labels are future information for every model horizon.
+    return [
+        column
+        for column in panel.columns
+        if not is_forbidden_feature(column)
+        and pd.api.types.is_numeric_dtype(panel[column])
+    ]
 
 
 def _feature_kind(name: str) -> str:

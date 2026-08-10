@@ -26,8 +26,11 @@ class TrainResult:
 
 
 def _split_time(panel: pd.DataFrame, train_end: str | None = None, valid_start: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    df = panel.copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if pd.api.types.is_datetime64_any_dtype(panel["date"]):
+        df = panel
+    else:
+        df = panel.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
     dates = sorted(df["date"].dropna().unique())
     if not dates:
         return df.iloc[0:0], df.iloc[0:0]
@@ -48,19 +51,26 @@ def _split_time(panel: pd.DataFrame, train_end: str | None = None, valid_start: 
 
 def _split_train_valid_predict(panel: pd.DataFrame, train_end: str | None = None,
                                valid_end: str | None = None,
-                               predict_start: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                               predict_start: str | None = None,
+                               predict_end: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Split by time so validation can tune rounds without touching test predictions."""
     train, valid = _split_time(panel, train_end=train_end)
     if valid_end is not None:
         ve = pd.Timestamp(valid_end)
         valid = valid[valid["date"] <= ve]
-    predict = panel.copy()
-    predict["date"] = pd.to_datetime(predict["date"], errors="coerce")
+    if pd.api.types.is_datetime64_any_dtype(panel["date"]):
+        predict = panel
+    else:
+        predict = panel.copy()
+        predict["date"] = pd.to_datetime(predict["date"], errors="coerce")
     if predict_start is not None:
         ps = pd.Timestamp(predict_start)
         predict = predict[predict["date"] >= ps]
     else:
         predict = valid
+    if predict_end is not None:
+        pe = pd.Timestamp(predict_end)
+        predict = predict[predict["date"] <= pe]
     return train, valid, predict
 
 
@@ -77,7 +87,14 @@ def _apply_train_mask(train: pd.DataFrame, mask_col: str | None) -> pd.DataFrame
 
 
 
+def _validate_feature_safety(features: list[str]) -> None:
+    unsafe = sorted({feature for feature in features if engineering.is_forbidden_feature(feature)})
+    if unsafe:
+        raise ValueError(f"unsafe future-label model features: {unsafe}")
+
+
 def _xy(df: pd.DataFrame, features: list[str], target: str):
+    _validate_feature_safety(features)
     sub = df[["code", "date", target] + features].replace([np.inf, -np.inf], np.nan).dropna(subset=[target])
     x = sub[features].fillna(0.0).to_numpy(dtype=float)
     y = sub[target].to_numpy(dtype=float)
@@ -85,6 +102,7 @@ def _xy(df: pd.DataFrame, features: list[str], target: str):
 
 
 def _predict_x(df: pd.DataFrame, features: list[str], target: str):
+    _validate_feature_safety(features)
     cols = ["code", "date"] + ([target] if target in df.columns else []) + features
     sub = df[cols].replace([np.inf, -np.inf], np.nan).copy()
     if target not in sub.columns:
@@ -96,6 +114,7 @@ def _predict_x(df: pd.DataFrame, features: list[str], target: str):
 
 
 def _rank_xy(df: pd.DataFrame, features: list[str], target: str, n_bins: int = 5):
+    _validate_feature_safety(features)
     sub = df[["code", "date", target] + features].replace([np.inf, -np.inf], np.nan).dropna(subset=[target]).copy()
     if sub.empty:
         return sub, np.empty((0, len(features))), np.array([]), np.array([], dtype=int), np.array([], dtype=int), np.array([])
@@ -179,6 +198,125 @@ def _metrics(y: np.ndarray, pred: np.ndarray) -> dict:
     }
 
 
+def _classification_metrics(y: np.ndarray, probability: np.ndarray) -> dict:
+    ok = np.isfinite(y) & np.isfinite(probability)
+    if ok.sum() == 0:
+        return {"n": 0}
+    truth = y[ok].astype(int)
+    score = np.clip(probability[ok].astype(float), 0.0, 1.0)
+    result = {
+        "n": int(len(truth)),
+        "positive_rate": float(truth.mean()),
+        "brier_score": float(np.mean((score - truth) ** 2)),
+    }
+    try:
+        from sklearn.metrics import average_precision_score, roc_auc_score
+        risk_truth = 1 - truth
+        risk_score = 1.0 - score
+        result["risk_pr_auc"] = float(average_precision_score(risk_truth, risk_score))
+        result["roc_auc"] = float(roc_auc_score(truth, score)) if len(np.unique(truth)) > 1 else None
+    except Exception:  # noqa: BLE001
+        result["risk_pr_auc"] = None
+        result["roc_auc"] = None
+    return result
+
+
+def train_binary_classifier(
+    panel: pd.DataFrame,
+    features: list[str],
+    label_col: str,
+    classifier: str,
+    train_end: str | None = None,
+    valid_end: str | None = None,
+    predict_start: str | None = None,
+    decay_half_life_days: float | None = 90.0,
+    min_weight: float = 0.05,
+    minority_weight: float = 20.0,
+    n_estimators: int = 160,
+    learning_rate: float = 0.02,
+    max_train_rows: int = 150_000,
+    n_jobs: int | None = None,
+    predict_end: str | None = None,
+    enforce_max_train_rows: bool = False,
+) -> TrainResult:
+    train, valid, predict_df = _split_train_valid_predict(
+        panel,
+        train_end=train_end,
+        valid_end=valid_end,
+        predict_start=predict_start,
+        predict_end=predict_end,
+    )
+    train_sub, x, y = _xy(train, features, label_col)
+    valid_sub, xv, yv = _xy(valid, features, label_col)
+    pred_sub, xp, _ = _predict_x(predict_df, features, label_col)
+    model_name = {
+        "ridge": "ridge_classifier",
+        "lightgbm": "lightgbm_classifier",
+        "elastic": "elastic_logistic",
+        "extra_trees": "extra_trees_classifier",
+    }.get(classifier, classifier)
+    if len(y) < 50 or len(yv) == 0 or len(xp) == 0 or len(np.unique(y)) < 2:
+        return TrainResult(model_name, False, "分类训练、验证或预测样本不足", {}, pd.DataFrame())
+    sample_weight = (
+        time_decay_weights(train_sub, decay_half_life_days, min_weight=min_weight)
+        if decay_half_life_days else np.ones(len(train_sub), dtype=float)
+    )
+    sample_weight = sample_weight * np.where(y < 0.5, float(minority_weight), 1.0)
+    n_train_rows_before_cap = int(len(y))
+    should_cap = classifier == "extra_trees" or bool(enforce_max_train_rows)
+    if should_cap and max_train_rows > 0 and len(y) > max_train_rows:
+        rng = np.random.default_rng(42)
+        probability = sample_weight / sample_weight.sum()
+        indices = np.sort(rng.choice(len(y), size=max_train_rows, replace=False, p=probability))
+        x = x[indices]
+        y = y[indices]
+        sample_weight = sample_weight[indices]
+    try:
+        if classifier == "ridge":
+            from sklearn.linear_model import LogisticRegression
+            estimator = LogisticRegression(
+                penalty="l2", C=1.0, solver="lbfgs", max_iter=500, random_state=42
+            )
+        elif classifier == "elastic":
+            from sklearn.linear_model import LogisticRegression
+            estimator = LogisticRegression(
+                penalty="elasticnet", C=1.0, l1_ratio=0.5, solver="saga",
+                max_iter=1000, tol=1e-4, random_state=42, n_jobs=n_jobs,
+            )
+        elif classifier == "lightgbm":
+            import lightgbm as lgb
+            estimator = lgb.LGBMClassifier(
+                objective="binary", n_estimators=n_estimators, learning_rate=float(learning_rate),
+                num_leaves=31, subsample=0.8, colsample_bytree=0.8,
+                reg_alpha=0.1, reg_lambda=1.0, random_state=42,
+                verbose=-1, n_jobs=n_jobs,
+            )
+        elif classifier == "extra_trees":
+            from sklearn.ensemble import ExtraTreesClassifier
+            estimator = ExtraTreesClassifier(
+                n_estimators=n_estimators, max_depth=12, min_samples_leaf=20,
+                max_features=0.7, bootstrap=False, n_jobs=n_jobs, random_state=42,
+            )
+        else:
+            return TrainResult(model_name, False, f"未知分类器：{classifier}", {}, pd.DataFrame())
+        estimator.fit(x, y.astype(int), sample_weight=sample_weight)
+        valid_probability = estimator.predict_proba(xv)[:, 1]
+        probability = estimator.predict_proba(xp)[:, 1]
+    except Exception as exc:  # noqa: BLE001
+        return TrainResult(model_name, False, f"分类训练失败：{exc}", {}, pd.DataFrame())
+    output = pred_sub[["code", "date", label_col]].copy()
+    output["pred"] = probability
+    metrics = _classification_metrics(yv, valid_probability)
+    metrics["minority_weight"] = float(minority_weight)
+    metrics["n_estimators"] = int(n_estimators)
+    metrics["learning_rate"] = float(learning_rate)
+    metrics["max_train_rows"] = int(max_train_rows)
+    metrics["enforce_max_train_rows"] = bool(enforce_max_train_rows)
+    metrics["n_train_rows_before_cap"] = n_train_rows_before_cap
+    metrics["n_train_rows"] = int(len(y))
+    return TrainResult(model_name, True, "ok", metrics, output)
+
+
 def _daily_feature_zscore(df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     for f in features:
@@ -234,9 +372,13 @@ def train_ridge(panel: pd.DataFrame, features: list[str], horizon: int = 5, alph
                 train_end: str | None = None, valid_end: str | None = None,
                 predict_start: str | None = None, decay_half_life_days: float | None = 90.0,
                 min_weight: float = 0.05,
-                label_col: str | None = None, train_mask_col: str | None = None) -> TrainResult:
+                label_col: str | None = None, train_mask_col: str | None = None,
+                predict_end: str | None = None) -> TrainResult:
     target = label_col or f"target_ret_{horizon}d"
-    train, valid, predict_df = _split_train_valid_predict(panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
+    train, valid, predict_df = _split_train_valid_predict(
+        panel, train_end=train_end, valid_end=valid_end,
+        predict_start=predict_start, predict_end=predict_end,
+    )
     train = _apply_train_mask(train, train_mask_col)
     train_sub, x, y = _xy(train, features, target)
     valid_sub, xv, yv = _xy(valid, features, target)
@@ -284,11 +426,11 @@ def train_elastic_net(panel: pd.DataFrame, features: list[str], horizon: int = 5
     try:
         from sklearn.linear_model import ElasticNet
         sample_weight = time_decay_weights(train_sub, decay_half_life_days, min_weight=min_weight) if decay_half_life_days else None
-        model = ElasticNet(alpha=float(alpha), l1_ratio=float(l1_ratio), fit_intercept=True,
-                           max_iter=2000, tol=1e-4, selection="cyclic", random_state=42)
-        model.fit(x, y, sample_weight=sample_weight)
-        valid_pred = model.predict(xv)
-        pred = model.predict(xp)
+        model_value = ElasticNet(alpha=float(alpha), l1_ratio=float(l1_ratio), fit_intercept=True,
+                                 max_iter=2000, tol=1e-4, selection="cyclic", random_state=42)
+        model_value.fit(x, y, sample_weight=sample_weight)
+        valid_pred = model_value.predict(xv)
+        pred = model_value.predict(xp)
     except Exception as e:  # noqa: BLE001
         return TrainResult("elastic_net", False, f"ElasticNet 训练失败：{e}", {}, pd.DataFrame())
     out = pred_sub[["code", "date", target]].copy()
@@ -296,7 +438,7 @@ def train_elastic_net(panel: pd.DataFrame, features: list[str], horizon: int = 5
     metrics = _metrics(yv, valid_pred)
     metrics["alpha"] = float(alpha)
     metrics["l1_ratio"] = float(l1_ratio)
-    metrics["n_nonzero_factors"] = int(np.count_nonzero(np.abs(model.coef_) > 1e-12))
+    metrics["n_nonzero_factors"] = int(np.count_nonzero(np.abs(model_value.coef_) > 1e-12))
     return TrainResult("elastic_net", True, "ok", metrics, out)
 
 
@@ -362,26 +504,82 @@ def train_rank_vote(panel: pd.DataFrame, features: list[str], horizon: int = 5,
     return TrainResult("rank_vote", True, "ok", metrics, out)
 
 
+def _lightgbm_objective_params(objective: str, alpha: float | None) -> dict:
+    objective = str(objective).strip().lower()
+    if objective == "regression":
+        if alpha is not None:
+            raise ValueError("alpha is only valid for the quantile objective")
+        return {"objective": "regression", "eval_metric": "l2"}
+    if objective == "quantile":
+        value = float(alpha) if alpha is not None else 0.20
+        if not 0.0 < value < 1.0:
+            raise ValueError("quantile alpha must be strictly between zero and one")
+        return {"objective": "quantile", "alpha": value, "eval_metric": "quantile"}
+    raise ValueError(f"unsupported LightGBM objective: {objective}")
+
+
 def train_lightgbm(panel: pd.DataFrame, features: list[str], horizon: int = 5, train_end: str | None = None,
                    valid_end: str | None = None, predict_start: str | None = None,
                    decay_half_life_days: float | None = 90.0, min_weight: float = 0.05,
                    n_estimators: int = 800, learning_rate: float | None = None,
-                   early_stopping_rounds: int = 50) -> TrainResult:
+                   early_stopping_rounds: int = 50, n_jobs: int | None = None,
+                   label_col: str | None = None,
+                   train_mask_col: str | None = None,
+                   objective: str = "regression", alpha: float | None = None,
+                   predict_end: str | None = None,
+                   max_train_rows: int | None = None,
+                   enforce_max_train_rows: bool = False) -> TrainResult:
     try:
         import lightgbm as lgb
     except Exception as e:  # noqa: BLE001
         return TrainResult("lightgbm", False, f"缺少 lightgbm：{e}", {}, pd.DataFrame())
-    target = f"target_ret_{horizon}d"
-    train, valid, predict_df = _split_train_valid_predict(panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
+    objective_params = _lightgbm_objective_params(objective, alpha)
+    target = label_col or f"target_ret_{horizon}d"
+    train, valid, predict_df = _split_train_valid_predict(
+        panel,
+        train_end=train_end,
+        valid_end=valid_end,
+        predict_start=predict_start,
+        predict_end=predict_end,
+    )
+    train = _apply_train_mask(train, train_mask_col)
     train_sub, x, y = _xy(train, features, target)
+    n_train_rows_before_cap = int(len(y))
+    if enforce_max_train_rows and max_train_rows and len(y) > int(max_train_rows):
+        rng = np.random.default_rng(42)
+        cap_weights = time_decay_weights(
+            train_sub, decay_half_life_days, min_weight=min_weight
+        ) if decay_half_life_days else np.ones(len(y), dtype=float)
+        indices = np.sort(rng.choice(
+            len(y), size=int(max_train_rows), replace=False,
+            p=cap_weights / cap_weights.sum(),
+        ))
+        train_sub, x, y = train_sub.iloc[indices], x[indices], y[indices]
     valid_sub, xv, yv = _xy(valid, features, target)
     pred_sub, xp, yp = _predict_x(predict_df, features, target)
     if len(y) < 50 or len(yv) == 0 or len(xp) == 0:
         return TrainResult("lightgbm", False, "训练、验证或预测样本不足", {}, pd.DataFrame())
     sample_weight = time_decay_weights(train_sub, decay_half_life_days, min_weight=min_weight) if decay_half_life_days else None
     try:
-        model = lgb.LGBMRegressor(n_estimators=n_estimators, learning_rate=learning_rate or 0.02, num_leaves=31, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, verbose=-1)
-        fit_kwargs = {"sample_weight": sample_weight, "eval_set": [(xv, yv)], "eval_metric": "l2"}
+        model = lgb.LGBMRegressor(
+            objective=objective_params["objective"],
+            **({"alpha": objective_params["alpha"]} if "alpha" in objective_params else {}),
+            n_estimators=n_estimators,
+            learning_rate=learning_rate or 0.02,
+            num_leaves=31,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            random_state=42,
+            verbose=-1,
+            n_jobs=n_jobs,
+        )
+        fit_kwargs = {
+            "sample_weight": sample_weight,
+            "eval_set": [(xv, yv)],
+            "eval_metric": objective_params["eval_metric"],
+        }
         try:
             callbacks = [lgb.early_stopping(early_stopping_rounds, verbose=False)] if early_stopping_rounds else []
             model.fit(x, y, callbacks=callbacks, **fit_kwargs)
@@ -393,8 +591,15 @@ def train_lightgbm(panel: pd.DataFrame, features: list[str], horizon: int = 5, t
     out = pred_sub[["code", "date", target]].copy()
     out["pred"] = pred
     metrics = _metrics(yp, pred)
+    metrics["n_train_rows_before_cap"] = n_train_rows_before_cap
+    metrics["n_train_rows"] = int(len(y))
+    metrics["max_train_rows"] = int(max_train_rows) if max_train_rows is not None else None
+    metrics["enforce_max_train_rows"] = bool(enforce_max_train_rows)
     if hasattr(model, "best_iteration_"):
         metrics["best_iteration"] = int(model.best_iteration_ or 0)
+    metrics["objective"] = objective_params["objective"]
+    if "alpha" in objective_params:
+        metrics["alpha"] = float(objective_params["alpha"])
     if decay_half_life_days:
         metrics["decay_half_life_days"] = float(decay_half_life_days)
         metrics["min_weight"] = float(min_weight)
@@ -446,13 +651,17 @@ def train_lightgbm_ranker(panel: pd.DataFrame, features: list[str], horizon: int
                           n_estimators: int = 800, learning_rate: float | None = None,
                           early_stopping_rounds: int = 50, n_jobs: int | None = None,
                           rank_bins: int = 5, eval_at: tuple[int, ...] = (3,),
-                          label_col: str | None = None, train_mask_col: str | None = None) -> TrainResult:
+                          label_col: str | None = None, train_mask_col: str | None = None,
+                          predict_end: str | None = None) -> TrainResult:
     try:
         import lightgbm as lgb
     except Exception as e:  # noqa: BLE001
         return TrainResult("lightgbm_ranker", False, f"缺少 lightgbm：{e}", {}, pd.DataFrame())
     target = label_col or f"target_ret_{horizon}d"
-    train, valid, predict_df = _split_train_valid_predict(panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
+    train, valid, predict_df = _split_train_valid_predict(
+        panel, train_end=train_end, valid_end=valid_end,
+        predict_start=predict_start, predict_end=predict_end,
+    )
     train = _apply_train_mask(train, train_mask_col)
     train_sub, x, y, group, _, _ = _rank_xy(train, features, target, n_bins=rank_bins)
     valid_sub, xv, yv, valid_group, _, yv_raw = _rank_xy(
@@ -541,6 +750,54 @@ def train_extra_trees(panel: pd.DataFrame, features: list[str], horizon: int = 5
         metrics["decay_half_life_days"] = float(decay_half_life_days)
         metrics["min_weight"] = float(min_weight)
     return TrainResult("extra_trees", True, "ok", metrics, out)
+
+
+def train_random_forest(panel: pd.DataFrame, features: list[str], horizon: int = 5,
+                        train_end: str | None = None, valid_end: str | None = None,
+                        predict_start: str | None = None,
+                        decay_half_life_days: float | None = 90.0, min_weight: float = 0.05,
+                        n_estimators: int = 120, max_train_rows: int = 300_000,
+                        label_col: str | None = None, train_mask_col: str | None = None) -> TrainResult:
+    try:
+        from sklearn.ensemble import RandomForestRegressor
+    except Exception as error:  # noqa: BLE001
+        return TrainResult("random_forest", False, f"缺少 scikit-learn：{error}", {}, pd.DataFrame())
+    target = label_col or f"target_ret_{horizon}d"
+    train, valid, predict_df = _split_train_valid_predict(
+        panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
+    train = _apply_train_mask(train, train_mask_col)
+    train_sub, x, y = _xy(train, features, target)
+    valid_sub, xv, yv = _xy(valid, features, target)
+    pred_sub, xp, yp = _predict_x(predict_df, features, target)
+    if len(y) < 50 or len(yv) == 0 or len(xp) == 0:
+        return TrainResult("random_forest", False, "训练、验证或预测样本不足", {}, pd.DataFrame())
+    sample_weight = (
+        time_decay_weights(train_sub, decay_half_life_days, min_weight=min_weight)
+        if decay_half_life_days else np.ones(len(train_sub), dtype=float)
+    )
+    if max_train_rows > 0 and len(train_sub) > max_train_rows:
+        rng = np.random.default_rng(42)
+        probability = sample_weight / sample_weight.sum()
+        idx = np.sort(rng.choice(len(train_sub), size=max_train_rows, replace=False, p=probability))
+        x, y, sample_weight = x[idx], y[idx], sample_weight[idx]
+    try:
+        model = RandomForestRegressor(
+            n_estimators=n_estimators, max_depth=12, min_samples_leaf=20,
+            max_features=0.7, bootstrap=True, n_jobs=-1, random_state=42,
+        )
+        model.fit(x, y, sample_weight=sample_weight)
+        pred = model.predict(xp)
+    except Exception as error:  # noqa: BLE001
+        return TrainResult("random_forest", False, f"random_forest 训练失败：{error}", {}, pd.DataFrame())
+    out = pred_sub[["code", "date", target]].copy()
+    out["pred"] = pred
+    metrics = _metrics(yp, pred)
+    metrics.update({"n_estimators": int(n_estimators), "n_train_rows": int(len(y)),
+                    "max_train_rows": int(max_train_rows)})
+    if decay_half_life_days:
+        metrics["decay_half_life_days"] = float(decay_half_life_days)
+        metrics["min_weight"] = float(min_weight)
+    return TrainResult("random_forest", True, "ok", metrics, out)
 
 
 def train_catboost_ranker(panel: pd.DataFrame, features: list[str], horizon: int = 5,

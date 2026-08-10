@@ -29,7 +29,7 @@ from quant.factors import engineering
 MODEL_NAME = "ridge_lightgbm_ranker_ensemble"
 # Bump when the per-window prediction computation changes in a way that invalidates
 # previously cached window outputs (see _recipe_signature / window_cache_dir).
-WINDOW_CACHE_VERSION = 1
+WINDOW_CACHE_VERSION = 2
 
 
 def _recipe_signature_payload(ignore_universe: bool, **kwargs) -> str:
@@ -72,6 +72,18 @@ def _window_month_signature(prepared_dir: Path, start: pd.Timestamp, end: pd.Tim
         st = p.stat()
         sig.append([p.name, int(st.st_size), int(st.st_mtime_ns)])
     return sig
+
+
+def _price_source_signature() -> str:
+    price_dir = Path(config.QUANT_DIR) / "price"
+    payload = []
+    if price_dir.is_dir():
+        for path in sorted(price_dir.iterdir()):
+            if path.suffix != ".parquet":
+                continue
+            stat = path.stat()
+            payload.append((path.name, int(stat.st_size), int(stat.st_mtime_ns)))
+    return hashlib.sha1(json.dumps(payload, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def _window_cache_key(prepared_dir: Path, recipe_sig: str, train_start: pd.Timestamp,
@@ -211,6 +223,10 @@ class MonthFrameCache:
 
     def stats(self) -> str:
         return f"cache_months={len(self._frames)} hits={self.hits} misses={self.misses}"
+
+
+def _purge_span(train_target_mode: str, horizon: int) -> int:
+    return int(horizon) + 1 if train_target_mode in {"open-label", "open-buyin-mask"} else int(horizon)
 
 
 def _purged_end(dates: pd.Series, boundary: pd.Timestamp, horizon: int) -> pd.Timestamp | None:
@@ -538,7 +554,14 @@ def _join_tradability(window: pd.DataFrame, horizon: int) -> pd.DataFrame:
     join 后断言 tradable_ret 命中率，防 code/date 规范化不一致导致静默丢样本。"""
     codes = sorted(window["code"].astype(str).str.zfill(6).unique())
     trad = _cached_price_tradability(codes, horizon)
-    keep = ["code", "date", f"tradable_ret_{horizon}d", "buyable_close"]
+    keep = [
+        "code",
+        "date",
+        f"tradable_ret_{horizon}d",
+        f"open_ret_{horizon}d",
+        "buyable_close",
+        "buyable_next",
+    ]
     keep = [c for c in keep if c in trad.columns]
     if trad.empty or len(keep) <= 2:
         raise RuntimeError(
@@ -560,6 +583,12 @@ def _join_tradability(window: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return out
 
 
+def _reject_unsafe_factors(factors: list[str], context: str) -> None:
+    unsafe = sorted({factor for factor in factors if engineering.is_forbidden_feature(factor)})
+    if unsafe:
+        raise RuntimeError(f"unsafe future-label factors in {context}: {unsafe}")
+
+
 def _selected_factors(selection_name: str, prepared_dir: Path, horizon: int) -> list[str]:
     sel = warehouse.load(selection_name)
     selected = sel["factor"].astype(str).tolist() if not sel.empty and "factor" in sel.columns else []
@@ -569,9 +598,10 @@ def _selected_factors(selection_name: str, prepared_dir: Path, horizon: int) -> 
     sample = pd.read_parquet(files[0])
     available = set(engineering.feature_columns(sample, horizon))
     factors = [f for f in selected if f in available]
-    if factors:
-        return factors
-    return [f for f in engineering.feature_columns(sample, horizon) if f in available]
+    if not factors:
+        factors = [f for f in engineering.feature_columns(sample, horizon) if f in available]
+    _reject_unsafe_factors(factors, "selected factor manifest")
+    return factors
 
 
 def train_batched(name: str, output_prefix: str, selection_name: str, horizon: int,
@@ -596,14 +626,36 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                   extra_trees_max_train_rows: int = 300_000,
                   window_cache_dir: str | None = None,
                   universe_file: str | None = None,
-                  train_target_mode: str = "baseline") -> pd.DataFrame:
+                  train_target_mode: str = "baseline",
+                  extra_trees_weight: float = 0.0,
+                  random_forest: bool = False, random_forest_estimators: int = 120,
+                  random_forest_max_train_rows: int = 300_000,
+                  random_forest_weight: float = 0.0) -> pd.DataFrame:
     _, _, prepared_dir = _panel_dirs(name)
-    if train_target_mode not in ("baseline", "buyin-mask", "tradable-label"):
+    if train_target_mode not in (
+        "baseline",
+        "buyin-mask",
+        "tradable-label",
+        "open-label",
+        "open-buyin-mask",
+    ):
         raise ValueError(f"unknown train_target_mode: {train_target_mode}")
     # A/B 训练口径：baseline=现役（target_ret 标签、全样本）；
     #   buyin-mask=剔训练段封涨停买入日；tradable-label=用跌停顺延后的可实现收益作标签。
-    ab_label_col = f"tradable_ret_{horizon}d" if train_target_mode == "tradable-label" else None
-    ab_mask_col = "buyable_close" if train_target_mode == "buyin-mask" else None
+    ab_label_col = (
+        f"tradable_ret_{horizon}d"
+        if train_target_mode == "tradable-label"
+        else f"open_ret_{horizon}d"
+        if train_target_mode in {"open-label", "open-buyin-mask"}
+        else None
+    )
+    ab_mask_col = (
+        "buyable_close"
+        if train_target_mode == "buyin-mask"
+        else "buyable_next"
+        if train_target_mode == "open-buyin-mask"
+        else None
+    )
     universe_codes: set[str] | None = None
     if universe_file:
         with open(universe_file, encoding="utf-8") as f:
@@ -656,6 +708,10 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             catboost_max_train_rows=catboost_max_train_rows, extra_trees=extra_trees,
             extra_trees_estimators=extra_trees_estimators,
             extra_trees_max_train_rows=extra_trees_max_train_rows,
+            extra_trees_weight=extra_trees_weight,
+            random_forest=random_forest, random_forest_estimators=random_forest_estimators,
+            random_forest_max_train_rows=random_forest_max_train_rows,
+            random_forest_weight=random_forest_weight,
             purge_horizon=purge_horizon, expanding_train=expanding_train,
             rolling_factor_select=rolling_factor_select, rolling_top_factors=rolling_top_factors,
             max_factor_ic_corr=max_factor_ic_corr,
@@ -664,6 +720,7 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         # 仅当非 baseline 时才注入 A/B 字段，保证 baseline 腿 recipe 哈希与现役完全一致（复用既有缓存）。
         if train_target_mode != "baseline":
             recipe_params["train_target_mode"] = train_target_mode
+            recipe_params["price_source_signature"] = _price_source_signature()
         recipe_sig = _recipe_signature(**recipe_params)
         legacy_recipe_sig = _legacy_recipe_signature(**recipe_params)
         cache_dir = Path(window_cache_dir)
@@ -746,8 +803,10 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         if train_target_mode != "baseline" and not window.empty:
             window = _join_tradability(window, horizon)
         factors_in_window = [f for f in factors if f in window.columns]
-        train_end_ts = _purged_end(window["date"], valid_start, horizon) if purge_horizon else valid_start - pd.Timedelta(days=1)
-        valid_end_ts = _purged_end(window["date"], current, horizon) if purge_horizon else current - pd.Timedelta(days=1)
+        _reject_unsafe_factors(factors_in_window, f"training window {windows}")
+        purge_span = _purge_span(train_target_mode, horizon)
+        train_end_ts = _purged_end(window["date"], valid_start, purge_span) if purge_horizon else valid_start - pd.Timedelta(days=1)
+        valid_end_ts = _purged_end(window["date"], current, purge_span) if purge_horizon else current - pd.Timedelta(days=1)
         if train_end_ts is None or valid_end_ts is None or valid_end_ts < valid_start:
             print(f"[train] window={windows} skipped: purge leaves insufficient train/valid dates", flush=True)
             windows += 1
@@ -765,6 +824,7 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             )
             if picked:
                 factors_in_window = picked
+            _reject_unsafe_factors(factors_in_window, f"rolling selection window {windows}")
             if not audit.empty:
                 audit = audit.copy()
                 audit.insert(0, "window", windows)
@@ -911,6 +971,20 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             print(f"[train:timing] window={windows} stage=extra_trees "
                   f"seconds={time.perf_counter() - stage_started:.2f} ok={extra_trees_res.ok}", flush=True)
             stage_started = time.perf_counter()
+        random_forest_res = None
+        if random_forest:
+            random_forest_res = qmodel.train_random_forest(
+                model_window, factors_in_window, horizon=horizon,
+                train_end=train_end, valid_end=valid_end,
+                predict_start=current.strftime("%Y-%m-%d"),
+                decay_half_life_days=decay_half_life_days, min_weight=min_weight,
+                n_estimators=random_forest_estimators,
+                max_train_rows=random_forest_max_train_rows,
+                label_col=ab_label_col, train_mask_col=ab_mask_col,
+            )
+            print(f"[train:timing] window={windows} stage=random_forest "
+                  f"seconds={time.perf_counter() - stage_started:.2f} ok={random_forest_res.ok}", flush=True)
+            stage_started = time.perf_counter()
         catboost_res = None
         if catboost_ranker:
             catboost_res = qmodel.train_catboost_ranker(
@@ -979,6 +1053,12 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                         on=["code", "date"],
                         how="left",
                     )
+                if random_forest and random_forest_res and random_forest_res.ok and not random_forest_res.predictions.empty:
+                    fp = random_forest_res.predictions[(random_forest_res.predictions["date"] >= current) & (random_forest_res.predictions["date"] < test_end)].copy()
+                    p = p.merge(
+                        fp[["code", "date", "pred"]].rename(columns={"pred": "random_forest_pred"}),
+                        on=["code", "date"], how="left",
+                    )
                 if catboost_ranker and catboost_res and catboost_res.ok and not catboost_res.predictions.empty:
                     cp = catboost_res.predictions[(catboost_res.predictions["date"] >= current) & (catboost_res.predictions["date"] < test_end)].copy()
                     p = p.merge(
@@ -1004,6 +1084,11 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                     p["elastic_z"] = p.groupby("date")["elastic_pred"].transform(_daily_zscore)
                 if extra_trees and "extra_trees_pred" in p.columns and p["extra_trees_pred"].notna().any():
                     p["extra_trees_z"] = p.groupby("date")["extra_trees_pred"].transform(_daily_zscore)
+                    p["pred"] = p["pred"] + float(extra_trees_weight) * p["extra_trees_z"].fillna(0.0)
+                if random_forest and "random_forest_pred" in p.columns and p["random_forest_pred"].notna().any():
+                    p["random_forest_z"] = p.groupby("date")["random_forest_pred"].transform(_daily_zscore)
+                    p["pred"] = ((1.0 - float(random_forest_weight)) * p["ridge_z"]
+                                 + float(random_forest_weight) * p["random_forest_z"].fillna(0.0))
                 if catboost_ranker and "catboost_pred" in p.columns and p["catboost_pred"].notna().any():
                     p["catboost_z"] = p.groupby("date")["catboost_pred"].transform(_daily_zscore)
                 if rank_vote_weight and "rank_vote_pred" in p.columns and p["rank_vote_pred"].notna().any():
@@ -1016,15 +1101,23 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                 # A/B：把可交易列并进预测输出，令训练内 portfolio 与统一评测同口径（baseline 无这些列，自动跳过）。
                 # 关键：tradable-label 腿的标签列名就是 tradable_ret_{h}d，此时 p 已带该列（来自模型预测输出）。
                 # 若不排除，merge 会因列名撞车加 _x/_y 后缀，导致下游 p[keep_cols] 找不到 tradable_ret_{h}d 而 KeyError。
-                ab_cols = [c for c in (f"tradable_ret_{horizon}d", "buyable_close")
-                           if c in model_window.columns and c not in p.columns]
+                ab_cols = [
+                    column
+                    for column in (
+                        f"tradable_ret_{horizon}d",
+                        f"open_ret_{horizon}d",
+                        "buyable_close",
+                        "buyable_next",
+                    )
+                    if column in model_window.columns and column not in p.columns
+                ]
                 if ab_cols:
                     p = p.merge(model_window[["code", "date"] + ab_cols].drop_duplicates(["code", "date"]), on=["code", "date"], how="left")
                 # tradable-label 腿的标签列被改名为 tradable_ret_{h}d（model.py 用 label_col 命名输出列），
                 # 此时预测输出里没有 target_ret_{h}d。这里用该腿实际的标签列名，避免 KeyError。
                 label_out_col = ab_label_col or target
                 keep_cols = ["code", "date", label_out_col, "pred", "model", "ridge_pred", "lgbm_pred"]
-                keep_cols.extend([c for c in ("ic_pred", "base_pred", "ic_z", "elastic_pred", "elastic_z", "extra_trees_pred", "extra_trees_z", "catboost_pred", "catboost_z", "rank_vote_pred", "rank_vote_z") if c in p.columns])
+                keep_cols.extend([c for c in ("ic_pred", "base_pred", "ic_z", "elastic_pred", "elastic_z", "extra_trees_pred", "extra_trees_z", "random_forest_pred", "random_forest_z", "catboost_pred", "catboost_z", "rank_vote_pred", "rank_vote_z") if c in p.columns])
                 keep_cols.extend([c for c in side_cols if c in p.columns])
                 keep_cols.extend([c for c in ab_cols if c in p.columns])
                 # 去重保序：tradable-label 模式下 label_out_col 就是 tradable_ret_{h}d，与 ab_cols 重列时去重。
@@ -1096,6 +1189,11 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
     summary["extra_trees"] = bool(extra_trees)
     summary["extra_trees_estimators"] = int(extra_trees_estimators) if extra_trees else None
     summary["extra_trees_max_train_rows"] = int(extra_trees_max_train_rows) if extra_trees else None
+    summary["extra_trees_weight"] = float(extra_trees_weight) if extra_trees else 0.0
+    summary["random_forest"] = bool(random_forest)
+    summary["random_forest_estimators"] = int(random_forest_estimators) if random_forest else None
+    summary["random_forest_max_train_rows"] = int(random_forest_max_train_rows) if random_forest else None
+    summary["random_forest_weight"] = float(random_forest_weight) if random_forest else 0.0
     summary["n_predictions"] = len(pred)
     summary_df = pd.DataFrame([{"model": MODEL_NAME, **summary}])
 
@@ -1162,13 +1260,19 @@ def main() -> None:
     ap.add_argument("--extra-trees", action="store_true", help="train an ExtraTrees shadow leg")
     ap.add_argument("--extra-trees-estimators", type=int, default=120)
     ap.add_argument("--extra-trees-max-train-rows", type=int, default=300000)
+    ap.add_argument("--extra-trees-weight", type=float, default=0.0)
+    ap.add_argument("--random-forest", action="store_true", help="train a RandomForest regression leg")
+    ap.add_argument("--random-forest-estimators", type=int, default=120)
+    ap.add_argument("--random-forest-max-train-rows", type=int, default=300000)
+    ap.add_argument("--random-forest-weight", type=float, default=0.0)
     ap.add_argument("--window-cache-dir", default=None,
                     help="cache per-window predictions keyed by recipe + month-file signature; "
                          "unchanged historical windows are reused so only the refreshed tail is recomputed")
     ap.add_argument("--train-target-mode", default="baseline",
-                    choices=["baseline", "buyin-mask", "tradable-label"],
-                    help="A/B 训练目标口径：baseline=现役(target_ret 标签、全样本)；"
-                         "buyin-mask=剔训练段封涨停买入日；tradable-label=用跌停顺延可实现收益作标签")
+                     choices=["baseline", "buyin-mask", "tradable-label", "open-label", "open-buyin-mask"],
+                     help="训练目标口径：baseline=收盘到收盘；buyin-mask=收盘买入可买性掩码；"
+                          "tradable-label=收盘可实现收益；open-label=次日开盘执行收益；"
+                          "open-buyin-mask=次日开盘收益并剔除次日不可买样本")
     args = ap.parse_args()
 
     config.ensure_dirs()
@@ -1225,6 +1329,11 @@ def main() -> None:
         extra_trees=args.extra_trees,
         extra_trees_estimators=args.extra_trees_estimators,
         extra_trees_max_train_rows=args.extra_trees_max_train_rows,
+        extra_trees_weight=args.extra_trees_weight,
+        random_forest=args.random_forest,
+        random_forest_estimators=args.random_forest_estimators,
+        random_forest_max_train_rows=args.random_forest_max_train_rows,
+        random_forest_weight=args.random_forest_weight,
         window_cache_dir=args.window_cache_dir,
         universe_file=args.universe_file or None,
         train_target_mode=args.train_target_mode,
