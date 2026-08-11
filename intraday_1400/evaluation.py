@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -34,14 +35,33 @@ def _bootstrap_ci(values: pd.Series, samples: int = 1000, seed: int = 42) -> lis
     return [float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))]
 
 
-def _metrics(selected: pd.DataFrame, gross_column: str, cost: float) -> dict:
+def _metrics(selected: pd.DataFrame, gross_column: str, cost: float, rebalance_stride: int = 1) -> dict:
     evaluated = selected.copy()
-    missing_targets = int(evaluated[gross_column].isna().sum())
+    observed_column = next(
+        (column for column in ("target_outcome_observed_t1", "outcome_observed") if column in evaluated),
+        None,
+    )
+    observed = (
+        evaluated[observed_column].fillna(False).astype(bool)
+        if observed_column else pd.Series(True, index=evaluated.index)
+    )
+    buyable = (
+        evaluated["entry_buyable"].fillna(False).astype(bool)
+        if "entry_buyable" in evaluated else pd.Series(True, index=evaluated.index)
+    )
+    immature = buyable & ~observed
+    immature_targets = int(immature.sum())
+    evaluated = evaluated[~immature].copy()
+    buyable = buyable[~immature]
+    missing_targets = int((buyable & evaluated[gross_column].isna()).sum())
     unsellable_return = float(
         os.environ.get("INTRADAY_1400_UNSELLABLE_RETURN", "-0.10") or -0.10
     )
-    evaluated[gross_column] = evaluated[gross_column].fillna(unsellable_return + float(cost))
-    daily = evaluated.groupby("date")[gross_column].mean() - float(cost)
+    evaluated.loc[~buyable, gross_column] = float(cost)
+    unsellable = buyable & evaluated[gross_column].isna()
+    evaluated.loc[unsellable, gross_column] = unsellable_return + float(cost)
+    daily = (evaluated.groupby("date")[gross_column].mean() - float(cost)).dropna()
+    daily = daily.iloc[::max(int(rebalance_stride), 1)]
     if daily.empty:
         return {"days": 0}
     std = float(daily.std())
@@ -57,8 +77,90 @@ def _metrics(selected: pd.DataFrame, gross_column: str, cost: float) -> dict:
         "turnover": _daily_turnover(evaluated),
         "mean_names": float(evaluated.groupby("date")["code"].nunique().mean()),
         "missing_targets": missing_targets,
+        "immature_targets": immature_targets,
         "unsellable_return": unsellable_return,
     }
+
+
+def _mean_return_only(
+    selected: pd.DataFrame,
+    gross_column: str,
+    cost: float,
+    rebalance_stride: int = 1,
+) -> float:
+    """Compute one control sample mean without bootstrap or auxiliary metrics."""
+    evaluated = selected.copy()
+    observed_column = next(
+        (column for column in ("target_outcome_observed_t1", "outcome_observed") if column in evaluated),
+        None,
+    )
+    observed = (
+        evaluated[observed_column].fillna(False).astype(bool)
+        if observed_column else pd.Series(True, index=evaluated.index)
+    )
+    buyable = (
+        evaluated["entry_buyable"].fillna(False).astype(bool)
+        if "entry_buyable" in evaluated else pd.Series(True, index=evaluated.index)
+    )
+    immature = buyable & ~observed
+    evaluated = evaluated[~immature].copy()
+    buyable = buyable[~immature]
+    if evaluated.empty:
+        return float("nan")
+    evaluated.loc[~buyable, gross_column] = float(cost)
+    unsellable_return = float(
+        os.environ.get("INTRADAY_1400_UNSELLABLE_RETURN", "-0.10") or -0.10
+    )
+    unsellable = buyable & evaluated[gross_column].isna()
+    evaluated.loc[unsellable, gross_column] = unsellable_return + float(cost)
+    daily = (evaluated.groupby("date")[gross_column].mean() - float(cost)).dropna()
+    daily = daily.iloc[::max(int(rebalance_stride), 1)]
+    return float(daily.mean()) if not daily.empty else float("nan")
+
+
+_CONTROL_FRAME: pd.DataFrame | None = None
+_CONTROL_GROSS_COLUMNS: dict[str, str] = {}
+_CONTROL_COSTS: tuple[float, ...] = ()
+_CONTROL_REBALANCE_STRIDE = 1
+
+
+def _init_control_worker(
+    frame: pd.DataFrame,
+    gross_columns: dict[str, str],
+    costs: tuple[float, ...],
+    rebalance_stride: int,
+) -> None:
+    global _CONTROL_FRAME, _CONTROL_GROSS_COLUMNS, _CONTROL_COSTS, _CONTROL_REBALANCE_STRIDE
+    _CONTROL_FRAME = frame
+    _CONTROL_GROSS_COLUMNS = gross_columns
+    _CONTROL_COSTS = costs
+    _CONTROL_REBALANCE_STRIDE = max(int(rebalance_stride), 1)
+
+
+def _control_seed_worker(args: tuple[int, int]) -> dict[tuple[int, str, float, str], float]:
+    top_n, seed = args
+    if _CONTROL_FRAME is None:
+        raise RuntimeError("control worker was not initialized")
+    controlled = _CONTROL_FRAME.copy()
+    rng = np.random.default_rng(int(seed))
+    controlled["random_score"] = rng.random(len(controlled))
+    controlled["shuffled_score"] = controlled.groupby("date")["score"].transform(
+        lambda values: rng.permutation(values.to_numpy())
+    )
+    random_rank = controlled.groupby("date")["random_score"].rank(method="first", ascending=False)
+    shuffled_rank = controlled.groupby("date")["shuffled_score"].rank(method="first", ascending=False)
+    selected = {
+        "random_topn": controlled[random_rank <= int(top_n)],
+        "score_shuffle": controlled[shuffled_rank <= int(top_n)],
+    }
+    output: dict[tuple[int, str, float, str], float] = {}
+    for target, gross_column in _CONTROL_GROSS_COLUMNS.items():
+        for cost in _CONTROL_COSTS:
+            for kind, frame in selected.items():
+                output[(int(top_n), target, cost, kind)] = _mean_return_only(
+                    frame, gross_column, cost, _CONTROL_REBALANCE_STRIDE,
+                )
+    return output
 
 
 def _load_labels() -> tuple[pd.DataFrame, dict]:
@@ -84,9 +186,7 @@ def _load_labels() -> tuple[pd.DataFrame, dict]:
         gross_column = f"gross__{target}"
         labels[gross_column] = labels[target] + embedded_cost
         gross_columns[target] = gross_column
-    labels = labels[labels["entry_buyable"].fillna(False)].drop_duplicates(
-        ["code", "date"], keep="last"
-    )
+    labels = labels.drop_duplicates(["code", "date"], keep="last")
     return labels, {"embedded_cost": embedded_cost, "gross_columns": gross_columns}
 
 
@@ -132,6 +232,84 @@ def _evaluate_source(
     return source_report
 
 
+def _distribution_summary(values: list[float]) -> dict:
+    clean = np.asarray([value for value in values if np.isfinite(value)], dtype=float)
+    if not len(clean):
+        return {"samples": 0}
+    return {
+        "samples": int(len(clean)),
+        "mean": float(clean.mean()),
+        "median": float(np.median(clean)),
+        "p025": float(np.quantile(clean, 0.025)),
+        "p975": float(np.quantile(clean, 0.975)),
+    }
+
+
+def _evaluate_negative_controls(
+    labels: pd.DataFrame,
+    predictions: pd.DataFrame,
+    top_values: tuple[int, ...],
+    costs: tuple[float, ...],
+    metadata: dict,
+    samples: int = 200,
+    seed: int = 42,
+    workers: int = 1,
+    rebalance_stride: int = 1,
+) -> dict:
+    merged = labels.merge(predictions, on=["code", "date"], how="inner", validate="one_to_one")
+    report = {
+        "samples": int(samples),
+        "seed": int(seed),
+        "rebalance_stride": max(int(rebalance_stride), 1),
+        "overlap_rows": int(len(merged)),
+        "overlap_days": int(merged["date"].nunique()),
+        "market_equal_weight": {},
+        "top": {},
+    }
+    for target, gross_column in metadata["gross_columns"].items():
+        report["market_equal_weight"][target] = {
+            f"cost_{int(round(cost * 10000))}bp": _metrics(
+                merged, gross_column, cost, rebalance_stride,
+            )
+            for cost in costs
+        }
+    worker_count = max(int(workers), 1)
+    report["workers"] = worker_count
+    jobs = [
+        (int(top_n), int(seed) + index)
+        for top_n in top_values
+        for index in range(max(int(samples), 0))
+    ]
+    if worker_count > 1 and jobs:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_init_control_worker,
+            initargs=(merged, metadata["gross_columns"], costs, rebalance_stride),
+        ) as pool:
+            results = list(pool.map(_control_seed_worker, jobs, chunksize=1))
+    else:
+        _init_control_worker(merged, metadata["gross_columns"], costs, rebalance_stride)
+        results = [_control_seed_worker(job) for job in jobs]
+    for top_n in top_values:
+        report["top"][str(top_n)] = {
+            target: {
+                f"cost_{int(round(cost * 10000))}bp": {
+                    "random_topn": _distribution_summary([
+                        result[(int(top_n), target, cost, "random_topn")] for result in results
+                        if (int(top_n), target, cost, "random_topn") in result
+                    ]),
+                    "score_shuffle": _distribution_summary([
+                        result[(int(top_n), target, cost, "score_shuffle")] for result in results
+                        if (int(top_n), target, cost, "score_shuffle") in result
+                    ]),
+                }
+                for cost in costs
+            }
+            for target in metadata["gross_columns"]
+        }
+    return report
+
+
 def _common_labels(labels: pd.DataFrame, predictions: dict[str, pd.DataFrame]) -> pd.DataFrame:
     keys = labels[["code", "date"]].drop_duplicates()
     for frame in predictions.values():
@@ -142,6 +320,9 @@ def _common_labels(labels: pd.DataFrame, predictions: dict[str, pd.DataFrame]) -
 def evaluate(
     top_values: tuple[int, ...] = (5, 10, 20, 30),
     costs: tuple[float, ...] = (0.0, 0.001, 0.002, 0.003),
+    control_samples: int = 200,
+    control_seed: int = 42,
+    control_workers: int = 1,
 ) -> dict:
     labels, metadata = _load_labels()
     manifest_path = config.MODEL_DIR / "intraday_1400_shadow_manifest.json"
@@ -169,6 +350,7 @@ def evaluate(
         "top_values": list(top_values),
         "sources": {},
         "common_universe": {},
+        "negative_controls": {},
         **metadata,
     }
     loaded: dict[str, pd.DataFrame] = {}
@@ -205,6 +387,21 @@ def evaluate(
                 common, loaded[name], path, causal, top_values, costs, metadata,
             )
         report["common_universe"][group_name] = group_report
+    causal_names = ["asof_base", "asof_plus_intraday"]
+    if all(name in loaded for name in causal_names):
+        causal_common = _common_labels(labels, {name: loaded[name] for name in causal_names})
+        report["negative_controls"] = _evaluate_negative_controls(
+            causal_common,
+            loaded["asof_plus_intraday"],
+            top_values,
+            costs,
+            metadata,
+            samples=control_samples,
+            seed=control_seed,
+            workers=control_workers,
+        )
+    else:
+        report["negative_controls"] = {"available": False, "sources": causal_names}
     atomic_json(report, config.REPORT_DIR / "fair_daily_topn_evaluation.json")
     print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
     return report
@@ -214,10 +411,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fair daily TopN evaluation for intraday 14:00 models")
     parser.add_argument("--top", default="5,10,20,30")
     parser.add_argument("--costs-bp", default="0,10,20,30")
+    parser.add_argument("--control-samples", type=int, default=200)
+    parser.add_argument("--control-seed", type=int, default=42)
+    parser.add_argument("--control-workers", type=int, default=1)
     args = parser.parse_args()
     top_values = tuple(int(value) for value in args.top.split(",") if int(value) > 0)
     costs = tuple(float(value) / 10000.0 for value in args.costs_bp.split(","))
-    evaluate(top_values, costs)
+    evaluate(top_values, costs, args.control_samples, args.control_seed, args.control_workers)
 
 
 if __name__ == "__main__":

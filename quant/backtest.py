@@ -13,9 +13,9 @@ from quant import model as qmodel
 
 
 # ------------------------- 回测成交口径（可用环境变量切换） -------------------------
-# 默认口径：按当日收盘价成交、忽略成本、含可交易性摩擦（涨停封板当日买不进、
-# 跌停封板顺延到下一可卖日收盘卖出）。这是「尾盘 T 买、T+1 卖」的贴近实盘口径。
-# 如需复现旧的乐观口径（不理会涨跌停），设 QUANT_BT_FILTER_UNTRADABLE=0。
+# 默认口径：按当日收盘价成交、计入 20bp 双边成本、含可交易性摩擦（涨停封板当日买不进、
+# 跌停封板顺延到下一可卖日收盘卖出）。这是「尾盘 T 买、T+1 卖」的严格研究口径。
+# 如需复现旧的乐观口径（不理会涨跌停或忽略成本），必须显式传入参数或环境变量。
 # 其它开关：
 #   QUANT_BT_FILL=next_open          # 次日开盘成交（此时用 open_ret + buyable_next）
 #   QUANT_BT_COST_ROUNDTRIP=0.003    # 双边综合成本(佣金+印花税+滑点)
@@ -37,9 +37,9 @@ def bt_sell_roll_max_days() -> int:
 
 def bt_cost_roundtrip() -> float:
     try:
-        return float(os.environ.get("QUANT_BT_COST_ROUNDTRIP", "0") or 0.0)
+        return float(os.environ.get("QUANT_BT_COST_ROUNDTRIP", "0.002") or 0.002)
     except Exception:  # noqa: BLE001
-        return 0.0
+        return 0.002
 
 
 def _max_drawdown(nav: pd.Series) -> float:
@@ -56,14 +56,16 @@ def evaluate_returns(ret: pd.Series, periods_per_year: int = 252) -> dict:
         return {}
     ret = ret.clip(lower=-0.99)
     nav = (1 + ret).cumprod()
-    ann = nav.iloc[-1] ** (periods_per_year / max(len(ret), 1)) - 1 if nav.iloc[-1] > 0 else np.nan
-    vol = ret.std() * np.sqrt(periods_per_year)
+    annual_return = nav.iloc[-1] ** (periods_per_year / max(len(ret), 1)) - 1 if nav.iloc[-1] > 0 else np.nan
+    annual_vol = ret.std() * np.sqrt(periods_per_year)
+    # Sharpe uses arithmetic mean excess return, not compounded annual return.
+    sharpe = ret.mean() / ret.std() * np.sqrt(periods_per_year) if ret.std() > 0 else None
     return {
         "periods": int(len(ret)),
         "total_return": float(nav.iloc[-1] - 1),
-        "annual_return": float(ann) if np.isfinite(ann) else None,
-        "annual_vol": float(vol),
-        "sharpe": float(ann / vol) if vol and np.isfinite(vol) and np.isfinite(ann) else None,
+        "annual_return": float(annual_return) if np.isfinite(annual_return) else None,
+        "annual_vol": float(annual_vol),
+        "sharpe": float(sharpe) if sharpe is not None and np.isfinite(sharpe) else None,
         "max_drawdown": _max_drawdown(nav),
         "win_rate": float((ret > 0).mean()),
     }
@@ -85,16 +87,19 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
                                rule_weight: float = 0.0, min_rule_score: float | None = None,
                                ridge_quantile: float | None = None,
                                use_open_fill: bool | None = None, filter_untradable: bool | None = None,
-                               cost_roundtrip: float | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+                               cost_roundtrip: float | None = None, no_refill: bool = False,
+                               require_tradability: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     """由每日预测构建组合并计算收益。
 
-    成交口径由参数或环境变量决定（默认：当日收盘成交、无成本、不过滤涨停/停牌）：
+    成交口径由参数或环境变量决定（默认：当日收盘成交、20bp 双边成本、过滤涨停/停牌）：
     - use_open_fill=True 且存在 ``open_ret_{h}d`` 列时，用「T+1 开盘买入、T+1+h 开盘卖出」的收益；
       收盘口径下若 filter_untradable=True 且存在 ``tradable_ret_{h}d`` 列，用跌停顺延后的实现收益，
       否则用 ``target_ret_{h}d``（信号日收盘→h日后收盘，乐观口径）。
     - filter_untradable=True 时剔除买不进的候选：next_open 口径看 ``buyable_next``（次日一字涨停），
-      收盘口径看 ``buyable_close``（当日涨停封板/一字涨停）。
-    - cost_roundtrip：单次调仓双边综合成本，按当期换手比例计提；0 表示忽略成本。
+      收盘口径看 ``buyable_close``（当日涨停封板/一字涨停）；缺列直接报错。
+    - no_refill=True 时先按预测分数取固定 TopN，再将不可成交名额记为现金，绝不从候选池回填。
+    - require_tradability=True 时，严格要求买入资格列存在；研究诊断不得把缺列结果标成严格口径。
+    - cost_roundtrip：单次调仓双边综合成本，按当期换手比例计提；默认 20bp。
     """
     if use_open_fill is None:
         use_open_fill = bt_use_open_fill()
@@ -112,8 +117,11 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
     else:
         ret_col = target
     buy_col = "buyable_next" if use_open_fill else "buyable_close"
-    if buy_col not in pred.columns and "buyable_next" in pred.columns:
-        buy_col = "buyable_next"
+    if require_tradability and filter_untradable and buy_col not in pred.columns:
+        raise ValueError(
+            f"严格可交易回测缺少 {buy_col}；请先从价格面板补齐可交易列，"
+            "不能静默降级到乐观口径"
+        )
     holdings = []
     returns = []
     last_codes: set[str] = set()
@@ -121,8 +129,6 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
         return pd.DataFrame(), pd.DataFrame()
     for date, g in pred.dropna(subset=["pred", ret_col]).groupby("date"):
         pool = g.copy()
-        if filter_untradable and buy_col in pool.columns:
-            pool = pool[pool[buy_col].fillna(False).astype(bool)]
         if positive_only:
             pool = pool[pool["pred"] > 0]
         if pred_quantile is not None and len(pool) >= 5:
@@ -140,10 +146,25 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
             pool = pool.copy()
             pool["ensemble_pred"] = _daily_zscore(pool["pred"]) + float(rule_weight) * _daily_zscore(pool["rule_score"])
             rank_col = "ensemble_pred"
-        pick = pool.sort_values(rank_col, ascending=False).head(top_n).copy()
+        ranked = pool.sort_values(rank_col, ascending=False)
+        if no_refill:
+            # Select the fixed slots first. Unbuyable names become cash and are not replaced.
+            pick = ranked.head(top_n).copy()
+            if filter_untradable and buy_col in pick.columns:
+                pick = pick[pick[buy_col].fillna(False).astype(bool)].copy()
+        else:
+            if filter_untradable and buy_col in pool.columns:
+                pool = pool[pool[buy_col].fillna(False).astype(bool)]
+            pick = pool.sort_values(rank_col, ascending=False).head(top_n).copy()
         if pick.empty:
+            if no_refill:
+                returns.append({"date": date, "ret": 0.0, "gross_ret": 0.0, "cost": 0.0,
+                                "cash": 1.0, "turnover": 0.0 if not last_codes else 1.0,
+                                "n_holdings": 0})
+                last_codes = set()
             continue
-        w = min(1.0 / len(pick), max_weight)
+        denominator = int(top_n) if no_refill else len(pick)
+        w = min(1.0 / max(denominator, 1), max_weight)
         if w * len(pick) < 1:
             cash = 1 - w * len(pick)
         else:
@@ -321,7 +342,7 @@ def main():
                     help="回测成交口径：close=尾盘T买(默认,含可交易性摩擦)；next_open=T+1开盘买/卖。也可用环境变量 QUANT_BT_FILL")
     ap.add_argument("--no-tradable-filter", action="store_true", help="关闭可交易性口径(还原乐观：不理会涨停买不进/跌停顺延卖出)")
     ap.add_argument("--cost-roundtrip", type=float, default=bt_cost_roundtrip(),
-                    help="单次调仓双边综合成本(佣金+印花税+滑点)，按换手计提；默认0=忽略。也可用环境变量 QUANT_BT_COST_ROUNDTRIP")
+                    help="单次调仓双边综合成本(佣金+印花税+滑点)，按换手计提；默认0.002。也可用环境变量 QUANT_BT_COST_ROUNDTRIP")
     ap.add_argument("--output-prefix", default="", help="实验输出前缀，避免覆盖默认 bt_* 产物")
     args = ap.parse_args()
 

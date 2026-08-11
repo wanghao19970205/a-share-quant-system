@@ -35,8 +35,9 @@ from realtime.v4 import V4PaperTrader
 from realtime.v5 import V5PaperTrader
 from realtime.sector_etf import SectorETFContext
 from realtime.feed import subscription_code
-from realtime.reference import (RefRow, _load_expected_return,
-                                _return_model_weights, expected_return_text)
+from realtime.reference import (RefRow, _load_expected_return, _load_hold_days,
+                                _return_model_weights, expected_return_text,
+                                load_actual_holdings)
 from realtime.watchlist import load_codes
 from realtime.weight_shadow import (evaluate as evaluate_weight_shadow,
                                     run_routine as run_weight_routine,
@@ -919,7 +920,7 @@ def scenario_O():
     sector_entry = position.get("sector_etf", {})
     check(sector_entry.get("etf_code") == "512800.SH",
           "V4 持仓锁定入场行业ETF上下文，供平仓归因")
-    check(sector_entry.get("mapping_version") == "industry_etf_exact_v2" and
+    check(sector_entry.get("mapping_version") == "industry_etf_exact_v3" and
           sector_entry.get("mapping_source") == "exact_primary" and
           sector_entry.get("mapping_confidence") == 1.0 and
           sector_entry.get("stock_industry") == "股份制银行Ⅲ",
@@ -936,7 +937,8 @@ def scenario_O():
     rankboard = RankBoard(
         cfg, ctx, FakeNotifier(), {"000970": "芯片股", "000971": "银行股"}, sector)
     _, rank_body, _ = rankboard._render(rankboard._rank())
-    check("[行业:数字芯片设计 概念:芯片概念/人工智能]" in rank_body and
+    check("[细分行业:数字芯片设计/集成电路 概念:芯片概念/人工智能 "
+          "比较ETF:半导体(512480.SH)]" in rank_body and
           "先进封装" not in rank_body,
           "Top5 Push 展示主行业和最多两个概念，限制正文长度")
     check("000972" in rank_body and "行业:印制电路板" in rank_body,
@@ -1587,6 +1589,70 @@ def scenario_X():
           "预测热更新直接 exec 替换进程且不调用可能崩溃的行情 SDK stop")
 
 
+# ============================================================================
+# Y. 实际持仓只读调仓建议：与 V1-V5 模拟盘严格隔离
+# ============================================================================
+def scenario_Y():
+    print("\n== Y. 实际持仓只读调仓建议（不写模拟盘）==")
+    cfg = new_cfg()
+    root = Path(cfg.ledger_dir)
+    cfg.holdings_file = root / "realtime_holdings.txt"
+    cfg.mobile_snapshot_file = root / "missing_mobile_snapshot.json"
+    cfg.predictions_file = root / "missing_predictions.parquet"
+    cfg.universe_file = root / "missing_universe.txt"
+    cfg.max_subscribe = 100
+    cfg.sector_meta_file = root / "all_a_stock_meta.parquet"
+    cfg.sector_etf_specs = (
+        Cfg.sector_etf_specs + ";医药宽基=512010.SH:化学制剂")
+    pd.DataFrame([{
+        "code": "600664", "a_industry": "化学制剂",
+        "a_industries": "化学制剂、化学制药、医药生物",
+        "a_concepts": "流感、创新药",
+        "meta_updated_at": "2026-07-16T16:21:06+08:00",
+    }]).to_parquet(cfg.sector_meta_file, index=False)
+    cfg.holdings_file.write_text(
+        "# actual_cash=5467.81 updated=2026-08-06\n"
+        "600664 - 5800 5000 5.592 15 # 哈药股份\n"
+        "000725 - 1000 1000 8.185 20 # 京东方A\n"
+        "000021 - 100 100 38.230 5 # 深科技\n"
+        "000938 - 200 200 42.265 10 # 紫光股份\n"
+        "002149 - 1100 1100 51.551 27 # 西部材料\n",
+        encoding="utf-8")
+    today = _dt.date.today().strftime("%Y-%m-%d")
+    refs = {
+        "600664": RefRow(expected_return=0.01, prediction_date=today),
+        "000725": RefRow(expected_return=-0.01, prediction_date=today),
+        "000021": RefRow(expected_return=0.03, prediction_date=today),
+        "000938": RefRow(expected_return=-0.005, prediction_date=today),
+        "002149": RefRow(expected_return=-0.02, prediction_date=today),
+    }
+    ctx = build_ctx(refs, [
+        mk_snap("600664", 6.79), mk_snap("000725", 5.92),
+        mk_snap("000021", 39.51), mk_snap("000938", 36.93),
+        mk_snap("002149", 38.21),
+    ])
+    paper_before = Path(cfg.paper_state_file).read_bytes() if Path(
+        cfg.paper_state_file).exists() else None
+    actual_sector = SectorETFContext(cfg)
+    board = RankBoard(cfg, ctx, FakeNotifier(), {
+        code: holding.name for code, holding in load_actual_holdings(cfg).items()},
+        actual_sector)
+    advice, _ = board._actual_advice()
+    holdings = load_actual_holdings(cfg)
+    check(len(holdings) == 5 and _load_hold_days(cfg)["002149"] == 27 and
+          "600664" in load_codes(cfg),
+          "扩展实际持仓格式保留数量/成本/天数且继续进入保护性订阅")
+    check("实际持仓怎么处理" in advice and "哈药股份" in advice and
+          "西部材料" in advice and "建议卖出约" in advice and
+          "只提醒，不会自动买卖" in advice and "暂时不要补仓" in advice and
+          "细分行业:化学制剂/化学制药" in advice and
+          "走势比较:医药宽基ETF(512010.SH)" in advice and
+          "行业资料更新于07/16，可能漏掉近期热点" in advice and
+          (Path(cfg.paper_state_file).read_bytes() if Path(
+              cfg.paper_state_file).exists() else None) == paper_before,
+          "调仓 Push 给出集中度/盈亏复核且不创建或修改任何模拟盘状态")
+
+
 def main() -> int:
     print("=" * 68)
     print(" 虚拟数据流验证：实时层重排/模拟盘/出场逻辑")
@@ -1596,7 +1662,7 @@ def main() -> int:
                scenario_I, scenario_J, scenario_K, scenario_L,
                scenario_M, scenario_N, scenario_O, scenario_P, scenario_Q,
                scenario_R, scenario_S, scenario_T, scenario_U, scenario_V,
-               scenario_W, scenario_X):
+               scenario_W, scenario_X, scenario_Y):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

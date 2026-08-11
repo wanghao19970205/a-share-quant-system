@@ -10,7 +10,7 @@ from .snapshot import Snapshot
 from .strategy import Signal, _digits
 
 
-_MAPPING_VERSION = "industry_etf_exact_v2"
+_MAPPING_VERSION = "industry_etf_exact_v3"
 
 # 格式：展示名=ETF完整代码:主行业1|主行业2。这里只列能够被对应 ETF 较可靠代表的
 # 申万三级主行业；宁可 unmapped 放行，也不使用概念或宽关键词误杀候选。
@@ -19,7 +19,7 @@ _DEFAULT_SPECS = (
     "半导体材料|半导体设备|分立器件;"
     "证券=512880.SH:证券Ⅱ;"
     "银行=512800.SH:农商行Ⅲ|国有大型银行Ⅲ|城商行Ⅲ|股份制银行Ⅲ;"
-    "医药=512010.SH:中药Ⅱ|体外诊断|其他医疗服务|其他生物制品|化学制剂|"
+    "医药宽基=512010.SH:中药Ⅱ|体外诊断|其他医疗服务|其他生物制品|化学制剂|"
     "医疗研发外包|医疗耗材|医疗设备|医药流通|医院|原料药|疫苗|线下药店|"
     "血液制品|诊断服务;"
     "军工=512660.SH:军工电子Ⅱ|地面兵装Ⅱ|航天装备Ⅱ|航海装备Ⅱ|航空装备Ⅱ;"
@@ -151,7 +151,8 @@ class SectorETFContext:
             return {}
         try:
             import pandas as pd
-            columns = ["code", "a_industry", "a_industries", "a_concepts"]
+            columns = [
+                "code", "a_industry", "a_industries", "a_concepts", "meta_updated_at"]
             try:
                 df = pd.read_parquet(path, columns=columns)
             except Exception:
@@ -169,10 +170,12 @@ class SectorETFContext:
             primary = self._clean_meta(row.get("a_industry"))
             hierarchy = self._clean_meta(row.get("a_industries"))
             concepts = self._clean_meta(row.get("a_concepts"))
+            meta_updated_at = self._clean_meta(row.get("meta_updated_at"))
             self._stock_meta[code] = {
                 "stock_industry": primary,
                 "stock_industries": hierarchy,
                 "stock_concepts": concepts,
+                "stock_meta_updated_at": meta_updated_at,
             }
             spec = self._by_primary_industry.get(primary)
             if spec is not None:
@@ -264,7 +267,8 @@ class SectorETFContext:
         digits = _digits(code)
         spec = self._stock_map.get(digits)
         meta = self._stock_meta.get(digits, {
-            "stock_industry": "", "stock_industries": "", "stock_concepts": ""})
+            "stock_industry": "", "stock_industries": "", "stock_concepts": "",
+            "stock_meta_updated_at": ""})
         mapping = {
             "mapping_version": self.mapping_version,
             "mapping_source": "exact_primary" if spec is not None else "unmapped",

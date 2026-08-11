@@ -613,23 +613,34 @@ def zscore_cross_section(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 def neutralize_cross_section(df: pd.DataFrame, cols: list[str], neutral_cols: list[str] | None = None) -> pd.DataFrame:
     """按交易日做线性中性化。默认用 log_mv_total，若有 industry 列也会加入行业哑变量。"""
     neutral_cols = neutral_cols or (["log_mv_total"] if "log_mv_total" in df.columns else [])
+    neutral_cols = [c for c in neutral_cols if c in df.columns]
     out = df.copy()
+    for c in cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float)
     if not neutral_cols and "industry" not in out.columns:
         return out
     for _, idx in out.groupby("date").groups.items():
         g = out.loc[idx]
-        xs = []
-        if neutral_cols:
-            xs.append(g[neutral_cols].apply(pd.to_numeric, errors="coerce"))
-        if "industry" in g.columns:
-            xs.append(pd.get_dummies(g["industry"], prefix="ind", dummy_na=True, dtype=float))
-        if not xs:
+        if not neutral_cols and "industry" not in g.columns:
             continue
-        x = pd.concat(xs, axis=1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        x.insert(0, "const", 1.0)
-        xmat = x.to_numpy(dtype=float)
+        industry = (
+            pd.get_dummies(g["industry"], prefix="ind", dummy_na=True, dtype=float)
+            if "industry" in g.columns else None
+        )
         for c in cols:
             y = pd.to_numeric(g[c], errors="coerce").to_numpy(dtype=float)
+            regressors = [n for n in neutral_cols if n != c]
+            design_parts = []
+            if regressors:
+                design_parts.append(g[regressors].apply(pd.to_numeric, errors="coerce"))
+            if industry is not None:
+                design_parts.append(industry)
+            if not design_parts:
+                continue
+            x = pd.concat(design_parts, axis=1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            x.insert(0, "const", 1.0)
+            xmat = x.to_numpy(dtype=float)
             ok = np.isfinite(y)
             if ok.sum() <= xmat.shape[1] + 2:
                 continue

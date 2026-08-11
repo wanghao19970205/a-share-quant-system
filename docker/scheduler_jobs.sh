@@ -45,6 +45,16 @@ MONTH_CACHE_SIZE="${MONTH_CACHE_SIZE:-64}"
 TRAIN_MONTHS="${TRAIN_MONTHS:-36}"
 
 job="${1:-}"
+# Keep realtime watchdog self-healing available while research disables other schedules.
+case "$job" in
+  intraday-1400-*|realtime) ;;
+  *)
+    if [ "${SCHEDULER_DISABLED:-0}" = "1" ]; then
+        clog "SKIP   job=$job reason=scheduler-disabled"
+        exit 0
+    fi
+    ;;
+esac
 job_started_epoch=$(date +%s)
 job_started_at=$(ts)
 job_end_logged=0
@@ -87,6 +97,23 @@ run_job() {
     echo "[$(ts)] done $label rc=$rc duration_sec=$stage_duration_sec duration=$stage_duration" >> "$out"
     clog "STAGE  job=$job stage=$label rc=$rc duration_sec=$stage_duration_sec duration=$stage_duration"
     return "$rc"
+}
+
+# SDK collector retry is process-level and strictly sequential. A failed process exits first,
+# then waits so the server can release its one session before checkpoint resume logs in again.
+run_job_with_retries() {
+    label="$1"; out="$2"; err="$3"; max_attempts="$4"; delay="$5"; shift 5
+    attempt=1
+    while [ "$attempt" -le "$max_attempts" ]; do
+        run_job "$label-attempt-$attempt" "$out" "$err" "$@"
+        retry_rc=$?
+        [ "$retry_rc" -eq 0 ] && return 0
+        [ "$attempt" -ge "$max_attempts" ] && return "$retry_rc"
+        echo "[$(ts)] retry $label after ${delay}s; checkpoint resume, no overlapping SDK login" >> "$out"
+        sleep "$delay"
+        attempt=$((attempt + 1))
+    done
+    return 1
 }
 
 acquire_quant_lock() {
@@ -193,6 +220,116 @@ case "$job" in
             --promotion-max-drawdown-worsening 0.02 \
             --month-cache-size "$MONTH_CACHE_SIZE" \
             --snapshot-dir "$SNAPSHOT_DIR"
+    ;;
+  intraday-1400-benchmark)
+    acquire_quant_lock
+    BENCHMARK_DATE="${INTRADAY_1400_BENCHMARK_DATE:-20260701}"
+    run_job intraday-1400-benchmark \
+      "$LOG_DIR/intraday-1400-benchmark.out.log" \
+      "$LOG_DIR/intraday-1400-benchmark.err.log" \
+      python -m intraday_1400.benchmark \
+        --codes-file "$QUANT_DATA_DIR/mainboard_active_universe.txt" \
+        --trade-date "$BENCHMARK_DATE" --sizes "20,50,100,200,400,800"
+    ;;
+  intraday-1400-sample)
+    acquire_quant_lock
+    SAMPLE_START="${INTRADAY_1400_SAMPLE_START:-20250701}"
+    SAMPLE_END="${INTRADAY_1400_SAMPLE_END:-20260731}"
+    SAMPLE_CODES="${INTRADAY_1400_SAMPLE_CODES:-100}"
+    run_job_with_retries intraday-1400-sample-collect \
+      "$LOG_DIR/intraday-1400-sample.out.log" \
+      "$LOG_DIR/intraday-1400-sample.err.log" 3 120 \
+      python -m intraday_1400.collector \
+        --codes-file "$QUANT_DATA_DIR/mainboard_active_universe.txt" \
+        --start "$SAMPLE_START" --end "$SAMPLE_END" --limit "$SAMPLE_CODES" \
+        --batch-size "${INTRADAY_1400_SAMPLE_BATCH_SIZE:-800}"
+    sample_rc=$?
+    [ "$sample_rc" -eq 0 ] || exit "$sample_rc"
+    run_job intraday-1400-sample-quality \
+      "$LOG_DIR/intraday-1400-sample.out.log" \
+      "$LOG_DIR/intraday-1400-sample.err.log" \
+      python -m intraday_1400.quality --fail-on-error
+    sample_rc=$?
+    [ "$sample_rc" -eq 0 ] || exit "$sample_rc"
+    run_job intraday-1400-sample-pipeline \
+      "$LOG_DIR/intraday-1400-sample.out.log" \
+      "$LOG_DIR/intraday-1400-sample.err.log" \
+      python -m intraday_1400.pipeline all --model-threads 12
+    ;;
+  intraday-1400-daily-shadow)
+    acquire_quant_lock
+    TRADE_DATE="${INTRADAY_1400_TRADE_DATE:-$(date +%Y%m%d)}"
+    # Re-read recent sessions so yesterday's 14:50 entry and T+1 exit labels are filled
+    # only after they have actually occurred. Features still cut every day at 13:55.
+    DAILY_START="${INTRADAY_1400_DAILY_START:-$(date -d "$TRADE_DATE -5 days" +%Y%m%d)}"
+    DAILY_BATCH_SIZE="${INTRADAY_1400_DAILY_BATCH_SIZE:-800}"
+    run_job_with_retries intraday-1400-daily-collect \
+      "$LOG_DIR/intraday-1400-daily.out.log" \
+      "$LOG_DIR/intraday-1400-daily.err.log" 2 60 \
+      python -m intraday_1400.collector \
+        --codes-file "$QUANT_DATA_DIR/mainboard_active_universe.txt" \
+        --start "$DAILY_START" --end "$TRADE_DATE" \
+        --batch-size "$DAILY_BATCH_SIZE" --no-resume
+    daily_shadow_rc=$?
+    [ "$daily_shadow_rc" -eq 0 ] || exit "$daily_shadow_rc"
+    run_job_with_retries intraday-1400-daily-factor-repair \
+      "$LOG_DIR/intraday-1400-daily.out.log" \
+      "$LOG_DIR/intraday-1400-daily.err.log" 2 60 \
+      python -m intraday_1400.repair \
+        --codes-file "$QUANT_DATA_DIR/mainboard_active_universe.txt" \
+        --start "${INTRADAY_1400_BACKFILL_START:-20230101}" --end "$TRADE_DATE" \
+        --batch-size "$DAILY_BATCH_SIZE"
+    daily_shadow_rc=$?
+    [ "$daily_shadow_rc" -eq 0 ] || exit "$daily_shadow_rc"
+    run_job intraday-1400-daily-quality \
+      "$LOG_DIR/intraday-1400-daily.out.log" \
+      "$LOG_DIR/intraday-1400-daily.err.log" \
+      python -m intraday_1400.quality --fail-on-error
+    daily_shadow_rc=$?
+    [ "$daily_shadow_rc" -eq 0 ] || exit "$daily_shadow_rc"
+    run_job intraday-1400-daily-pipeline \
+      "$LOG_DIR/intraday-1400-daily.out.log" \
+      "$LOG_DIR/intraday-1400-daily.err.log" \
+      env INTRADAY_1400_RUN_ABLATION=0 \
+      python -m intraday_1400.pipeline all --model-threads 12
+    ;;
+  intraday-1400-validate)
+    acquire_quant_lock
+    run_job intraday-1400-validate-quality \
+      "$LOG_DIR/intraday-1400-validate.out.log" \
+      "$LOG_DIR/intraday-1400-validate.err.log" \
+      python -m intraday_1400.quality --fail-on-error
+    validate_rc=$?
+    [ "$validate_rc" -eq 0 ] || exit "$validate_rc"
+    run_job intraday-1400-validate-pipeline \
+      "$LOG_DIR/intraday-1400-validate.out.log" \
+      "$LOG_DIR/intraday-1400-validate.err.log" \
+      python -m intraday_1400.pipeline all --model-threads 12
+    ;;
+  intraday-1400-backfill)
+    acquire_quant_lock
+    # 最新生产模型只需36个月训练+验证缓冲；2018全历史在替代验证通过后再补。
+    BACKFILL_START="${INTRADAY_1400_BACKFILL_START:-20230101}"
+    BACKFILL_END="${INTRADAY_1400_BACKFILL_END:-$(date +%Y%m%d)}"
+    run_job_with_retries intraday-1400-backfill-collect \
+      "$LOG_DIR/intraday-1400-backfill.out.log" \
+      "$LOG_DIR/intraday-1400-backfill.err.log" 3 120 \
+      python -m intraday_1400.collector \
+        --codes-file "$QUANT_DATA_DIR/mainboard_active_universe.txt" \
+        --start "$BACKFILL_START" --end "$BACKFILL_END" \
+        --batch-size "${INTRADAY_1400_BACKFILL_BATCH_SIZE:-800}"
+    backfill_rc=$?
+    [ "$backfill_rc" -eq 0 ] || exit "$backfill_rc"
+    run_job intraday-1400-backfill-quality \
+      "$LOG_DIR/intraday-1400-backfill.out.log" \
+      "$LOG_DIR/intraday-1400-backfill.err.log" \
+      python -m intraday_1400.quality --fail-on-error
+    backfill_rc=$?
+    [ "$backfill_rc" -eq 0 ] || exit "$backfill_rc"
+    run_job intraday-1400-backfill-pipeline \
+      "$LOG_DIR/intraday-1400-backfill.out.log" \
+      "$LOG_DIR/intraday-1400-backfill.err.log" \
+      python -m intraday_1400.pipeline all --model-threads 12
     ;;
   refresh-qfq)
     # 月度 qfq 口径维护：检测最近 window-days 内除权(后复权因子跳变)的票，整条重拉覆盖。
@@ -330,7 +467,7 @@ case "$job" in
     done
     ;;
   *)
-    echo "usage: scheduler_jobs.sh {intraday-light|daily-light|weekly-full|monthly-factor|refresh-qfq|snapshots|news-daily|news-annotation|all-a-meta|top10-eval|sentiment-model|realtime-weight-shadow|realtime|rotate}" >&2
+    echo "usage: scheduler_jobs.sh {intraday-light|daily-light|weekly-full|monthly-factor|intraday-1400-benchmark|intraday-1400-sample|intraday-1400-backfill|intraday-1400-validate|intraday-1400-daily-shadow|refresh-qfq|snapshots|news-daily|news-annotation|all-a-meta|top10-eval|sentiment-model|realtime-weight-shadow|realtime|rotate}" >&2
     clog "ERROR  unknown job=$job"
     exit 2
     ;;

@@ -246,7 +246,8 @@ def _normalize_kline(df: pd.DataFrame | None) -> pd.DataFrame | None:
 
 
 def fetch_daily_batch(symbols: list[str], start_date: str, end_date: str,
-                      adjust: str = "qfq") -> dict[str, pd.DataFrame]:
+                      adjust: str = "qfq", progress_offset: int = 0,
+                      progress_total: int | None = None) -> dict[str, pd.DataFrame]:
     """Fetch daily bars in bounded SDK requests and merge results by symbol.
 
     与 fetch_daily 口径一致：原始价按 ``adjust`` 用后复权因子换算（默认前复权）。
@@ -260,6 +261,8 @@ def fetch_daily_batch(symbols: list[str], start_date: str, end_date: str,
     broker_items = list(mapping.items())
     import time as _time  # 局部导入：模块未导入 time，避免动其它 import
     n_batches = (len(broker_items) + batch_size - 1) // batch_size
+    display_offset = max(int(progress_offset), 0)
+    display_total = max(int(progress_total or n_batches), display_offset + n_batches)
     loop_t0 = _time.perf_counter()
     for offset in range(0, len(broker_items), batch_size):
         batch_idx = offset // batch_size
@@ -281,7 +284,8 @@ def fetch_daily_batch(symbols: list[str], start_date: str, end_date: str,
         factor_frame = _get_factor_frame(tuple(bc for _, bc in chunk)) if adjust else None
         _f_el = _time.perf_counter() - _f_t0
         _f_stat = "off" if not adjust else ("ok" if factor_frame is not None else "miss")
-        print(f"[kline_batch] {batch_idx + 1}/{n_batches} codes={len(chunk)} "
+        display_idx = display_offset + batch_idx + 1
+        print(f"[kline_batch] {display_idx}/{display_total} codes={len(chunk)} "
               f"kline={_k_el:.1f}s factor={_f_el:.1f}s({_f_stat}) "
               f"batch={_time.perf_counter() - _k_t0:.1f}s "
               f"cum={_time.perf_counter() - loop_t0:.1f}s", flush=True)

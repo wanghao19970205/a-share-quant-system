@@ -21,6 +21,19 @@ from .weight_manifest import load_active_manifest
 
 
 @dataclass
+class ActualHolding:
+    """人工维护的实际账户持仓；只用于订阅和建议展示，绝不驱动自动交易。"""
+
+    code: str
+    buy_date: Optional[str] = None
+    shares: Optional[int] = None
+    available: Optional[int] = None
+    cost: Optional[float] = None
+    hold_days: Optional[int] = None
+    name: str = ""
+
+
+@dataclass
 class RefRow:
     atr: Optional[float] = None          # ATR(14) 绝对值（元）
     atr_pct: Optional[float] = None      # ATR / 昨收，便于缺 ATR 时按比例兜底
@@ -231,55 +244,100 @@ def _load_expected_return(
     return returns, prediction_date, components, model_scores, model_rank_pct
 
 
-def _load_hold_days(cfg: RealtimeConfig) -> dict[str, int]:
-    """从持仓文件解析每票已持有的交易日数（供 HoldingExpiry 判 T+N 到期）。
-
-    持仓文件格式（每行）：`代码[ 买入日期]`，买入日期支持 YYYY-MM-DD / YYYYMMDD，
-    分隔符空白或逗号。示例：
-        600519 2026-07-23
-        000001,20260722
-        002211            # 无日期 → 视为今日买入(hold_days=0)，不触发到期
-    以行内注释 # 之后忽略。买入日到今日之间的 A 股交易日数即 hold_days
-    （买入当日 = 0；下一交易日 = 1 = T+1）。无 pandas / 无交易日历时按自然日
-    近似（周末剔除），保证降级可用。缺日期或解析失败的行 hold_days 记 0。
-    """
-    path = cfg.holdings_file
-    if not path.exists():
-        return {}
-    import datetime as _dt
-
-    raw: dict[str, Optional[str]] = {}
+def _holding_optional_float(value: str) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"-", "none", "null", "nan"}:
+        return None
     try:
-        for ln in path.read_text(encoding="utf-8").splitlines():
-            s = ln.split("#", 1)[0].strip()
-            if not s:
-                continue
-            parts = s.replace(",", " ").split()
-            code = parts[0].strip().zfill(6)
-            buy = parts[1].strip() if len(parts) > 1 else None
-            raw[code] = buy
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def load_actual_cash(cfg: RealtimeConfig) -> float:
+    """读取 ``# actual_cash=<金额>``，缺失时返回 0。"""
+    configured = getattr(cfg, "holdings_file", None)
+    if not configured:
+        return 0.0
+    path = Path(configured)
+    if not path.is_file():
+        return 0.0
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            match = line.strip().lower()
+            if match.startswith("# actual_cash="):
+                value = _holding_optional_float(match.split("=", 1)[1].split()[0])
+                return max(0.0, value or 0.0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return 0.0
+
+
+def load_actual_holdings(cfg: RealtimeConfig) -> dict[str, ActualHolding]:
+    """读取实际账户持仓。
+
+    兼容旧格式 ``代码 [买入日期]``；扩展格式为：
+    ``代码 买入日期|- 持股数 可用数 成本价 持股交易日 # 名称``。
+    这些字段只用于只读展示和人工建议，不写入任何模拟盘状态。
+    """
+    configured = getattr(cfg, "holdings_file", None)
+    if not configured:
+        return {}
+    path = Path(configured)
+    if not path.is_file():
+        return {}
+    out: dict[str, ActualHolding] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
     except Exception:  # noqa: BLE001
         return {}
+    for line in lines:
+        data, _, comment = line.partition("#")
+        parts = data.replace(",", " ").split()
+        if not parts:
+            continue
+        code = parts[0].strip().split(".", 1)[0].zfill(6)
+        if not code.isdigit() or len(code) != 6:
+            continue
+        buy_date = parts[1].strip() if len(parts) > 1 and parts[1] != "-" else None
+        shares = _holding_optional_float(parts[2]) if len(parts) > 2 else None
+        available = _holding_optional_float(parts[3]) if len(parts) > 3 else None
+        cost = _holding_optional_float(parts[4]) if len(parts) > 4 else None
+        hold_days = _holding_optional_float(parts[5]) if len(parts) > 5 else None
+        out[code] = ActualHolding(
+            code=code,
+            buy_date=buy_date,
+            shares=max(0, int(shares)) if shares is not None else None,
+            available=max(0, int(available)) if available is not None else None,
+            cost=cost if cost is not None and cost > 0 else None,
+            hold_days=max(0, int(hold_days)) if hold_days is not None else None,
+            name=comment.strip(),
+        )
+    return out
 
-    def _parse_date(txt: str) -> Optional[_dt.date]:
+
+def _load_hold_days(cfg: RealtimeConfig) -> dict[str, int]:
+    """读取持仓交易日；显式持股天数优先，旧格式按买入日期计算。"""
+    import datetime as _dt
+
+    def _parse_date(text: str) -> Optional[_dt.date]:
         for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y/%m/%d"):
             try:
-                return _dt.datetime.strptime(txt, fmt).date()
+                return _dt.datetime.strptime(text, fmt).date()
             except (TypeError, ValueError):
                 continue
         return None
 
     today = _dt.date.today()
     out: dict[str, int] = {}
-    for code, buy_txt in raw.items():
-        if not buy_txt:
-            out[code] = 0
+    for code, holding in load_actual_holdings(cfg).items():
+        if holding.hold_days is not None:
+            out[code] = holding.hold_days
             continue
-        d = _parse_date(buy_txt)
-        if d is None or d > today:
-            out[code] = 0
-            continue
-        out[code] = _trading_days_between(d, today)
+        buy_date = _parse_date(holding.buy_date) if holding.buy_date else None
+        out[code] = (_trading_days_between(buy_date, today)
+                     if buy_date is not None and buy_date <= today else 0)
     return out
 
 

@@ -15,6 +15,7 @@ from quant import model as quant_model
 from intraday_1400.collector import _factor_fingerprint
 from intraday_1400.evaluation import (
     _common_labels,
+    _evaluate_negative_controls,
     _evaluate_source,
     _metrics as evaluation_metrics,
 )
@@ -317,6 +318,33 @@ class IntradayFeatureTest(unittest.TestCase):
         self.assertEqual(metrics["missing_targets"], 1)
         self.assertEqual(metrics["mean_names"], 2.0)
 
+    def test_daily_topn_metrics_treat_unbuyable_slot_as_cash(self):
+        selected = pd.DataFrame({
+            "date": pd.to_datetime(["2026-07-01"]),
+            "code": ["600000"],
+            "gross_return": [np.nan],
+            "entry_buyable": [False],
+            "target_outcome_observed_t1": [False],
+        })
+        metrics = evaluation_metrics(selected, "gross_return", 0.002)
+        self.assertAlmostEqual(metrics["mean_return"], 0.0)
+        self.assertEqual(metrics["missing_targets"], 0)
+        self.assertEqual(metrics["immature_targets"], 0)
+
+    def test_daily_topn_metrics_exclude_immature_targets_from_penalty(self):
+        selected = pd.DataFrame({
+            "date": pd.to_datetime(["2026-07-01", "2026-07-01"]),
+            "code": ["600000", "600001"],
+            "gross_return": [np.nan, 0.02],
+            "target_outcome_observed_t1": [False, True],
+        })
+        with mock.patch.dict("os.environ", {"INTRADAY_1400_UNSELLABLE_RETURN": "-0.10"}):
+            metrics = evaluation_metrics(selected, "gross_return", 0.002)
+        self.assertAlmostEqual(metrics["mean_return"], 0.018)
+        self.assertEqual(metrics["missing_targets"], 0)
+        self.assertEqual(metrics["immature_targets"], 1)
+        self.assertEqual(metrics["mean_names"], 1.0)
+
     def test_evaluate_source_ranks_before_unsellable_target_handling(self):
         date = pd.Timestamp("2026-07-01")
         labels = pd.DataFrame({
@@ -340,6 +368,46 @@ class IntradayFeatureTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["mean_return"], -0.10)
         self.assertEqual(metrics["missing_targets"], 1)
         self.assertEqual(metrics["mean_names"], 1.0)
+
+    def test_negative_controls_are_deterministic_and_include_market_leg(self):
+        dates = pd.to_datetime(["2026-07-01"] * 4 + ["2026-07-02"] * 4)
+        labels = pd.DataFrame({
+            "code": ["600000", "600001", "600002", "600003"] * 2,
+            "date": dates,
+            "entry_buyable": [True] * 8,
+            "gross__target_net_ret_t1": [0.01, 0.02, 0.03, 0.04, -0.01, 0.0, 0.01, 0.02],
+        })
+        predictions = pd.DataFrame({
+            "code": labels["code"],
+            "date": dates,
+            "score": [4.0, 3.0, 2.0, 1.0] * 2,
+        })
+        metadata = {"gross_columns": {"target_net_ret_t1": "gross__target_net_ret_t1"}}
+        first = _evaluate_negative_controls(
+            labels, predictions, (1, 2), (0.002,), metadata, samples=5, seed=7,
+        )
+        second = _evaluate_negative_controls(
+            labels, predictions, (1, 2), (0.002,), metadata, samples=5, seed=7,
+        )
+        parallel = _evaluate_negative_controls(
+            labels, predictions, (1, 2), (0.002,), metadata, samples=5, seed=7, workers=2,
+        )
+        strided = _evaluate_negative_controls(
+            labels, predictions, (1, 2), (0.002,), metadata,
+            samples=5, seed=7, workers=2, rebalance_stride=2,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["top"], parallel["top"])
+        market = first["market_equal_weight"]["target_net_ret_t1"]["cost_20bp"]
+        self.assertAlmostEqual(market["mean_return"], 0.013)
+        strided_market = strided["market_equal_weight"]["target_net_ret_t1"]["cost_20bp"]
+        self.assertEqual(strided["rebalance_stride"], 2)
+        self.assertEqual(strided_market["days"], 1)
+        self.assertAlmostEqual(strided_market["mean_return"], 0.023)
+        for top_n in ("1", "2"):
+            controls = first["top"][top_n]["target_net_ret_t1"]["cost_20bp"]
+            self.assertEqual(controls["random_topn"]["samples"], 5)
+            self.assertEqual(controls["score_shuffle"]["samples"], 5)
 
     def test_common_universe_uses_identical_date_code_keys(self):
         labels = pd.DataFrame({

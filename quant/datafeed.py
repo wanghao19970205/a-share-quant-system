@@ -363,8 +363,16 @@ def margin_underlying_szse(date: str) -> pd.DataFrame:
 
 # 需代理（push2 行情推送服务器）——配置代理后可用
 # AmazingData 批量 K 线接口；盘中主链路用单次请求覆盖整批代码。
-def broker_daily_prices(codes: list[str], start: str, end: str) -> dict[str, pd.DataFrame]:
-    return amazingdata_source.fetch_daily_batch(codes, start, end)
+def broker_daily_prices(codes: list[str], start: str, end: str,
+                        progress_offset: int = 0,
+                        progress_total: int | None = None,
+                        adjust: str = "qfq") -> dict[str, pd.DataFrame]:
+    return amazingdata_source.fetch_daily_batch(
+        codes, start, end,
+        adjust=adjust,
+        progress_offset=progress_offset,
+        progress_total=progress_total,
+    )
 
 
 def market_spot() -> pd.DataFrame:

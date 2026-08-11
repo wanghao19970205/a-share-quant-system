@@ -211,7 +211,8 @@ def _prediction_metrics(predictions: pd.DataFrame, horizon: int) -> dict:
 def _portfolio_metrics(predictions: pd.DataFrame, horizon: int, top_n: int) -> tuple[dict, pd.DataFrame]:
     returns, _ = backtest.portfolio_from_predictions(
         predictions, horizon=horizon, top_n=top_n, max_weight=1.0 / max(top_n, 1),
-        positive_only=False, use_open_fill=False, filter_untradable=False, cost_roundtrip=0.0,
+        positive_only=False, use_open_fill=False, filter_untradable=False,
+        cost_roundtrip=backtest.bt_cost_roundtrip(),
     )
     if returns.empty:
         return {}, returns

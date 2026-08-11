@@ -135,6 +135,15 @@ class RealtimeConfig:
     rank_board_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_RANK_BOARD", True))
     rank_interval_sec: int = field(default_factory=lambda: _env_int("REALTIME_RANK_INTERVAL", 300))
     rank_top_n: int = field(default_factory=lambda: _env_int("REALTIME_RANK_TOP_N", 5))
+    # 实际账户仅做只读调仓提示；绝不生成委托或写入 V1-V5 模拟盘状态。
+    actual_advice_enabled: bool = field(default_factory=lambda: _env_bool(
+        "REALTIME_ACTUAL_ADVICE", True))
+    actual_advice_max_weight: float = field(default_factory=lambda: min(1.0, max(
+        0.05, _env_float("REALTIME_ACTUAL_MAX_WEIGHT", 0.35))))
+    actual_advice_profit_lock: float = field(default_factory=lambda: max(
+        0.0, _env_float("REALTIME_ACTUAL_PROFIT_LOCK", 0.15)))
+    actual_advice_loss_review: float = field(default_factory=lambda: min(
+        0.0, _env_float("REALTIME_ACTUAL_LOSS_REVIEW", -0.15)))
 
     # ---- 盘中动态重排（RerankScorer，RankBoard + PaperTrader 共用）----------
     # 候选池先过三模型融合收益门，再按现役融合 pred 的全A日内百分位取 Top-rank_pool_n。

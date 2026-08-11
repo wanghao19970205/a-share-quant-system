@@ -247,6 +247,41 @@ def merge_active_predictions(
     os.replace(tmp, dst)
 
 
+def _files_identical(left: Path, right: Path, chunk_size: int = 8 * 1024 * 1024) -> bool:
+    """Compare active artifacts without loading either full file into memory."""
+    try:
+        if not left.exists() or not right.exists() or left.stat().st_size != right.stat().st_size:
+            return False
+        with left.open("rb") as left_file, right.open("rb") as right_file:
+            while True:
+                left_chunk = left_file.read(chunk_size)
+                right_chunk = right_file.read(chunk_size)
+                if left_chunk != right_chunk:
+                    return False
+                if not left_chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def _merge_short_and_legacy(
+    short_active: Path,
+    legacy_active: Path,
+    source_predictions: Path,
+    fresh: pd.DataFrame,
+) -> str:
+    """Merge once when short and legacy histories are byte-identical."""
+    if _files_identical(short_active, legacy_active):
+        merge_active_predictions(
+            short_active, source_predictions, short_active, fresh_frame=fresh)
+        _atomic_copy(short_active, legacy_active)
+        return "shared-history"
+    merge_active_predictions(
+        short_active, source_predictions, short_active, fresh_frame=fresh)
+    merge_active_predictions(
+        legacy_active, source_predictions, legacy_active, fresh_frame=fresh)
+    return "independent-history"
+
 
 def _parquet_max_date(path: Path) -> pd.Timestamp | None:
     try:
@@ -564,12 +599,10 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
                 flush=True,
             )
             merge_started = time.perf_counter()
-            merge_active_predictions(
-                short_active, source_predictions, short_active, fresh_frame=fresh)
-            merge_active_predictions(
-                legacy_active, source_predictions, legacy_active, fresh_frame=fresh)
+            merge_mode = _merge_short_and_legacy(
+                short_active, legacy_active, source_predictions, fresh)
             print(
-                f"[publish:timing] stage=short_legacy_merge "
+                f"[publish:timing] stage=short_legacy_merge mode={merge_mode} "
                 f"seconds={time.perf_counter() - merge_started:.2f}",
                 flush=True,
             )
