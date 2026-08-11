@@ -1,0 +1,156 @@
+{
+  "horizon": 3,
+  "train_end": "2026-01-31",
+  "valid_end": "2026-04-18",
+  "predict_start": "2026-04-19",
+  "base_feature_count": 66,
+  "sentiment_features": [
+    "news_sent_local_decay_3d",
+    "news_sent_structured_decay_3d",
+    "news_sent_hybrid_decay_3d",
+    "news_sent_local_decay_7d",
+    "news_sent_structured_decay_7d",
+    "news_sent_hybrid_decay_7d",
+    "news_sent_local_decay_14d",
+    "news_sent_structured_decay_14d",
+    "news_sent_hybrid_decay_14d",
+    "news_sent_article_count_1d",
+    "news_sent_article_count_7d",
+    "news_sent_positive_ratio_7d",
+    "news_sent_negative_ratio_7d",
+    "news_sent_llm_coverage_7d",
+    "news_sent_relevance_7d",
+    "news_sent_certainty_7d",
+    "news_sent_novelty_7d",
+    "news_sent_announcement_count_7d",
+    "news_sent_research_count_7d",
+    "news_sent_stock_news_count_7d"
+  ],
+  "models": {
+    "ridge": {
+      "baseline": {
+        "ok": true,
+        "training_metrics": {
+          "n": 38181,
+          "rank_ic": 0.01543927070322239,
+          "mse": 0.004420121863134077,
+          "top_mean_return": 0.0009333367601102154,
+          "all_mean_return": -0.0011499107947982592,
+          "decay_half_life_days": 90.0,
+          "min_weight": 0.05
+        },
+        "test_metrics": {
+          "n": 38181,
+          "rank_ic": 0.01543927070322239,
+          "direction_accuracy": 0.4746077892145308
+        },
+        "portfolio": {
+          "periods": 103,
+          "total_return": 0.5263536085166924,
+          "annual_return": 0.41181249707187373,
+          "annual_vol": 0.5214645364220638,
+          "sharpe": 0.789722921327406,
+          "max_drawdown": -0.34917084920347463,
+          "win_rate": 0.5631067961165048,
+          "avg_turnover": 0.8514563106796117
+        }
+      },
+      "augmented": {
+        "ok": true,
+        "training_metrics": {
+          "n": 38181,
+          "rank_ic": 0.022799266066882186,
+          "mse": 0.0044228142784508775,
+          "top_mean_return": -2.452750079021773e-05,
+          "all_mean_return": -0.0011499107947982592,
+          "decay_half_life_days": 90.0,
+          "min_weight": 0.05
+        },
+        "test_metrics": {
+          "n": 38181,
+          "rank_ic": 0.022799266066882186,
+          "direction_accuracy": 0.4812603127209869
+        },
+        "portfolio": {
+          "periods": 103,
+          "total_return": 1.1482201925830826,
+          "annual_return": 0.8656129217917734,
+          "annual_vol": 0.4987602104267397,
+          "sharpe": 1.7355292256596697,
+          "max_drawdown": -0.3609715349485503,
+          "win_rate": 0.5533980582524272,
+          "avg_turnover": 0.8349514563106796
+        }
+      },
+      "rank_ic_gain": 0.007359995363659796,
+      "sharpe_gain": 0.9458063043322638,
+      "monthly_win_rate": 0.5,
+      "drawdown_change": -0.011800685745075645,
+      "promoted": false
+    },
+    "lightgbm_ranker": {
+      "baseline": {
+        "ok": true,
+        "training_metrics": {
+          "n": 21503,
+          "rank_ic": 0.013410455949542507,
+          "mse": 0.04924992724248584,
+          "top_mean_return": 0.00204615310771731,
+          "all_mean_return": -0.003714854333037952,
+          "best_iteration": 22,
+          "decay_half_life_days": 90.0,
+          "min_weight": 0.05
+        },
+        "test_metrics": {
+          "n": 21503,
+          "rank_ic": 0.013410455949542507,
+          "direction_accuracy": 0.5643863646932986
+        },
+        "portfolio": {
+          "periods": 58,
+          "total_return": -0.1779407201776808,
+          "annual_return": -0.24706711407446103,
+          "annual_vol": 0.74021582031734,
+          "sharpe": -0.3337771326861674,
+          "max_drawdown": -0.7271531247842528,
+          "win_rate": 0.5,
+          "avg_turnover": 0.6137931034482758
+        }
+      },
+      "augmented": {
+        "ok": true,
+        "training_metrics": {
+          "n": 21503,
+          "rank_ic": 0.03439266053299,
+          "mse": 0.2865073151165601,
+          "top_mean_return": 0.0030883777278820444,
+          "all_mean_return": -0.003714854333037952,
+          "best_iteration": 72,
+          "decay_half_life_days": 90.0,
+          "min_weight": 0.05
+        },
+        "test_metrics": {
+          "n": 21503,
+          "rank_ic": 0.03439266053299,
+          "direction_accuracy": 0.5719201971817885
+        },
+        "portfolio": {
+          "periods": 58,
+          "total_return": -0.027202864398565674,
+          "annual_return": -0.039155824606943335,
+          "annual_vol": 0.826963427449276,
+          "sharpe": -0.047348919320068794,
+          "max_drawdown": -0.7259556054314856,
+          "win_rate": 0.5,
+          "avg_turnover": 0.7293103448275862
+        }
+      },
+      "rank_ic_gain": 0.02098220458344749,
+      "sharpe_gain": 0.2864282133660986,
+      "monthly_win_rate": 0.5,
+      "drawdown_change": 0.001197519352767129,
+      "promoted": false
+    }
+  },
+  "promote_to_full_a_backfill": false
+}

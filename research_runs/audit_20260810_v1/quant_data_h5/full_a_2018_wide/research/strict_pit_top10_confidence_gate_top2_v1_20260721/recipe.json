@@ -1,0 +1,36 @@
+{
+  "candidate": "strict_pit_top10_residual_confidence_gate_top2",
+  "source": "/app/quant_data/full_a_2018_wide/residual_industry_strict_pit_top2_v1_20260721/predictions.parquet",
+  "leg_column": "residual_pred",
+  "pool_size": 10,
+  "rerank_weight": 0.05,
+  "state_quantiles": [
+    0.6,
+    0.7,
+    0.8
+  ],
+  "state_features": [
+    "topk_residual_coverage",
+    "topk_residual_dispersion",
+    "topk_residual_top_gap_z"
+  ],
+  "holdout_months": 6,
+  "horizons": [
+    1,
+    2,
+    3
+  ],
+  "champion_params": {
+    "lgbm_weight": 0.85,
+    "ic_weight": 0.0,
+    "elastic_weight": 0.2,
+    "extra_trees_weight": 0.1,
+    "top_n": 2,
+    "gross_exposure": 0.3,
+    "slot_weight": 0.15,
+    "ridge_quantile": 0.7,
+    "pred_quantile": 0.6,
+    "naive_weight": 0.0
+  },
+  "publishable": false
+}

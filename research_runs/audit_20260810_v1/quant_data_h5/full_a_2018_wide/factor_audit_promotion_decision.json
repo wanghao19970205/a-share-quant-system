@@ -1,0 +1,51 @@
+{
+  "range": [
+    "2025-08-04",
+    "2026-07-13"
+  ],
+  "params": {
+    "ic_weight": 0.0,
+    "top_n": 2,
+    "gross_exposure": 0.3,
+    "ridge_quantile": 0.7,
+    "pred_quantile": 0.6,
+    "naive_weight": 0.1
+  },
+  "decision": {
+    "promote": false,
+    "reason": "gain_or_stability_threshold_not_met",
+    "avg_sharpe_gain": 4.841988022154453,
+    "improved_horizons": 3,
+    "common_horizons": 3,
+    "worst_drawdown_change": -0.16474859334829506,
+    "details": [
+      {
+        "horizon": 1,
+        "sharpe_candidate": 15.763018042691016,
+        "sharpe_baseline": 4.355153497858,
+        "sharpe_gain": 11.407864544833016,
+        "max_drawdown_candidate": -0.1953539405843363,
+        "max_drawdown_baseline": -0.21558774319122032,
+        "drawdown_change": 0.02023380260688401
+      },
+      {
+        "horizon": 2,
+        "sharpe_candidate": 5.596305242053848,
+        "sharpe_baseline": 3.4314749742954516,
+        "sharpe_gain": 2.1648302677583966,
+        "max_drawdown_candidate": -0.39005198967501786,
+        "max_drawdown_baseline": -0.2253033963267228,
+        "drawdown_change": -0.16474859334829506
+      },
+      {
+        "horizon": 3,
+        "sharpe_candidate": 4.000341250782521,
+        "sharpe_baseline": 3.0470719969105753,
+        "sharpe_gain": 0.9532692538719454,
+        "max_drawdown_candidate": -0.48102259252900204,
+        "max_drawdown_baseline": -0.3885262898957499,
+        "drawdown_change": -0.09249630263325215
+      }
+    ]
+  }
+}

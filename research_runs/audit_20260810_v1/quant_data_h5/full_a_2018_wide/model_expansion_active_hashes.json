@@ -1,0 +1,18 @@
+{
+  "reason": "successful daily-light 2026-07-20",
+  "prediction_latest_date": "2026-07-20",
+  "hashes": {
+    "active_quant_model.json": {
+      "size": 5362,
+      "sha256": "26b9c2658025bc4f757cdea310fe468c361610750dbf3e341c21b12e7554b4df"
+    },
+    "active_quant_short_predictions.parquet": {
+      "size": 159189380,
+      "sha256": "9da3960cc3850f0be88ca2b6bbfe79018e8b0f7be2d6c36f57e151a5ff000fd8"
+    },
+    "active_quant_swing_predictions.parquet": {
+      "size": 574211206,
+      "sha256": "f0470c34b629a151cee45b9fd90fe40ace2c695322b9ff59945fa77d523cd88b"
+    }
+  }
+}

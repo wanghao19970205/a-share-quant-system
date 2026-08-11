@@ -1,0 +1,177 @@
+{
+  "candidate": "strict_pit_residual_top10_rerank_top2",
+  "publishable": false,
+  "reason": "independent shadow candidate; production artifacts are never written",
+  "source": "/app/quant_data/full_a_2018_wide/residual_industry_strict_pit_top2_v1_20260721/predictions.parquet",
+  "leg_column": "residual_pred",
+  "pool_size": 10,
+  "top_n": 2,
+  "selection_range": [
+    "2024-08-02",
+    "2026-01-20"
+  ],
+  "holdout_range": [
+    "2026-01-21",
+    "2026-07-20"
+  ],
+  "selection": [
+    {
+      "weight": 0.0,
+      "avg_sharpe": 9.766362165054051,
+      "worst_drawdown": -0.1766803557489257,
+      "details": [
+        {
+          "horizon": 3,
+          "periods": 356,
+          "total_return": 252.7799882174867,
+          "annual_return": 2.6926987083832623,
+          "annual_vol": 0.2757115354597706,
+          "sharpe": 9.766362165054051,
+          "max_drawdown": -0.1766803557489257,
+          "win_rate": 0.6601123595505618,
+          "direction_win_rate": 0.6123595505617978,
+          "avg_turnover": 0.8829588014981273,
+          "avg_holdings": 2.0
+        }
+      ]
+    },
+    {
+      "weight": 0.03,
+      "avg_sharpe": 9.755571756486539,
+      "worst_drawdown": -0.1766803557489257,
+      "details": [
+        {
+          "horizon": 3,
+          "periods": 356,
+          "total_return": 250.11864496226386,
+          "annual_return": 2.6835246005587576,
+          "annual_vol": 0.27507609677254086,
+          "sharpe": 9.755571756486539,
+          "max_drawdown": -0.1766803557489257,
+          "win_rate": 0.6657303370786517,
+          "direction_win_rate": 0.6137640449438202,
+          "avg_turnover": 0.8838951310861423,
+          "avg_holdings": 2.0
+        }
+      ]
+    },
+    {
+      "weight": 0.05,
+      "avg_sharpe": 9.825484367614969,
+      "worst_drawdown": -0.1766803557489257,
+      "details": [
+        {
+          "horizon": 3,
+          "periods": 356,
+          "total_return": 250.2210294916623,
+          "annual_return": 2.6838789082736327,
+          "annual_vol": 0.27315487032066954,
+          "sharpe": 9.825484367614969,
+          "max_drawdown": -0.1766803557489257,
+          "win_rate": 0.6657303370786517,
+          "direction_win_rate": 0.6151685393258427,
+          "avg_turnover": 0.8820224719101124,
+          "avg_holdings": 2.0
+        }
+      ]
+    },
+    {
+      "weight": 0.1,
+      "avg_sharpe": 9.769285680968421,
+      "worst_drawdown": -0.17785635128434274,
+      "details": [
+        {
+          "horizon": 3,
+          "periods": 356,
+          "total_return": 240.12730358202583,
+          "annual_return": 2.6484053231411617,
+          "annual_vol": 0.2710950840858845,
+          "sharpe": 9.769285680968421,
+          "max_drawdown": -0.17785635128434274,
+          "win_rate": 0.6629213483146067,
+          "direction_win_rate": 0.6165730337078652,
+          "avg_turnover": 0.8838951310861423,
+          "avg_holdings": 2.0
+        }
+      ]
+    }
+  ],
+  "selected_weight": 0.05,
+  "holdout_pool_rank_ic_mean": 0.20704777722774864,
+  "holdout_pool_positive_ic_day_rate": 0.7304347826086957,
+  "holdout_pool_ic_days": 115,
+  "holdout_baseline": [
+    {
+      "horizon": 3,
+      "periods": 115,
+      "total_return": 7.644905130773685,
+      "annual_return": 3.8332833488907667,
+      "annual_vol": 0.2355304185207836,
+      "sharpe": 16.275109486771075,
+      "max_drawdown": -0.09502296733595272,
+      "win_rate": 0.782608695652174,
+      "direction_win_rate": 0.6782608695652174,
+      "avg_turnover": 0.872463768115942,
+      "avg_holdings": 2.0
+    }
+  ],
+  "holdout_candidate": [
+    {
+      "horizon": 3,
+      "periods": 115,
+      "total_return": 7.590657075641827,
+      "annual_return": 3.8111107917027907,
+      "annual_vol": 0.23806660022847878,
+      "sharpe": 16.008590823093904,
+      "max_drawdown": -0.09502296733595261,
+      "win_rate": 0.7739130434782608,
+      "direction_win_rate": 0.6826086956521739,
+      "avg_turnover": 0.8666666666666666,
+      "avg_holdings": 2.0
+    }
+  ],
+  "promotion_gate": {
+    "promote": false,
+    "reason": "gain_or_stability_threshold_not_met",
+    "avg_sharpe_gain": -0.2665186636771715,
+    "improved_horizons": 0,
+    "common_horizons": 1,
+    "worst_drawdown_change": 1.1102230246251565e-16,
+    "details": [
+      {
+        "horizon": 3,
+        "sharpe_candidate": 16.008590823093904,
+        "sharpe_baseline": 16.275109486771075,
+        "sharpe_gain": -0.2665186636771715,
+        "max_drawdown_candidate": -0.09502296733595261,
+        "max_drawdown_baseline": -0.09502296733595272,
+        "drawdown_change": 1.1102230246251565e-16
+      }
+    ]
+  },
+  "stability_gate": {
+    "passed": false,
+    "nonoverlap_improved_horizons": 0,
+    "significant_improved_horizons": 0,
+    "acceptable_horizons": 0,
+    "min_significant_sharpe_gain": 0.5,
+    "max_other_sharpe_decline": 0.5,
+    "common_horizons": 1,
+    "monthly_win_rate": 0.2857142857142857,
+    "monthly_wins": 2,
+    "months": 7,
+    "details": [
+      {
+        "horizon": 3,
+        "nonoverlap_candidate_sharpe": 16.387700608867576,
+        "nonoverlap_baseline_sharpe": 18.706031069327963,
+        "nonoverlap_sharpe_gain": -2.3183304604603876,
+        "significant_improvement": false,
+        "within_allowed_decline": false,
+        "monthly_wins": 2,
+        "months": 7
+      }
+    ]
+  },
+  "passed": false
+}

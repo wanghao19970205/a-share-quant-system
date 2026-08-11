@@ -1,0 +1,18 @@
+{
+  "test_start": "2026-03-02",
+  "test_end": "2026-04-01",
+  "train_end": "2026-01-27",
+  "valid_end": "2026-02-24",
+  "factors": 20,
+  "rows": 69034,
+  "metrics": {
+    "n": 69034,
+    "rank_ic": -0.014090741646850211,
+    "mse": 0.002895978674787547,
+    "top_mean_return": -0.008331493616971582,
+    "all_mean_return": -0.007743357776977505,
+    "best_iteration": 2,
+    "decay_half_life_days": 60.0,
+    "min_weight": 0.03
+  }
+}

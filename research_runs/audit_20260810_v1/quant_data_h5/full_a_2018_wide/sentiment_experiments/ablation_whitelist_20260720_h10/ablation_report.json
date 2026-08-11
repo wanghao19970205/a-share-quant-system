@@ -1,0 +1,798 @@
+{
+  "horizon": 10,
+  "feature_groups": {
+    "lexicon_direction": [
+      "news_sent_local_decay_3d",
+      "news_sent_local_decay_7d",
+      "news_sent_local_decay_14d",
+      "news_sent_positive_ratio_7d",
+      "news_sent_negative_ratio_7d"
+    ],
+    "llm_structured": [
+      "news_sent_structured_decay_3d",
+      "news_sent_structured_decay_7d",
+      "news_sent_structured_decay_14d"
+    ],
+    "hybrid": [
+      "news_sent_hybrid_decay_3d",
+      "news_sent_hybrid_decay_7d",
+      "news_sent_hybrid_decay_14d"
+    ],
+    "activity_category": [
+      "news_sent_article_count_1d",
+      "news_sent_article_count_7d",
+      "news_sent_announcement_count_7d",
+      "news_sent_research_count_7d",
+      "news_sent_stock_news_count_7d"
+    ],
+    "llm_quality": [
+      "news_sent_llm_coverage_7d",
+      "news_sent_relevance_7d",
+      "news_sent_certainty_7d",
+      "news_sent_novelty_7d"
+    ]
+  },
+  "selection_window": {
+    "train_end": "2026-01-31",
+    "valid_end": "2026-02-28",
+    "predict_start": "2026-03-01",
+    "end": "2026-04-18"
+  },
+  "confirmation_window": {
+    "train_end": "2026-01-31",
+    "valid_end": "2026-04-18",
+    "predict_start": "2026-04-19"
+  },
+  "models": {
+    "ridge": {
+      "selection_steps": [
+        {
+          "step": 1,
+          "candidates": {
+            "lexicon_direction": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.021741348367274607,
+                  "mse": 0.01302869321393684,
+                  "top_mean_return": 0.009904984163411696,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.021741348367274607,
+                  "direction_accuracy": 0.49421288077824327
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 4.455170387446804,
+                  "annual_return": 2.0804931987617494,
+                  "annual_vol": 0.5550007651830561,
+                  "sharpe": 3.74863122589667,
+                  "max_drawdown": -0.6136146093672091,
+                  "win_rate": 0.6578947368421053,
+                  "avg_turnover": 0.6578947368421053
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.002807791594991449,
+                "sharpe_gain": 1.7258561829938053,
+                "monthly_win_rate": 0.6666666666666666,
+                "drawdown_change": 0.05120288262349104
+              }
+            },
+            "llm_structured": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.023800536816405087,
+                  "mse": 0.01304577875904923,
+                  "top_mean_return": 0.009158823790536053,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.023800536816405087,
+                  "direction_accuracy": 0.49527799474543777
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 1.3886415861836783,
+                  "annual_return": 0.7814507232219097,
+                  "annual_vol": 0.5384826729247318,
+                  "sharpe": 1.45120866931059,
+                  "max_drawdown": -0.6765132944391947,
+                  "win_rate": 0.631578947368421,
+                  "avg_turnover": 0.7578947368421053
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.0007486031458609696,
+                "sharpe_gain": -0.5715663735922747,
+                "monthly_win_rate": 0.3333333333333333,
+                "drawdown_change": -0.011695802448494552
+              }
+            },
+            "hybrid": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.023030153391685033,
+                  "mse": 0.013055340142298798,
+                  "top_mean_return": 0.009129795901063066,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.023030153391685033,
+                  "direction_accuracy": 0.49591706312575445
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 1.5600246836811795,
+                  "annual_return": 0.8652211567215027,
+                  "annual_vol": 0.5744923048097491,
+                  "sharpe": 1.5060622213347703,
+                  "max_drawdown": -0.7050918228276012,
+                  "win_rate": 0.6052631578947368,
+                  "avg_turnover": 0.7473684210526316
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.0015189865705810233,
+                "sharpe_gain": -0.5167128215680943,
+                "monthly_win_rate": 0.6666666666666666,
+                "drawdown_change": -0.04027433083690102
+              }
+            },
+            "activity_category": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.02322573584529074,
+                  "mse": 0.013018053508502667,
+                  "top_mean_return": 0.010408148437744595,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.02322573584529074,
+                  "direction_accuracy": 0.4934317972023006
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 2.0531122736494622,
+                  "annual_return": 1.0963365106087766,
+                  "annual_vol": 0.5449739785738316,
+                  "sharpe": 2.0117226761502116,
+                  "max_drawdown": -0.6513539929937702,
+                  "win_rate": 0.6842105263157895,
+                  "avg_turnover": 0.7263157894736844
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.001323404116975315,
+                "sharpe_gain": -0.011052366752652976,
+                "monthly_win_rate": 0.6666666666666666,
+                "drawdown_change": 0.013463498996930001
+              }
+            },
+            "llm_quality": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.018677293456782918,
+                  "mse": 0.012999661552619753,
+                  "top_mean_return": 0.010885080046494798,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.018677293456782918,
+                  "direction_accuracy": 0.49485194915855996
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 2.533118080319623,
+                  "annual_return": 1.3094863844722249,
+                  "annual_vol": 0.5475701320934896,
+                  "sharpe": 2.3914496202810587,
+                  "max_drawdown": -0.6628016881138525,
+                  "win_rate": 0.6578947368421053,
+                  "avg_turnover": 0.7184210526315791
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.005871846505483138,
+                "sharpe_gain": 0.3686745773781941,
+                "monthly_win_rate": 0.6666666666666666,
+                "drawdown_change": 0.0020158038768476327
+              }
+            }
+          },
+          "winner": "lexicon_direction"
+        },
+        {
+          "step": 2,
+          "candidates": {
+            "llm_structured": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.02079695454063789,
+                  "mse": 0.013040993469730755,
+                  "top_mean_return": 0.009590347850733266,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.02079695454063789,
+                  "direction_accuracy": 0.4972662074842008
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 2.041597885235051,
+                  "annual_return": 1.0910902208547562,
+                  "annual_vol": 0.5331299313816283,
+                  "sharpe": 2.046574684012114,
+                  "max_drawdown": -0.6386924192654385,
+                  "win_rate": 0.6052631578947368,
+                  "avg_turnover": 0.7078947368421054
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.0009443938266367156,
+                "sharpe_gain": -1.7020565418845557,
+                "monthly_win_rate": 0.3333333333333333,
+                "drawdown_change": -0.025077809898229386
+              }
+            },
+            "hybrid": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.020448853382894937,
+                  "mse": 0.013044654787905592,
+                  "top_mean_return": 0.009452162645992763,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.020448853382894937,
+                  "direction_accuracy": 0.496911169495136
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 1.843731359360541,
+                  "annual_return": 0.9998608873177133,
+                  "annual_vol": 0.5447157753333931,
+                  "sharpe": 1.835564403666754,
+                  "max_drawdown": -0.6620845188372582,
+                  "win_rate": 0.6052631578947368,
+                  "avg_turnover": 0.718421052631579
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.0012924949843796697,
+                "sharpe_gain": -1.9130668222299159,
+                "monthly_win_rate": 0.3333333333333333,
+                "drawdown_change": -0.04846990947004903
+              }
+            },
+            "activity_category": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.02087818843363352,
+                  "mse": 0.013030115126139956,
+                  "top_mean_return": 0.009880190067289473,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.02087818843363352,
+                  "direction_accuracy": 0.494780941560747
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 4.931736960349627,
+                  "annual_return": 2.256429426758917,
+                  "annual_vol": 0.5577414987824798,
+                  "sharpe": 4.045654540113266,
+                  "max_drawdown": -0.5815891259959411,
+                  "win_rate": 0.6842105263157895,
+                  "avg_turnover": 0.6578947368421053
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.0008631599336410868,
+                "sharpe_gain": 0.2970233142165961,
+                "monthly_win_rate": 0.6666666666666666,
+                "drawdown_change": 0.03202548337126798
+              }
+            },
+            "llm_quality": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.014502283625251461,
+                  "mse": 0.013007344537897762,
+                  "top_mean_return": 0.010637837608116436,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.014502283625251461,
+                  "direction_accuracy": 0.4962721011148193
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 4.9362448621686745,
+                  "annual_return": 2.258070377738312,
+                  "annual_vol": 0.5619034511687616,
+                  "sharpe": 4.018609198860616,
+                  "max_drawdown": -0.5780730742933308,
+                  "win_rate": 0.6578947368421053,
+                  "avg_turnover": 0.6815789473684211
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.007239064742023146,
+                "sharpe_gain": 0.26997797296394577,
+                "monthly_win_rate": 0.6666666666666666,
+                "drawdown_change": 0.03554153507387836
+              }
+            }
+          },
+          "winner": "llm_quality"
+        },
+        {
+          "step": 3,
+          "candidates": {
+            "llm_structured": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.01504263596276966,
+                  "mse": 0.01301884693382034,
+                  "top_mean_return": 0.009972413171839974,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.01504263596276966,
+                  "direction_accuracy": 0.49904139742952497
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 2.1437427871215293,
+                  "annual_return": 1.1374005126768307,
+                  "annual_vol": 0.5419410259765473,
+                  "sharpe": 2.098753292624966,
+                  "max_drawdown": -0.6681668783513075,
+                  "win_rate": 0.6052631578947368,
+                  "avg_turnover": 0.7447368421052631
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": -0.0005403523375181983,
+                "sharpe_gain": -1.9198559062356497,
+                "monthly_win_rate": 0.3333333333333333,
+                "drawdown_change": -0.09009380405797673
+              }
+            },
+            "hybrid": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.014795890742510497,
+                  "mse": 0.01302166886413153,
+                  "top_mean_return": 0.009846589818495696,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.014795890742510497,
+                  "direction_accuracy": 0.49861535184264716
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 2.4158120407391612,
+                  "annual_return": 1.2583473209449463,
+                  "annual_vol": 0.556938201253288,
+                  "sharpe": 2.259402063125253,
+                  "max_drawdown": -0.6699884233902635,
+                  "win_rate": 0.6052631578947368,
+                  "avg_turnover": 0.7447368421052631
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": -0.00029360711725903536,
+                "sharpe_gain": -1.7592071357353625,
+                "monthly_win_rate": 0.3333333333333333,
+                "drawdown_change": -0.09191534909693277
+              }
+            },
+            "activity_category": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.014396594153259517,
+                  "mse": 0.013005787910450345,
+                  "top_mean_return": 0.010763480345310765,
+                  "all_mean_return": 0.009318103888397648,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 14083,
+                  "rank_ic": -0.014396594153259517,
+                  "direction_accuracy": 0.49641411631044524
+                },
+                "portfolio": {
+                  "periods": 38,
+                  "total_return": 4.589170812210123,
+                  "annual_return": 2.130468346152963,
+                  "annual_vol": 0.5576062187031386,
+                  "sharpe": 3.820739932040093,
+                  "max_drawdown": -0.5780730742933308,
+                  "win_rate": 0.6578947368421053,
+                  "avg_turnover": 0.6736842105263158
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.00010568947199194462,
+                "sharpe_gain": -0.19786926682052242,
+                "monthly_win_rate": 0.0,
+                "drawdown_change": 0.0
+              }
+            }
+          },
+          "winner": null
+        }
+      ],
+      "selected_groups": [
+        "lexicon_direction",
+        "llm_quality"
+      ],
+      "selected_features": [
+        "news_sent_local_decay_3d",
+        "news_sent_local_decay_7d",
+        "news_sent_local_decay_14d",
+        "news_sent_positive_ratio_7d",
+        "news_sent_negative_ratio_7d",
+        "news_sent_llm_coverage_7d",
+        "news_sent_relevance_7d",
+        "news_sent_certainty_7d",
+        "news_sent_novelty_7d"
+      ],
+      "confirmation_baseline": {
+        "ok": true,
+        "training_metrics": {
+          "n": 30768,
+          "rank_ic": 0.019456312731154793,
+          "mse": 0.016633551265487566,
+          "top_mean_return": 0.011335718991079978,
+          "all_mean_return": 0.0017985288730876026,
+          "decay_half_life_days": 90.0,
+          "min_weight": 0.05
+        },
+        "test_metrics": {
+          "n": 30768,
+          "rank_ic": 0.019456312731154793,
+          "direction_accuracy": 0.4496879875195008
+        },
+        "portfolio": {
+          "periods": 83,
+          "total_return": 0.009887436170823216,
+          "annual_return": 0.0029916909938803027,
+          "annual_vol": 0.5646107534264996,
+          "sharpe": 0.005298678737031454,
+          "max_drawdown": -0.8345274722301428,
+          "win_rate": 0.5421686746987951,
+          "avg_turnover": 0.7072289156626504
+        }
+      },
+      "confirmation_selected": {
+        "ok": true,
+        "training_metrics": {
+          "n": 30768,
+          "rank_ic": 0.021091573171242533,
+          "mse": 0.016652653624539493,
+          "top_mean_return": 0.008673571207755998,
+          "all_mean_return": 0.0017985288730876026,
+          "decay_half_life_days": 90.0,
+          "min_weight": 0.05
+        },
+        "test_metrics": {
+          "n": 30768,
+          "rank_ic": 0.021091573171242533,
+          "direction_accuracy": 0.4516705668226729
+        },
+        "portfolio": {
+          "periods": 83,
+          "total_return": 1.256868666094375,
+          "annual_return": 0.2803526940844514,
+          "annual_vol": 0.5970659238068537,
+          "sharpe": 0.4695506524588453,
+          "max_drawdown": -0.8294649767651614,
+          "win_rate": 0.5421686746987951,
+          "avg_turnover": 0.6987951807228915
+        }
+      },
+      "confirmation_comparison": {
+        "rank_ic_gain": 0.00163526044008774,
+        "sharpe_gain": 0.46425197372181387,
+        "monthly_win_rate": 0.8,
+        "drawdown_change": 0.005062495464981387
+      },
+      "confirmed": true
+    },
+    "lightgbm_ranker": {
+      "selection_steps": [
+        {
+          "step": 1,
+          "candidates": {
+            "lexicon_direction": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 12599,
+                  "rank_ic": -0.024736287715367292,
+                  "mse": 0.013119844261374702,
+                  "top_mean_return": 0.004387306049849745,
+                  "all_mean_return": 0.004302509627263073,
+                  "best_iteration": 2,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 12599,
+                  "rank_ic": -0.024736287715367292,
+                  "direction_accuracy": 0.5034526549726168
+                },
+                "portfolio": {
+                  "periods": 34,
+                  "total_return": -0.7029229053439181,
+                  "annual_return": -0.593272974727664,
+                  "annual_vol": 0.3459480072754363,
+                  "sharpe": -1.7149194741720626,
+                  "max_drawdown": -0.7671466087217433,
+                  "win_rate": 0.29411764705882354,
+                  "avg_turnover": 0.6882352941176472
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": -0.022873518733765398,
+                "sharpe_gain": -2.4155729163391633,
+                "monthly_win_rate": 0.0,
+                "drawdown_change": -0.38043888048696295
+              }
+            },
+            "llm_structured": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 12599,
+                  "rank_ic": -0.016930344459813517,
+                  "mse": 0.021665677156692455,
+                  "top_mean_return": 0.0007086163674136614,
+                  "all_mean_return": 0.004302509627263073,
+                  "best_iteration": 8,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 12599,
+                  "rank_ic": -0.016930344459813517,
+                  "direction_accuracy": 0.5327406937058496
+                },
+                "portfolio": {
+                  "periods": 34,
+                  "total_return": 2.9792610973145357,
+                  "annual_return": 1.7832963664909016,
+                  "annual_vol": 0.34313848572791944,
+                  "sharpe": 5.197016483615624,
+                  "max_drawdown": -0.15833515922120556,
+                  "win_rate": 0.7647058823529411,
+                  "avg_turnover": 0.4647058823529412
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": -0.015067575478211621,
+                "sharpe_gain": 4.4963630414485225,
+                "monthly_win_rate": 1.0,
+                "drawdown_change": 0.22837256901357483
+              }
+            },
+            "hybrid": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 12599,
+                  "rank_ic": -0.050038760506723554,
+                  "mse": 0.3035034825092935,
+                  "top_mean_return": 0.0030205928064734114,
+                  "all_mean_return": 0.004302509627263073,
+                  "best_iteration": 49,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 12599,
+                  "rank_ic": -0.050038760506723554,
+                  "direction_accuracy": 0.5305976664814668
+                },
+                "portfolio": {
+                  "periods": 34,
+                  "total_return": 1.4118798312514729,
+                  "annual_return": 0.9204058617924191,
+                  "annual_vol": 0.42212158109089454,
+                  "sharpe": 2.1804283481877467,
+                  "max_drawdown": -0.4446039747079469,
+                  "win_rate": 0.6176470588235294,
+                  "avg_turnover": 0.5588235294117647
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": -0.048175991525121656,
+                "sharpe_gain": 1.479774906020646,
+                "monthly_win_rate": 1.0,
+                "drawdown_change": -0.05789624647316649
+              }
+            },
+            "activity_category": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 12599,
+                  "rank_ic": 0.009533178046911011,
+                  "mse": 0.012949613002855345,
+                  "top_mean_return": 0.003960950453453117,
+                  "all_mean_return": 0.004302509627263073,
+                  "best_iteration": 1,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 12599,
+                  "rank_ic": 0.009533178046911011,
+                  "direction_accuracy": 0.5090086514802762
+                },
+                "portfolio": {
+                  "periods": 34,
+                  "total_return": -0.4162084811554957,
+                  "annual_return": -0.3289486299348575,
+                  "annual_vol": 0.2858179392710925,
+                  "sharpe": -1.1509026717278807,
+                  "max_drawdown": -0.5174486415486643,
+                  "win_rate": 0.4411764705882353,
+                  "avg_turnover": 0.8117647058823528
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.011395947028512907,
+                "sharpe_gain": -1.8515561138949814,
+                "monthly_win_rate": 0.0,
+                "drawdown_change": -0.13074091331388393
+              }
+            },
+            "llm_quality": {
+              "result": {
+                "ok": true,
+                "training_metrics": {
+                  "n": 12599,
+                  "rank_ic": 0.02692156417129004,
+                  "mse": 0.012885576756726124,
+                  "top_mean_return": 0.009055248983862266,
+                  "all_mean_return": 0.004302509627263073,
+                  "best_iteration": 1,
+                  "decay_half_life_days": 90.0,
+                  "min_weight": 0.05
+                },
+                "test_metrics": {
+                  "n": 12599,
+                  "rank_ic": 0.02692156417129004,
+                  "direction_accuracy": 0.4971029446781491
+                },
+                "portfolio": {
+                  "periods": 34,
+                  "total_return": -0.4573512267299311,
+                  "annual_return": -0.36433016915017,
+                  "annual_vol": 0.26557128575799704,
+                  "sharpe": -1.3718733488460324,
+                  "max_drawdown": -0.5174486415486643,
+                  "win_rate": 0.4117647058823529,
+                  "avg_turnover": 0.761764705882353
+                }
+              },
+              "comparison": {
+                "rank_ic_gain": 0.028784333152891934,
+                "sharpe_gain": -2.072526791013133,
+                "monthly_win_rate": 0.0,
+                "drawdown_change": -0.13074091331388393
+              }
+            }
+          },
+          "winner": null
+        }
+      ],
+      "selected_groups": [],
+      "selected_features": [],
+      "confirmation_baseline": {
+        "ok": true,
+        "training_metrics": {
+          "n": 16680,
+          "rank_ic": -0.009468544842471897,
+          "mse": 0.04842275989106503,
+          "top_mean_return": -0.0014409132315359645,
+          "all_mean_return": 0.003457454486939932,
+          "best_iteration": 14,
+          "decay_half_life_days": 90.0,
+          "min_weight": 0.05
+        },
+        "test_metrics": {
+          "n": 16680,
+          "rank_ic": -0.009468544842471897,
+          "direction_accuracy": 0.5784172661870504
+        },
+        "portfolio": {
+          "periods": 45,
+          "total_return": 27.443934094517555,
+          "annual_return": 5.519799070110305,
+          "annual_vol": 0.6163065039027891,
+          "sharpe": 8.956256400274743,
+          "max_drawdown": -0.4739218289119801,
+          "win_rate": 0.6888888888888889,
+          "avg_turnover": 0.5288888888888889
+        }
+      },
+      "confirmation_selected": {
+        "ok": false,
+        "message": "选择期没有入选特征组"
+      },
+      "confirmation_comparison": {
+        "rank_ic_gain": null,
+        "sharpe_gain": null,
+        "monthly_win_rate": null,
+        "drawdown_change": null
+      },
+      "confirmed": false
+    }
+  },
+  "promote_to_full_a_backfill": false
+}

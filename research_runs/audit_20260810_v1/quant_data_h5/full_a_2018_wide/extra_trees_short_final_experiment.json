@@ -1,0 +1,241 @@
+{
+  "selection_range": [
+    "2024-08-02",
+    "2026-01-13"
+  ],
+  "holdout_range": [
+    "2026-01-14",
+    "2026-07-13"
+  ],
+  "candidate_params": {
+    "lgbm_weight": 0.85,
+    "ic_weight": 0.03,
+    "elastic_weight": 0.2,
+    "top_n": 2,
+    "gross_exposure": 0.3,
+    "slot_weight": 0.15,
+    "ridge_quantile": 0.7,
+    "pred_quantile": 0.6,
+    "naive_weight": 0.1,
+    "extra_trees_weight": 0.1
+  },
+  "incumbent_params": {
+    "lgbm_weight": 0.85,
+    "ic_weight": 0.03,
+    "elastic_weight": 0.2,
+    "top_n": 2,
+    "gross_exposure": 0.3,
+    "slot_weight": 0.15,
+    "ridge_quantile": 0.7,
+    "pred_quantile": 0.6,
+    "naive_weight": 0.1
+  },
+  "candidate": [
+    {
+      "horizon": 1,
+      "lgbm_weight": 0.85,
+      "ic_weight": 0.03,
+      "elastic_weight": 0.2,
+      "top_n": 2,
+      "gross_exposure": 0.3,
+      "slot_weight": 0.15,
+      "ridge_quantile": 0.7,
+      "pred_quantile": 0.6,
+      "naive_weight": 0.1,
+      "extra_trees_weight": 0.1,
+      "periods": 117,
+      "total_return": 0.6901008531605037,
+      "annual_return": 2.0966257590678024,
+      "annual_vol": 0.18350698708723714,
+      "sharpe": 11.425318416192459,
+      "max_drawdown": -0.026434880588675713,
+      "win_rate": 0.6153846153846154,
+      "direction_win_rate": 0.5683760683760684,
+      "avg_turnover": 0.8660968660968661,
+      "avg_holdings": 2.0
+    },
+    {
+      "horizon": 2,
+      "lgbm_weight": 0.85,
+      "ic_weight": 0.03,
+      "elastic_weight": 0.2,
+      "top_n": 2,
+      "gross_exposure": 0.3,
+      "slot_weight": 0.15,
+      "ridge_quantile": 0.7,
+      "pred_quantile": 0.6,
+      "naive_weight": 0.1,
+      "extra_trees_weight": 0.1,
+      "periods": 116,
+      "total_return": 1.0534284439173587,
+      "annual_return": 1.1848290809757405,
+      "annual_vol": 0.17593550636283511,
+      "sharpe": 6.734451194474895,
+      "max_drawdown": -0.046310383085934825,
+      "win_rate": 0.5948275862068966,
+      "direction_win_rate": 0.521551724137931,
+      "avg_turnover": 0.8649425287356322,
+      "avg_holdings": 2.0
+    },
+    {
+      "horizon": 3,
+      "lgbm_weight": 0.85,
+      "ic_weight": 0.03,
+      "elastic_weight": 0.2,
+      "top_n": 2,
+      "gross_exposure": 0.3,
+      "slot_weight": 0.15,
+      "ridge_quantile": 0.7,
+      "pred_quantile": 0.6,
+      "naive_weight": 0.1,
+      "extra_trees_weight": 0.1,
+      "periods": 115,
+      "total_return": 1.1650616409880676,
+      "annual_return": 0.7580820932749377,
+      "annual_vol": 0.17663815808635663,
+      "sharpe": 4.291723269126929,
+      "max_drawdown": -0.09205881073343891,
+      "win_rate": 0.5652173913043478,
+      "direction_win_rate": 0.5434782608695652,
+      "avg_turnover": 0.8666666666666666,
+      "avg_holdings": 2.0
+    }
+  ],
+  "baseline": [
+    {
+      "horizon": 1,
+      "lgbm_weight": 0.85,
+      "ic_weight": 0.03,
+      "elastic_weight": 0.2,
+      "top_n": 2,
+      "gross_exposure": 0.3,
+      "slot_weight": 0.15,
+      "ridge_quantile": 0.7,
+      "pred_quantile": 0.6,
+      "naive_weight": 0.1,
+      "periods": 117,
+      "total_return": 0.47731920891253465,
+      "annual_return": 1.317510261093418,
+      "annual_vol": 0.17638484268776525,
+      "sharpe": 7.469520855744175,
+      "max_drawdown": -0.04549225624158304,
+      "win_rate": 0.5811965811965812,
+      "direction_win_rate": 0.5427350427350427,
+      "avg_turnover": 0.849002849002849,
+      "avg_holdings": 2.0
+    },
+    {
+      "horizon": 2,
+      "lgbm_weight": 0.85,
+      "ic_weight": 0.03,
+      "elastic_weight": 0.2,
+      "top_n": 2,
+      "gross_exposure": 0.3,
+      "slot_weight": 0.15,
+      "ridge_quantile": 0.7,
+      "pred_quantile": 0.6,
+      "naive_weight": 0.1,
+      "periods": 116,
+      "total_return": 0.7067809927686906,
+      "annual_return": 0.7872821795754976,
+      "annual_vol": 0.17154242510429943,
+      "sharpe": 4.589431326372019,
+      "max_drawdown": -0.08113418676802087,
+      "win_rate": 0.5603448275862069,
+      "direction_win_rate": 0.4870689655172414,
+      "avg_turnover": 0.8477011494252873,
+      "avg_holdings": 2.0
+    },
+    {
+      "horizon": 3,
+      "lgbm_weight": 0.85,
+      "ic_weight": 0.03,
+      "elastic_weight": 0.2,
+      "top_n": 2,
+      "gross_exposure": 0.3,
+      "slot_weight": 0.15,
+      "ridge_quantile": 0.7,
+      "pred_quantile": 0.6,
+      "naive_weight": 0.1,
+      "periods": 115,
+      "total_return": 0.8208090026203809,
+      "annual_return": 0.549195278073028,
+      "annual_vol": 0.16630219868608237,
+      "sharpe": 3.302393368290383,
+      "max_drawdown": -0.11443857714402428,
+      "win_rate": 0.5652173913043478,
+      "direction_win_rate": 0.4956521739130435,
+      "avg_turnover": 0.8492753623188405,
+      "avg_holdings": 2.0
+    }
+  ],
+  "daily_gate": {
+    "promote": true,
+    "reason": "passed",
+    "avg_sharpe_gain": 2.3633824431292356,
+    "improved_horizons": 3,
+    "common_horizons": 3,
+    "worst_drawdown_change": 0.019057375652907327,
+    "details": [
+      {
+        "horizon": 1,
+        "sharpe_candidate": 11.425318416192459,
+        "sharpe_baseline": 7.469520855744175,
+        "sharpe_gain": 3.955797560448284,
+        "max_drawdown_candidate": -0.026434880588675713,
+        "max_drawdown_baseline": -0.04549225624158304,
+        "drawdown_change": 0.019057375652907327
+      },
+      {
+        "horizon": 2,
+        "sharpe_candidate": 6.734451194474895,
+        "sharpe_baseline": 4.589431326372019,
+        "sharpe_gain": 2.1450198681028763,
+        "max_drawdown_candidate": -0.046310383085934825,
+        "max_drawdown_baseline": -0.08113418676802087,
+        "drawdown_change": 0.03482380368208604
+      },
+      {
+        "horizon": 3,
+        "sharpe_candidate": 4.291723269126929,
+        "sharpe_baseline": 3.302393368290383,
+        "sharpe_gain": 0.9893299008365459,
+        "max_drawdown_candidate": -0.09205881073343891,
+        "max_drawdown_baseline": -0.11443857714402428,
+        "drawdown_change": 0.022379766410585367
+      }
+    ]
+  },
+  "stability_gate": {
+    "passed": true,
+    "nonoverlap_improved_horizons": 3,
+    "common_horizons": 3,
+    "monthly_win_rate": 0.7142857142857143,
+    "monthly_wins": 15,
+    "months": 21,
+    "details": [
+      {
+        "horizon": 1,
+        "nonoverlap_candidate_sharpe": 11.425318416192459,
+        "nonoverlap_baseline_sharpe": 7.469520855744175,
+        "monthly_wins": 5,
+        "months": 7
+      },
+      {
+        "horizon": 2,
+        "nonoverlap_candidate_sharpe": 6.986728500036842,
+        "nonoverlap_baseline_sharpe": 5.574827656975754,
+        "monthly_wins": 5,
+        "months": 7
+      },
+      {
+        "horizon": 3,
+        "nonoverlap_candidate_sharpe": 5.297505318083709,
+        "nonoverlap_baseline_sharpe": 3.2288620678775986,
+        "monthly_wins": 5,
+        "months": 7
+      }
+    ]
+  },
+  "promote": true
+}
