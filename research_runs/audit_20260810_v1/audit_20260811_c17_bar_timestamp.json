@@ -1,0 +1,37 @@
+{
+  "audit": "c17_bar_timestamp_semantics",
+  "date": "2026-08-11",
+  "source": {
+    "provider": "AmazingData",
+    "execution_bars": "/www/A/intraday_1400_data/adaptive_label_holdout_2025q4/pilot_execution_bars.parquet",
+    "asof_sample": "/www/A/intraday_1400_data/asof_price/2026-08/000001-000090-50-ae7ab713684f.parquet"
+  },
+  "execution_bars": {
+    "shape": [10180464, 15],
+    "timestamp_dtype": "datetime64[us]",
+    "timestamp_min": "2025-10-31 09:30:00",
+    "timestamp_max": "2026-02-04 14:55:00",
+    "sample_code": "000001",
+    "sample_session": "2025-10-31",
+    "sample_bar_count": 48,
+    "sample_first": "09:30",
+    "sample_morning_last": "11:25",
+    "sample_afternoon_first": "13:00",
+    "sample_last": "14:55",
+    "has_11_30": false
+  },
+  "asof_1400": {
+    "shape": [250, 82],
+    "period": "min5",
+    "asof_time": "14:00",
+    "cutoff_bar_time": "13:55",
+    "bar_count": 36,
+    "is_complete": true
+  },
+  "code_path": {
+    "timestamp_shift_detected": false,
+    "normalization": "pd.to_datetime without bar-time offset"
+  },
+  "conclusion": "START",
+  "reason": "A START-labeled 5-minute session is 09:30..11:25 and 13:00..14:55; a 14:00 snapshot includes the 13:55 bar. END semantics would require 09:35..11:30 and a 14:00 cutoff bar."
+}

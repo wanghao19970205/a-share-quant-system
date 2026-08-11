@@ -231,19 +231,14 @@
 
 - **证据**：`问题` §5.1；`INTRADAY_ASOF_1400_PLAN.md` Batch 0。
 - **动作**：从真实供应商 SDK 样本验证 `kline_time` 是 bar 起始还是结束；若是 END，重算 14:00/14:50 标签。
-- **状态**：待生产样本；fixture 只能证明内部一致，不能结案。
+- **状态**：已完成真实样本外部验证，结论为 START。AmazingData execution bars 为 `10180464×15`，真实样本交易日有 48 根 5 分钟 bar：`09:30..11:25`、`13:00..14:55`，不存在 `11:30`；14:00 as-of 快照明确 `cutoff_bar_time=13:55`、`bar_count=36`、`is_complete=True`。采集/特征代码只做 `pd.to_datetime` 和 cutoff 过滤，没有对供应商 timestamp 加减 5 分钟。若为 END 语义，首根应为 09:35、上午末根应为 11:30、14:00 快照应截止 14:00，与实测不符；因此无需重算 14:00/14:50 标签。证据 `audit_20260811_c17_bar_timestamp.json` SHA256 `78b6bf8bbaa27ced61c04cf3adb1998a2484af2bcf42f9387dd7bd3a9626b999`，本地/远端一致。
 
 ### C18 修复 `_normalize_kline`
 
-- **证据**：`问题` §5.2；`stock_analyzer/amazingdata_source.py:231-245`。
-- **动作**：
-  - 无名 DatetimeIndex 不得静默丢弃；
-  - 显式解析 format；
-  - int/string 时间分别验证；
-  - 丢弃 NaT；
-  - 重复时间戳显式去重或报错；
-  - 同时出现 date/kline_time 时禁止生成重复 date 列。
-- **状态**：待修复。
+- **证据**：`问题` §5.16、P24；`amazingdata_source.py:259-273`。
+- **问题**：未命名 DatetimeIndex 被丢弃后用 `RangeIndex` 伪造 1970 纳秒日期；reset_index 后 rename 可能产生重复 date 列；非法日期不报错。
+- **动作**：显式识别 DatetimeIndex、YYYYMMDD 整数和 date/kline_time；非法日期 fail closed；重复时间戳显式去重或报错；同时出现 date/kline_time 时禁止生成重复 date 列。
+- **状态**：已完成。`_normalize_kline()` 现保留未命名 DatetimeIndex，按 `%Y%m%d` 解析整数/字符串紧凑日期，不再用 `RangeIndex` 伪造日期；无日期来源、索引与同名列冲突、多个原始列归一化成 `date`、非法日期和重复时间戳均 fail-closed。新增 5 个日期主键回归场景，远端模块测试 `23/23`、完整回归 `315/315`、本地/远端编译通过；`amazingdata_source.py` SHA256 `e9becf2dc18d71a82ba878399ccabb806b0d12f6afa4da324db48e79d7583cf6`、测试文件 SHA256 `c47c71235c80bfd58dedcc674868a4959e62ee6168a330599dceb85c2dcdd24e` 本地/远端一致。追加真实 AmazingData 验证：`600000.SH`、`000001.SZ`、`300750.SZ` 在 `2026-08-03..2026-08-07` 均返回 `5×8` 的真实 `RangeIndex + kline_time` schema；隔离新代码均标准化为连续 5 个 `datetime64[ns]` 交易日，日期空值/重复和 OHLC 空值均为 `0`。证据 `audit_20260811_c18_real_kline.json` SHA256 `6c7b240e61de382ddbb6b7ef10471ecb5125bf9819ba779289e9d317dd30edb1`，本地/远端一致。
 
 ### C19 复权和因子版本对账
 
@@ -260,7 +255,7 @@
 
 - **证据**：`问题` P16；`fair_race_pipeline.py:343-362`。
 - **动作**：生产容器固定 pandas 2.x；若实际是 pandas 1.x，所有变体赛跑作废重跑；避免 `deep=False` 写回父 panel。
-- **状态**：已完成。远端 scheduler 镜像实测 pandas 3.0.5，pandas 1.x 污染开关已排除；`panel_for_variant` 的 `daily_h1` 分支已改为 `deep=True`，并补充结果修改不写回父面板的回归断言。本地完整回归 `265/265`、远端隔离聚焦测试 `23/23` 通过。
+- **状态**：已完成。远端 scheduler 镜像实测 pandas 3.0.5，pandas 1.x 污染开关已排除；`panel_for_variant` 的 `daily_h1` 分支已改为 `deep=True`，并补充结果修改不写回父面板的回归断言。本地完整回归 `265/265`、远端隔离聚焦测试 `23/23` 通过。追加真实数据验证：先实证默认 h5 panel 不含 `target_ret_1d`、不能冒充 daily_h1 输入，随后使用真实 `factor_panel_mainboard_active_h1` 月面板 `69126×70` 与 intraday prepared `73321×191` 按 `(code,date)` 一对一合并为 `69113×24`；隔离代码的 daily_h1 目标替换、逐日 excess 中心化、返回对象独立性，以及修改返回 target/真实特征后父 panel 不变均通过。证据 `audit_20260811_c20_real_panel_isolation.json` SHA256 `aa25f837771d8b822012a11371472621806a6082b66f009bdb8f02df5cc331db`，本地/远端一致。
 
 ### C21 holdout 账本和 state hash
 
@@ -300,7 +295,7 @@
 - **问题**：黑名单未覆盖 `pred`、`score`、`prior`、`e4` 等分数形状列名；当前未必已发作，但边界一旦变化会允许模型分数回流特征。
 - **动作**：增加定向前缀黑名单（`e4_`、`prior_`、`daily_pred_` 等），不要粗暴禁掉合法 `rule_score`/`rule_score_chg_5`；建模入口使用显式白名单。
 - **验收**：恶意分数列进入训练时硬失败；合法 rule 特征回归测试继续通过。
-- **状态**：已完成代码修复与隔离验证：增加 `e4_`、`prior_`、`daily_pred_` 定向前缀黑名单，保留合法 `rule_score`；selection manifest 在过滤可用列前硬失败，避免危险列被静默丢弃。新增恶意分数列和合法 rule 特征回归测试，本地完整回归 `265/265`、远端隔离聚焦测试 `51/51` 通过。
+- **状态**：已完成代码修复、隔离测试和真实数据验证：增加 `e4_`、`prior_`、`daily_pred_` 定向前缀黑名单，保留合法 `rule_score`；selection manifest 在过滤可用列前硬失败，避免危险列被静默丢弃。新增恶意分数列和合法 rule 特征回归测试，本地完整回归 `265/265`、远端隔离聚焦测试 `51/51` 通过。2026-08-11 使用只读挂载的隔离源码和真实数据复验 7 套 prepared panel（单月 `15055` 至 `59923` 行）及 3 份真实 selection：所有 panel 的 `rule_score` 均保留为可训练特征，真实 selection 均无禁用因子；在真实 h1 panel 上注入 `e4_live_score/prior_model_score/daily_pred_rank` 后三列全部被特征边界排除，危险 manifest 在过滤前硬失败。最终精确聚焦测试 `3/3`、完整隔离回归 `315/315`、92 个 Python 文件内存编译通过。证据 `audit_20260811_c24_c31_real_validation.json` SHA256 `69185ca944665daf449a6000db079a2c7e49927b73a72767c070e68ac65164f8`。
 
 ### C25 重做“特征无用”判定和模型指标
 
@@ -309,7 +304,7 @@
 - **动作**：先确认 S10 的 `rolling_factor_select`/`purge_horizon` 实际状态；按特征族汇总系数或 grouped permutation importance；去掉 `rule_score`/`rule_score_chg_5` 单独重训以分离规则 alpha；所有模型统一同一切分并按日计算 IC/分位数指标。
 - **验收**：报告同时给单列、特征族、grouped importance、逐日 IC、覆盖率和统一 valid/test 窗口；未完成前禁止写“分数特征无用”。
 - **只读证据（S10）**：2026-08-10 远端 active manifest 显示 `rolling_factor_select=True`、`purge_horizon=True`；现役共线性筛选与 purge 均已开启，但这不替代 grouped importance 和统一切分。
-- **状态**：部分完成，仍未解除“特征无用”禁令。broad/no-rule 严格同切分训练、逐日收益配对 bootstrap 和 rule_score 对照已完成；新增 `audit_20260810_c25_grouped_importance.json` 对两条 factor_audit 做特征族选择/IC 汇总：主要稳定贡献来自 `price_volume`，去除 rule_score 后其他家族统计基本不变。该报告是 grouped selection/IC diagnostics，不是 grouped permutation importance；统一 valid/test 报告和 grouped permutation 仍待补。报告 SHA256：`6d42af4bdd5c7ee556a2ddf33a10410d472a75015ac1f9416e9c3bcaf91e82bd`。
+- **状态**：部分完成，仍未解除“特征无用”禁令。broad/no-rule 同切分训练、逐日收益配对 bootstrap 和 rule_score 对照已完成，但必须按证据强度降级解读：`audit_20260810_c25_grouped_importance.json` 只是 grouped selection/IC 汇总，broad/no-rule 的 19 个共同 top 因子稳定度与 abs IC 均未变化，构造上不能回答共线性、交互或 grouped permutation；该报告由 `engineering.py` SHA256 `adeb71c475c76822b2a8b42e9b87ee519a369a8a35c831dd82c5dbb86f6dff26` 生成，早于 C24/C30 的危险前缀和公告时点修复，基本面族结果带 pre-fix 限制。真正可用的 `broad_vs_norule` 证据仅表明 rule_score 在 67 因子池中 `12/12` 窗入选、mean IC `-0.0324`；去除后总收益从 `-19.80%` 降至 `-29.51%`，但配对差 `6.53bp/调仓`、p=`0.7102`、CI `[-25.94,40.88]bp`，边际贡献不可区分于噪声。不得据此写“分数特征无用”，也不得用 33/65/67 因子 Sharpe 差异作“低质量因子稀释信号”的因果结论。统一 valid/test、真实 grouped permutation 和有功效的重训仍待补。报告 SHA256：`6d42af4bdd5c7ee556a2ddf33a10410d472a75015ac1f9416e9c3bcaf91e82bd`。
 
 ### C26 修复生产 active 产物、成本和融合搜索的可变性
 
@@ -361,7 +356,7 @@
 - **问题**：`best` 只在 `try` 内绑定，网格异常后触发 `UnboundLocalError`，再被包装成“无法读取 incumbent 参数”，导致一次网格失败中止日更并误导排障。
 - **动作**：在 `try` 前初始化 `best=None`，保留原参数的失败语义；区分网格失败、incumbent 读取失败和发布失败。
 - **验收**：构造网格异常时发布不漂移、不误报；错误类型和原始异常保留；正常网格路径回归通过。
-- **状态**：已完成代码修复与隔离验证：incumbent 读取异常单独拒绝发布，short grid 异常只保留 incumbent，缺失的 swing grid 调用不再包装成 incumbent 读取失败；本地完整回归 `265/265`、远端隔离聚焦测试 `51/51` 通过，生产路径未触碰。
+- **状态**：已完成代码修复、隔离测试和真实数据验证：incumbent 读取异常单独拒绝发布，short grid 异常只保留 incumbent，缺失的 swing grid 调用不再包装成 incumbent 读取失败；本地完整回归 `265/265`、远端隔离聚焦测试 `51/51` 通过，生产路径未触碰。2026-08-11 在源码和数据均只读挂载的容器中，使用真实 `1402229` 行短线预测、真实 `3193` 只优化股票池及 active manifest 的 champion 参数注入网格异常；函数返回 `None`，日志保留原始 `RuntimeError: audit-real-grid-failure` 并明确“保留原参数”，未误报 incumbent 读取失败。manifest、预测和股票池三个输入的前后 SHA256 完全一致。最终精确聚焦测试 `3/3`、完整隔离回归 `315/315`、92 个 Python 文件内存编译通过。证据 `audit_20260811_c24_c31_real_validation.json` SHA256 `69185ca944665daf449a6000db079a2c7e49927b73a72767c070e68ac65164f8`。
 
 ### C32 统一纯日线候选与在位 baseline 的冠军配置对比
 
@@ -377,7 +372,7 @@
 - **问题**：swing 显示 h10 但训练未进入 swing horizon，用户看到的“10 日预期”可能来自 h1；`lgbm_weight` 不进网格；池化 `_metrics` 与逐日选股能力混淆，Ridge/Ranker 使用不同切分。
 - **动作**：真正训练 h10 或将显示标签改回 h1；把 lgbm/影子腿权重纳入预注册搜索；统一 valid/test 窗口，所有 IC/分位数按日汇总。
 - **验收**：用户可见 horizon 与训练标签、预测文件列和 manifest 三者一致；报告包含逐日指标和统一切分；未完成前禁止展示 swing h10 alpha。
-- **状态**：待修复。
+- **状态**：部分完成。2026-08-11 远端只读对账确认 `DERIVE_FROM={"swing_7_15":"short_1_3"}` 且训练循环排除派生风格，旧 active manifest 却把复用的 short h1 预测标为 swing h10；增量刷新还会冻结陈旧 `prediction_horizon`。隔离修复新增 `_published_prediction_horizons()`：派生风格发布真实源模型 horizon，全量与增量 manifest 同步修正 `prediction_horizon/prediction_horizons`、artifact horizon 及 summary/returns/holdings 来源；7/10/15 仅保留为持有期评估集合，不再冒充 h10 模型输出。训练 profile 也改为明确“只训练短线，派生风格复用预测”。C33 定点测试远端 `1/1`、完整回归 `310/310`、编译通过；`scheduled_workflow.py` SHA256 `f345b9477bd0d61e072e3d5a28efd36b5b707eea7c457e9c8ac240b51548bed5`、共享测试文件 SHA256 `ac7c6796bd7c59f4887117fd0e8934f130be3f3a674376c845b4e96f099427cd` 本地/远端一致。追加真实 active 数据验证：short 文件 `1819978×18`（2024-02-02 起）、swing 文件 `6983002×18`（2020-02-03 起），历史长度不同，不能用整文件 SHA 相等作为复用判据；在共同最新日 `2026-08-07`，两者均为 `3011` 行且代码一一对应，`pred/ridge/lgbm/ic/base/elastic/extra_trees` 七列逐项完全一致，证明当前 swing 最新预测实际复用 short h1。隔离新映射将两者 `prediction_horizon` 均记为 `1`，与真实工件一致。证据 `audit_20260811_c33_real_active_horizon.json` SHA256 `a7823cc38d6b8c7efb4a5cb8a56f0b68fbff6f8048fb36a38e42c23fa5953a16`，本地/远端一致。尚未重建 active manifest，统一 valid/test 窗口和逐日统计仍待闭合，生产未启用新语义。
 
 ### C34 复核分数特征与规则 alpha 的可分离性
 
@@ -446,7 +441,7 @@
 - **共同日期诊断**：h3/h5/h10 共同 `205` 天（2025-09-02..2026-07-10），Top5、20bp、no-refill、`stride=horizon`。h3/h5/h10 分别 `69/41/21` 个周期；h5 tradable coverage `97.77%`，该缺口必须保留。
 - **配对控制结果**：h3 相对 market `+73.47bp/周期`，CI `[-19.86,172.47]bp`，Holm p=`0.9492`；h5 `+21.18bp`，CI `[-92.62,133.67]bp`，Holm p=`1.0`；h10 `+62.91bp`，CI `[-94.99,240.56]bp`，Holm p=`1.0`。三者相对 random/shuffle 的 CI 也全部跨 0。
 - **报告**：`audit_20260810_horizon_controls.json`，SHA256 `5eba3c2b6d37ffa580a7cea2eb982a36b413a68a0c0c0907ef3c0d4fac8638f4`；200 seeds、5000 bootstrap、block=5、9 项 Holm family。
-- **状态**：严格 h5 和共同日期控制已完成；没有 horizon 通过 Holm 0.05，全部禁止晋级或写入 active。
+- **状态**：仅严格 h5 和共同日期控制已完成；没有 horizon 通过 Holm 0.05，因此全部禁止晋级或写入 active，但这不等于“无 alpha”。观测上 h3/h5/h10 的毛收益分别约 `84.02/29.65/67.05bp`，扣除约 `18.11/17.69/18.81bp` 成本后净收益仍为 `+65.91/+11.96/+48.24bp/周期`，对应 market 为 `-7.56/-9.22/-14.67bp`，是值得继续验证的正向机制线索。当前功效不足：对 market 的观测差约 `73.47/21.18/62.91bp`，但 CI 均跨 0，不能把未显著反向解释为无效。更关键的是三条 horizon 不同流水线：`validation_summary.json` 明确 h3/h10 `strict=false`、原产物缺可交易列；h3 的 input SHA 与 `diagnostic_old_predictions_not_frozen_holdout` 报告相同，严格列来自事后 join，而 h5 才是逐股 purge、3 个月 validation 的严格重训，故当前效应大小不得用于 horizon 排名。报告还缺 `positive_only/pred_quantile/max_weight/no_refill/universe hash`，现金比例 h3/h5/h10 分别约 `45.51%/6.83%/0.95%`，必须统一并解释。下一步应在同一严格流水线、同一 universe/recipe、预注册参数和更长非重叠样本上重跑，并先做功效设计。
 
 ### C40 持久化 factor IC cache，避免重启重复计算
 
@@ -456,6 +451,12 @@
 - **状态**：已完成。本地完整回归 `264/264`、远端聚焦测试通过；prepared panel 104 个月直接复用，窗口 53–57 cache-hit 仅约 `0.07–0.09s/窗`，factor IC 已持久化为 parquet，后续窗口 selection 降至约 `35–38s`。
 
 ## 八、生产隔离和发布纪律
+
+### 快照与复核版本约束
+
+- 复核不得按同名文件路径或 mtime 猜测“最新清单”；每个导出批次必须只指定一份 canonical 清单，并用 manifest 同时绑定清单 SHA256、代码文件 SHA256、报告 SHA256 和 Git commit。
+- 2026-08-11 核查确认 GitHub `main` commit `feb2208` 是不完整复核快照：报告和多份清单已提交，但 C22-C40 的主体修复仍只存在于隔离 `research_runs/audit_20260810_v1/source`，Git 根代码对 15 个关键符号命中均为 `0`，8 个抽查关键文件 hash 与隔离 source 全部不同。此前“源代码已推送”的表述错误；在完成同批次代码导出前，GitHub 快照只能用于报告数据复核，不能用于判断清单代码状态。
+- 后续稳定批次提交时必须包含 canonical source、测试、清单和证据 manifest；提交后从 GitHub 新 clone 复算逐文件 SHA，并用符号 smoke test 验证关键入口存在，不能只核对远端工作树。
 
 - [x] 研究修改先在本地测试，再按文件同步远端并做 SHA256 校验。
 - [x] 远端生产 `/www/A` 原有 dirty 改动未被覆盖；已同步文件逐一核对。

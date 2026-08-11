@@ -231,19 +231,14 @@
 
 - **证据**：`问题` §5.1；`INTRADAY_ASOF_1400_PLAN.md` Batch 0。
 - **动作**：从真实供应商 SDK 样本验证 `kline_time` 是 bar 起始还是结束；若是 END，重算 14:00/14:50 标签。
-- **状态**：待生产样本；fixture 只能证明内部一致，不能结案。
+- **状态**：已完成真实样本外部验证，结论为 START。AmazingData execution bars 为 `10180464×15`，真实样本交易日有 48 根 5 分钟 bar：`09:30..11:25`、`13:00..14:55`，不存在 `11:30`；14:00 as-of 快照明确 `cutoff_bar_time=13:55`、`bar_count=36`、`is_complete=True`。采集/特征代码只做 `pd.to_datetime` 和 cutoff 过滤，没有对供应商 timestamp 加减 5 分钟。若为 END 语义，首根应为 09:35、上午末根应为 11:30、14:00 快照应截止 14:00，与实测不符；因此无需重算 14:00/14:50 标签。证据 `audit_20260811_c17_bar_timestamp.json` SHA256 `78b6bf8bbaa27ced61c04cf3adb1998a2484af2bcf42f9387dd7bd3a9626b999`，本地/远端一致。
 
 ### C18 修复 `_normalize_kline`
 
-- **证据**：`问题` §5.2；`stock_analyzer/amazingdata_source.py:231-245`。
-- **动作**：
-  - 无名 DatetimeIndex 不得静默丢弃；
-  - 显式解析 format；
-  - int/string 时间分别验证；
-  - 丢弃 NaT；
-  - 重复时间戳显式去重或报错；
-  - 同时出现 date/kline_time 时禁止生成重复 date 列。
-- **状态**：待修复。
+- **证据**：`问题` §5.16、P24；`amazingdata_source.py:259-273`。
+- **问题**：未命名 DatetimeIndex 被丢弃后用 `RangeIndex` 伪造 1970 纳秒日期；reset_index 后 rename 可能产生重复 date 列；非法日期不报错。
+- **动作**：显式识别 DatetimeIndex、YYYYMMDD 整数和 date/kline_time；非法日期 fail closed；重复时间戳显式去重或报错；同时出现 date/kline_time 时禁止生成重复 date 列。
+- **状态**：已完成。`_normalize_kline()` 现保留未命名 DatetimeIndex，按 `%Y%m%d` 解析整数/字符串紧凑日期，不再用 `RangeIndex` 伪造日期；无日期来源、索引与同名列冲突、多个原始列归一化成 `date`、非法日期和重复时间戳均 fail-closed。新增 5 个日期主键回归场景，远端模块测试 `23/23`、完整回归 `315/315`、本地/远端编译通过；`amazingdata_source.py` SHA256 `e9becf2dc18d71a82ba878399ccabb806b0d12f6afa4da324db48e79d7583cf6`、测试文件 SHA256 `c47c71235c80bfd58dedcc674868a4959e62ee6168a330599dceb85c2dcdd24e` 本地/远端一致。追加真实 AmazingData 验证：`600000.SH`、`000001.SZ`、`300750.SZ` 在 `2026-08-03..2026-08-07` 均返回 `5×8` 的真实 `RangeIndex + kline_time` schema；隔离新代码均标准化为连续 5 个 `datetime64[ns]` 交易日，日期空值/重复和 OHLC 空值均为 `0`。证据 `audit_20260811_c18_real_kline.json` SHA256 `6c7b240e61de382ddbb6b7ef10471ecb5125bf9819ba779289e9d317dd30edb1`，本地/远端一致。
 
 ### C19 复权和因子版本对账
 
@@ -260,7 +255,7 @@
 
 - **证据**：`问题` P16；`fair_race_pipeline.py:343-362`。
 - **动作**：生产容器固定 pandas 2.x；若实际是 pandas 1.x，所有变体赛跑作废重跑；避免 `deep=False` 写回父 panel。
-- **状态**：已完成。远端 scheduler 镜像实测 pandas 3.0.5，pandas 1.x 污染开关已排除；`panel_for_variant` 的 `daily_h1` 分支已改为 `deep=True`，并补充结果修改不写回父面板的回归断言。本地完整回归 `265/265`、远端隔离聚焦测试 `23/23` 通过。
+- **状态**：已完成。远端 scheduler 镜像实测 pandas 3.0.5，pandas 1.x 污染开关已排除；`panel_for_variant` 的 `daily_h1` 分支已改为 `deep=True`，并补充结果修改不写回父面板的回归断言。本地完整回归 `265/265`、远端隔离聚焦测试 `23/23` 通过。追加真实数据验证：先实证默认 h5 panel 不含 `target_ret_1d`、不能冒充 daily_h1 输入，随后使用真实 `factor_panel_mainboard_active_h1` 月面板 `69126×70` 与 intraday prepared `73321×191` 按 `(code,date)` 一对一合并为 `69113×24`；隔离代码的 daily_h1 目标替换、逐日 excess 中心化、返回对象独立性，以及修改返回 target/真实特征后父 panel 不变均通过。证据 `audit_20260811_c20_real_panel_isolation.json` SHA256 `aa25f837771d8b822012a11371472621806a6082b66f009bdb8f02df5cc331db`，本地/远端一致。
 
 ### C21 holdout 账本和 state hash
 
@@ -300,7 +295,7 @@
 - **问题**：黑名单未覆盖 `pred`、`score`、`prior`、`e4` 等分数形状列名；当前未必已发作，但边界一旦变化会允许模型分数回流特征。
 - **动作**：增加定向前缀黑名单（`e4_`、`prior_`、`daily_pred_` 等），不要粗暴禁掉合法 `rule_score`/`rule_score_chg_5`；建模入口使用显式白名单。
 - **验收**：恶意分数列进入训练时硬失败；合法 rule 特征回归测试继续通过。
-- **状态**：已完成代码修复与隔离验证：增加 `e4_`、`prior_`、`daily_pred_` 定向前缀黑名单，保留合法 `rule_score`；selection manifest 在过滤可用列前硬失败，避免危险列被静默丢弃。新增恶意分数列和合法 rule 特征回归测试，本地完整回归 `265/265`、远端隔离聚焦测试 `51/51` 通过。
+- **状态**：已完成代码修复、隔离测试和真实数据验证：增加 `e4_`、`prior_`、`daily_pred_` 定向前缀黑名单，保留合法 `rule_score`；selection manifest 在过滤可用列前硬失败，避免危险列被静默丢弃。新增恶意分数列和合法 rule 特征回归测试，本地完整回归 `265/265`、远端隔离聚焦测试 `51/51` 通过。2026-08-11 使用只读挂载的隔离源码和真实数据复验 7 套 prepared panel（单月 `15055` 至 `59923` 行）及 3 份真实 selection：所有 panel 的 `rule_score` 均保留为可训练特征，真实 selection 均无禁用因子；在真实 h1 panel 上注入 `e4_live_score/prior_model_score/daily_pred_rank` 后三列全部被特征边界排除，危险 manifest 在过滤前硬失败。最终精确聚焦测试 `3/3`、完整隔离回归 `315/315`、92 个 Python 文件内存编译通过。证据 `audit_20260811_c24_c31_real_validation.json` SHA256 `69185ca944665daf449a6000db079a2c7e49927b73a72767c070e68ac65164f8`。
 
 ### C25 重做“特征无用”判定和模型指标
 
@@ -309,7 +304,7 @@
 - **动作**：先确认 S10 的 `rolling_factor_select`/`purge_horizon` 实际状态；按特征族汇总系数或 grouped permutation importance；去掉 `rule_score`/`rule_score_chg_5` 单独重训以分离规则 alpha；所有模型统一同一切分并按日计算 IC/分位数指标。
 - **验收**：报告同时给单列、特征族、grouped importance、逐日 IC、覆盖率和统一 valid/test 窗口；未完成前禁止写“分数特征无用”。
 - **只读证据（S10）**：2026-08-10 远端 active manifest 显示 `rolling_factor_select=True`、`purge_horizon=True`；现役共线性筛选与 purge 均已开启，但这不替代 grouped importance 和统一切分。
-- **状态**：部分完成，仍未解除“特征无用”禁令。broad/no-rule 严格同切分训练、逐日收益配对 bootstrap 和 rule_score 对照已完成；新增 `audit_20260810_c25_grouped_importance.json` 对两条 factor_audit 做特征族选择/IC 汇总：主要稳定贡献来自 `price_volume`，去除 rule_score 后其他家族统计基本不变。该报告是 grouped selection/IC diagnostics，不是 grouped permutation importance；统一 valid/test 报告和 grouped permutation 仍待补。报告 SHA256：`6d42af4bdd5c7ee556a2ddf33a10410d472a75015ac1f9416e9c3bcaf91e82bd`。
+- **状态**：部分完成，仍未解除“特征无用”禁令。broad/no-rule 同切分训练、逐日收益配对 bootstrap 和 rule_score 对照已完成，但必须按证据强度降级解读：`audit_20260810_c25_grouped_importance.json` 只是 grouped selection/IC 汇总，broad/no-rule 的 19 个共同 top 因子稳定度与 abs IC 均未变化，构造上不能回答共线性、交互或 grouped permutation；该报告由 `engineering.py` SHA256 `adeb71c475c76822b2a8b42e9b87ee519a369a8a35c831dd82c5dbb86f6dff26` 生成，早于 C24/C30 的危险前缀和公告时点修复，基本面族结果带 pre-fix 限制。真正可用的 `broad_vs_norule` 证据仅表明 rule_score 在 67 因子池中 `12/12` 窗入选、mean IC `-0.0324`；去除后总收益从 `-19.80%` 降至 `-29.51%`，但配对差 `6.53bp/调仓`、p=`0.7102`、CI `[-25.94,40.88]bp`，边际贡献不可区分于噪声。不得据此写“分数特征无用”，也不得用 33/65/67 因子 Sharpe 差异作“低质量因子稀释信号”的因果结论。统一 valid/test、真实 grouped permutation 和有功效的重训仍待补。报告 SHA256：`6d42af4bdd5c7ee556a2ddf33a10410d472a75015ac1f9416e9c3bcaf91e82bd`。
 
 ### C26 修复生产 active 产物、成本和融合搜索的可变性
 
@@ -326,7 +321,7 @@
 - **问题**：仓库没有真实交易日历，缺失时静默用 `weekday()<5`；标签、rolling、持有期、卖出顺延和 purge 大量按行位移，停牌期间可能被无代价跳过；sentiment 用自然日衰减，约稀释 40%。
 - **动作**：生成并 hash `trading_calendar.parquet`，缺失即失败；所有 shift/rolling/持有期/purge 按股票交易日历；日线链补 `risk_trading_gap_days`；sentiment 改交易日衰减。
 - **验收**：长假、停牌、月末、跨年 fixture 覆盖标签、平仓、rolling、purge；报告输出日历 hash 和实际交易日数。
-- **状态**：待权威数据，禁止按 prepared 行并集冒充交易所日历。C27 隔离探测在远端数据目录发现 0 个 calendar/trade_cal/trading_day 候选文件；44 个代码命中均为 prepared 月文件派生日历，或读取实际不存在的 `trading_calendar.parquet`。在取得交易所开闭市源之前不修改生产 shift/rolling/purge 语义。探测报告 SHA256：`91e6e87e5cf7a1ea21ce161df5d0144c26cc8b223eca520e7fc5c93fdb56dcab`。
+- **状态**：部分完成，权威日历获取与隔离落盘已闭合，下游交易日语义尚未闭合。`a-share-quant-system` 已通过 AmazingData `BaseData.get_calendar()` 获取开市日，日更入口校验单列、非空、唯一、递增后使用原子 parquet 写入；供应商不可用时不伪造 weekday 日历。远端隔离制品 `/www/A/research_runs/audit_20260810_v1/quant_data_c27/trading_calendar.parquet` 为 `datetime64[ns]` 单列、`8701` 行，覆盖 `1990-12-19` 至 `2026-08-11`，空值/重复均为 `0`，SHA256 `36707acd2d02fec4784ec5bbf1c0957120e370252fcbab0c700eea3b7d52f259`。本地完整回归 `269/269`、远端 pandas 3 隔离聚焦测试 `13/13` 通过；同步测试文件本地/远端 SHA256 均为 `3824c160eb3d7bd16f261d712fc81e37f3557aec2813b67c330577f07a2ed39d`。sentiment 候选现严格读取该单列权威日历：休市日不产生衰减步长，周末/节假日文章映射到下一开市日，日历缺失、非法或未覆盖请求结束日直接失败；周末映射和缺日 fixture 通过，本地完整回归 `281/281`、远端隔离聚焦 `2/2`，`sentiment_signal.py` SHA256 `73da47fae641b05f5d78200fc3b6759c76ecfea14d2aea0db4b740f34d582309` 逐文件一致；共享测试文件后续随 C29 回归扩展，当前本地/远端 SHA256 均为 `16a74132f6fff2ff010b8d1feb23e864a4f4ed33ff3e5b10a65037b02817960f`。日线面板新增显式研究开关 `include_trading_gap_risk=True`：日历只加载一次，以权威开市日 ordinal 计算逐股 `risk_trading_gap_days`，长假或跨年后的相邻开市日为 `1`，个股缺失一个市场 session 后恢复为 `2`；价日期不在日历中直接失败。该列被列入禁用特征，只作为缺口诊断，不自动进入因子选择；默认开关为 `False`，未改变生产训练。长假、停牌缺行、月末/跨年、日历缺日期、full/incremental 等价和贯通 fixture 本地/远端聚焦均 `6/6` 通过，本地完整回归 `289/289`；`engineering.py` SHA256 `c33728f7e43017d6d42f5b8fdeab61c63437c2105c89d6b19b3019d2a4fd78e7`、共享测试文件 SHA256 `07f074dd70ebb8886664ac05373632a6cdfeccdd888e82dcf4f7e614b34077cf` 均逐文件一致。`price_tradability()` 新增显式 `require_calendar=True` 研究模式：先按权威开市 session 补齐逐股时间轴，停牌缺价格行视为不可交易；固定 horizon 的 `target_ret/open_ret` 不再免费跨过停牌，`tradable_ret` 结合 PIT 状态顺延到下一可卖 session，计算后只返回原始观测日，尾部未成熟标签保持 NaN。默认关闭，旧生产行位移语义不变。停牌缺行、动态状态、缺状态和零成交远端聚焦 `4/4`、远端完整回归 `294/294` 通过；`tradability.py` SHA256 `e6c79d9f7afccfe2f0b1bea38c6957f0a90a8b9a4437bbbd160d8fe21144e379`、共享测试文件 SHA256 `425c4ddf240fb700ee97e412a90cf9d7bc10ba91dc3a91ba7a7099034dc4b273` 本地/远端一致。训练入口新增显式 `--strict-execution-labels`：仅允许非 baseline 模式，强制同时使用权威日历和 PIT 状态；strict/legacy 的内存标签缓存键隔离，strict 语义进入 recipe signature，禁止误复用旧窗口预测缓存。默认关闭，不改变生产训练。训练接入/缓存/标签聚焦测试远端 `4/4`、远端完整回归 `295/295`；`full_train_batched.py` SHA256 `4e4f18c75ba15413e7328d008d6b24d5ead5ec6c4ffd6990c91f931330b0fe77`、共享测试文件 SHA256 `c7383b82b27e832df082adf3dfd86a5a91a137c115118b2fed54eac6135594f8` 本地/远端一致。strict purge 已改用权威市场 session 边界，`horizon + sell-roll cap - 1` 按开市序列回退，不再受个股停牌缺行或自然日长假影响；旧模式继续使用逐股保守行边界。长假/旧 purge/标签跨度/缓存聚焦测试远端 `4/4`、远端完整回归 `296/296`；`full_train_batched.py` SHA256 `fb7d460b2d0e33d1c98646f9f0d6fe359b0216986ca426b0115fa532a0f78063`、共享测试文件 SHA256 `712272772fdfb18f0ec1ef710cfc633730e54c424bc580ed754e64f38f7db974` 本地/远端一致。价格因子新增显式 `strict_calendar_factors=True`：先按权威市场 session 补轴计算 `pct_change/rolling`，停牌缺行占据窗口位置，计算后仅输出真实观测日；日历按文件 size/mtime 签名做进程内缓存，每个 worker 最多读取一次。默认关闭。停牌 rolling、增量一致性、面板贯通和 gap fixture 远端 `4/4`、远端完整回归 `297/297`；`engineering.py` SHA256 `15c5488776f5b7fca089e6fb4ca4743e9339493ea8476c411502d3c6cdf11b42`、共享测试文件 SHA256 `138e088f48df947621db3dfb3fa69a5b3a9d040763fa2c8dd124ba7899bfe7db` 本地/远端一致。C27 的显式严格研究链已覆盖情绪衰减、gap 诊断、标签/持有期/卖出顺延、rolling 和 purge；仍需扩大真实价仓覆盖验证，完成前不修改生产默认语义，也不据此重排收益结论。原缺数探测报告保留为接入前证据，SHA256 `91e6e87e5cf7a1ea21ce161df5d0144c26cc8b223eca520e7fc5c93fdb56dcab`。
 
 ### C28 修复宇宙生存者偏差和盘中 codes-file 来源不明
 
@@ -335,7 +330,7 @@
 - **动作**：按月保存 PIT 宇宙快照并按窗口起始日读取；外部退市名单做上界回测；对价格文件/池文件做只读数量与 hash 对账；将 universe codes 纳入 recipe hash；盘中链必须声明、固化并校验 codes-file 来源。
 - **验收**：每个报告有 universe snapshot hash、起止日期、退市处理和代码覆盖率；缺失来源或历史池不可复现时直接禁止比较。
 - **只读证据（S9）**：2026-08-10 远端 `price/` 有 `5533` 个 parquet，active 主板池去除注释后为 `3193` 行；其中主板前缀且不在 active 的仅 `3` 只，差异主要是 `300/301/302/688/689/920` 等非主板代码。价格仓与 active 池仍不是同一宇宙，但不能把 `2339` 全部解释为退市偏差。
-- **状态**：待权威数据/待修复；真正退市主板上界较小，主要 survivorship 风险仍来自 PIT 成分和 `min_price_rows` 历史准入。C28 隔离探测仅发现 `full_a_universe.txt` 和 `mainboard_active_universe.txt` 两个静态列表，没有上市/退市日期、历史成分或证券主数据 parquet，因此不能从现有快照构造 PIT 宇宙。探测报告 SHA256：`0d5bad671d17fb36270aa9d8ecceb205a8303015b58d02118a5a5b1ca7f93f31`。
+- **状态**：部分完成，PIT 原料获取、严格规范化和隔离落盘已闭合，但尚未切换生产训练宇宙。AmazingData 实测 `get_stock_basic` 提供 `LISTDATE/DELISTDATE/LISTPLATE_NAME/IS_LISTED`，三指数 `get_index_constituent` 提供 `INDATE/OUTDATE`；schema 探测报告 `audit_20260811_c28_amazingdata_schema_v2.json` SHA256 `de7176fbac831cde51c291b8908a1d908fcb4363ac7b9f0d826cccd3c247001e`。新增显式 `refresh_pit_reference_data()`，只原子写研究数据，不接管现有 `universe()`、active manifest 或生产训练。远端隔离 `security_master.parquet` 为 `5542` 行，上市日覆盖 `1990-12-19` 至 `2026-08-11`，重复代码/逆序区间均为 `0`，SHA256 `f59c760e428ceb4f85d39692c870c072582be5301226c8b75d45c4d18ed5281c`；`index_constituent_history.parquet` 为 `7133` 行（沪深300 `1226`、中证500 `2468`、中证1000 `3439`），`5333` 条闭合区间，重复键/逆序区间均为 `0`，SHA256 `509c0baf4fbedfb95933fc340e1aa83e1dd45374f9c5f123a8187d2738220b9e`。真实历史含 `T00018.SH` 非标准占位成员，现保留原始 `market_code` 并标注 `is_standard_a_share=False`，不再误判为坏数据。聚焦测试本地/远端 `18/18`、本地完整回归 `274/274` 通过。限制：证券主数据 `DELISTDATE` 实测全空，但有 `21` 行 `IS_LISTED!=1`，且代码集未证明覆盖全部历史退市证券，不能单靠该表解除股票级 survivorship；新增纯本地 `resolve_pit_window_universe()` 研究入口，以训练窗口起点为 anchor，按半开区间 `[in_date,out_date)` 与 `[list_date,delist_date)` 固定解析指数成分和上市交集，排除非标准历史成员，返回排序 codes、两份源文件内容 SHA256、universe hash 和 manifest hash；缺文件、缺 schema、逆序区间、无指数记录或空结果均 fail-closed。`pit_universe_manifest_hash` 会改变 recipe signature，而旧 `universe_codes` 忽略规则保持兼容。真实工件指数编码已核对为 `000300.SH/000852.SH/000905.SH`；远端以 `2024-01-02` 为 anchor 解析沪深 300 得 `298` 只，universe hash `35d14be7106055013f686145a2d5b0987bf19f7d98f22b8f7803003007b93331`、manifest hash `ec8e16c3e4afe27243251e79e0ffbac75372092ce0e504e884160860c81581bc`。边界/schema/cache 聚焦测试本地/远端均 `3/3`，本地完整回归 `292/292`；`full_train_batched.py` SHA256 `761598da7ca40798bec292eff3826ec616cdc921ffeaae7f748a098324f93c34`、共享测试文件 SHA256 `85ab92eb2ec4040268c4e05735d10f90f2730dcd6ed2f177fc1a2f6b3b903f34` 均逐文件一致。训练入口新增显式 `--pit-index-code`：每个 walk-forward 窗口以 `train_start` 解析固定 PIT universe，与静态池取交集，空交集 fail-closed；窗口 manifest hash 进入缓存键，缓存命中后仍按同一集合过滤，训练结束落盘窗口 anchor、代码数量、universe/manifest hash 和两份源文件 SHA256。默认不传时生产行为不变。PIT 交集/空集/边界/cache 聚焦测试远端 `4/4`、远端完整回归 `299/299`；`full_train_batched.py` SHA256 `7008e150cb5867bcefa58351251a43a0c3d9294575f521971753f1da9fe46ef6`、共享测试文件 SHA256 `f66aab3a0ba9bca883c73445790705f0fd5157ac8a4f0f623b3d62a5acdc5847` 本地/远端一致。盘中 collector 现将 `--codes-file` 的绝对路径、原文件 SHA256/字节数、完整去重代码数、limit 后有效代码数和 limit 固化到原子报告；文件不存在、无合法六位代码或有效池为空均 fail-closed。provenance 聚焦测试远端通过、远端完整回归 `302/302`；`collector.py` SHA256 `9d2fe73fc8996dd96e875766c86d2445570a59006b6e1b1e8cfb24c5df0e212b`、盘中测试文件 SHA256 `510b84a0356d53c5c0fa873e6a88af1302b29923a2badd37d5a18166352d8ba6` 本地/远端一致。供应商 `OUTDATE` 是否为生效日仍需文档确认，因此当前半开边界只作为显式研究契约。2026-08-11 schema 快照显示 `000300.SH` 成分 `1226` 行，其中 `OUTDATE` 非空 `926` 行、空值 `300` 行，非空日期范围 `2005-06-30` 至 `2026-06-12`；样本同时包含已闭合区间和空 `OUTDATE` 的开放区间，但 schema 不说明退出日是调整日、下一交易日还是其他生效时点，故仍不能解除语义禁令。证据 `audit_20260811_c28_amazingdata_schema_v2.json` SHA256 `de7176fbac831cde51c291b8908a1d908fcb4363ac7b9f0d826cccd3c247001e`。原静态数据缺口探测报告 SHA256 `0d5bad671d17fb36270aa9d8ecceb205a8303015b58d02118a5a5b1ca7f93f31` 保留为接入前证据。
 
 ### C29 补齐 ST、新股、停牌和流动性口径
 
@@ -343,7 +338,7 @@
 - **问题**：没有 `is_st`、上市日期、退市整理期或绝对流动性阈值；±9.5% 硬编码误判 ST 和上市首日；日线停牌按陈旧收盘成交，盘中链已有的 suspended 语义未移植；`risk_amount_vs_median_20` 缺少 `shift(1)`。
 - **动作**：加入 ST/板块/上市日/退市日字段，参数化涨跌停阈值；停牌买卖和顺延与盘中链统一；增加成交额/ADV 门；修 `risk_amount_vs_median_20` 的 lag。
 - **验收**：ST、上市首日、退市整理、停牌、零成交和低流动性 fixture 均有明确状态；缺字段不得默认可买可卖。
-- **状态**：部分完成。`risk_amount_vs_median_20` 已改为仅使用截至前一交易日的 20 日成交额中位数，避免当日成交额进入自身基准；本地 `intraday_1400` 回归 `142/142` 通过。ST/上市日/退市日、参数化涨跌停、日线停牌和绝对流动性门仍待权威数据，不在字段缺失时猜测生产语义。
+- **状态**：部分完成。`risk_amount_vs_median_20` 已改为仅使用截至前一交易日的 20 日成交额中位数，避免当日成交额进入自身基准；本地 `intraday_1400` 回归 `142/142` 通过。日线可交易口径显式读取 `volume`：零成交当日 `buyable_close=False`、次日零成交 `buyable_next=False`；卖出顺延跳过零成交日，整个有界窗口均不可成交时返回 NaN，不再按陈旧收盘伪造成交。AmazingData `get_history_stock_status` 已验证并隔离落盘逐日 `high_limit/low_limit`、ST、停牌、退市整理和除权状态；研究入口新增显式 `require_status=True`，按 `(code,date)` 一对一合并，使用供应商逐日精确涨跌停价，缺状态、停牌或退市整理均 fail-closed，卖出顺延跳过不可交易日；默认 `False`，因此未改变现有生产行为。真实隔离制品 `/www/A/research_runs/audit_20260810_v1/quant_data_c29_status/trading_status_history.parquet` 为 `21448` 行、`7` 只股票、无重复键，含 `439` 个 ST 行、`382` 个停牌行和 `54` 个退市整理行，SHA256 `9eb421ed83ce5a876d082c360ef409b4ab23c4a87eab2379765e0bd62c1675c3`；ST 样本同时存在 `5%`（`138` 行）和 `10%`（`301` 行）涨停率，实证否定“ST 固定 5%”猜测。零成交、动态 ST 涨停、停牌顺延及缺状态 fail-closed 的本地/远端聚焦回归均 `4/4` 通过；`quant/tradability.py` SHA256 `f570f30eebf745a00a653d3a281deaa6b94ed25fd7d2721ba7cc0185a8ed60bc`、共享测试文件 SHA256 `16a74132f6fff2ff010b8d1feb23e864a4f4ed33ff3e5b10a65037b02817960f` 均逐文件一致。新增显式 `min_adv20/--min-adv20` 绝对流动性门：使用 `amount.shift(1).rolling(20)`，只限制买入，缺 amount/历史不足 fail-closed；门槛进入标签缓存键和训练 recipe，默认关闭。当日成交额隔离、strict cache、零成交和停牌 session 聚焦测试远端 `4/4`、远端完整回归 `303/303`；`tradability.py` SHA256 `3625bbed187933b9a800fe04881596f8b4504b95db91e1fbc2c840a2a04dbfc8`、`full_train_batched.py` SHA256 `2896de2a2f77ce789a3497f1cc1dfbfb273989a1ea26c3af0763c9464aec3fb8`、共享测试文件 SHA256 `096e1b320df3e91021802ae2d46b615a491e1cde6e9e0f1400a260cf6d75b73e` 本地/远端一致。新增显式 `min_listing_sessions/--min-listing-sessions`：基于 `security_master.list_date` 和权威开市日历计算上市 session 数，仅限制买入；阈值由研究配置指定，不硬编码新股天数，缺主表/日历/上市日期 fail-closed，并进入标签缓存键和训练 recipe。上市 session/recipe/strict cache/ADV 聚焦测试远端 `4/4`、远端完整回归 `305/305`；`tradability.py` SHA256 `c2169c502de90305b2d4ea3e6c1981d82f36e5d3b81d61f177333f4680455a45`、`full_train_batched.py` SHA256 `2e3b9317263fa7303b1d4961001c1e4370ee337e1b40f1e0e6b9fdde0c36e02e`、共享测试文件 SHA256 `6a6312a7afa76902151f03e01d91c5561e25f15512c25b758879aa32b193e3a3` 本地/远端一致。全市场状态覆盖仍未闭合，生产尚未启用严格状态模式。新增隔离覆盖统计（2026-08-11）：状态快照 `21448×12`，字段类型为 `date=datetime64[ns]`、状态布尔列非空，覆盖 `7` 只股票、`2014-01-02` 至 `2026-08-10`，`(code,date)` 重复键 `0`；权威交易日历为 `8701×1`。该结果只能证明样本快照内部一致，不能证明全市场历史状态覆盖，故不解除 C29 数据覆盖禁令。
 
 ### C30 修复标签可见时点、复权缓存和数据闸门
 
@@ -351,9 +346,9 @@
 - **问题**：`ann_date` 缺失时退化为 `report_date`，可能提前 1–4 个月；baseline recipe 不含 `price_source_signature`；`refresh-months=1` 使月末 horizon 行永久 NaN；龙虎榜/大宗交易可能在披露前进入特征；复权失败静默回退未复权价；OHLC 缺失时 `buyable_*` 默认 True。
 - **动作**：缺公告日直接丢弃并计数；baseline 缓存加入复权签名；`refresh-months >= 2`；延迟披露因子至少 lag 一交易日；复权失败 raise；OHLC 缺失默认不可交易。
 - **验收**：报告输出丢弃行数、公告时点覆盖率、缓存命中签名、月末标签完整率和复权失败数；任何闸门缺失直接失败。
-- **状态**：待修复，保持未结案。
-- **只读数据审计（2026-08-10）**：四类远端快照 `financial_yjbb/income/balance/performance_forecast` 的 `ann_date` 均为 100% 非空；因此不能把当前问题归因于公告日缺失。`financial_yjbb` 的 `ann_date-report_date` 中位数为 417 天，`income` 为 396 天，`balance` 为 48 天，`performance_forecast` 为 15 天，字段语义/映射仍需数据供应方对账，禁止把 `report_date` 直接当公告日替代。价格样本 200 个文件、412,963 行的 OHLC 缺失计数均为 0。
-- **证据**：`audit_20260810_c30_data.json`，隔离报告任务 exit 0；SHA256 `57335d5f309304d415e74da7b15ce837de0867da237a055d133c6b369334a52b`。
+- **状态**：部分完成，公告日缺失的前视回退已关闭。`_asof_report_factor()` 和 `_forecast_events()` 不再用 `report_date` 冒充 `ann_date`；缺列直接不生成因子，单行公告日为空则丢弃，避免报告期提前进入面板。新增财报、混合公告日和业绩预告 fixture，本地聚焦 `10/10`、完整回归 `279/279`、远端隔离聚焦 `10/10` 通过；同步 `engineering.py` SHA256 `7ac521423af4d56a501450afcc961f364651c91a8472c1bdb7f0b4b07e8f748d`、测试文件 SHA256 `caccaa3f0052ae6f0f6c2bc2b02e8268fbb74ed41f736773ac2e2709666a39bb` 均逐文件一致。
+- **只读数据审计（2026-08-10）**：四类远端快照 `financial_yjbb/income/balance/performance_forecast` 的 `ann_date` 均为 100% 非空；因此不能把当前问题归因于公告日缺失。`financial_yjbb` 的 `ann_date-report_date` 中位数为 417 天，`income` 为 396 天，`balance` 为 48 天，`performance_forecast` 为 15 天，字段语义/映射仍需数据供应方对账，禁止把 `report_date` 直接当公告日替代。价格样本 200 个文件、412,963 行的 OHLC 缺失计数均为 0。证据 `audit_20260810_c30_data.json` SHA256 `57335d5f309304d415e74da7b15ce837de0867da237a055d133c6b369334a52b`。
+- **AmazingData schema 实测（2026-08-11）**：3 只样本的利润表 `1950` 行、资产负债表 `638` 行、现金流量表 `1782` 行，均同时提供 `REPORTING_PERIOD`、`ANN_DATE`、`ACTUAL_ANN_DATE`，本次样本两个公告日字段均 100% 非空；后复权因子返回 `8701×3` 宽表。探测报告 `audit_20260811_c30_amazingdata_schema.json` SHA256 `abeae061efcb32662670c5e1da330ded782a4802c63e2c1a5f7d949a36647c1e`。报告未记录因子索引日期，不能仅凭 8701 行宣称复权日期覆盖闭合；2026-08-11 两次隔离复探（含现有环境凭证）均未返回因子表，因此继续保持未证明，不用行数猜测日期覆盖。新增默认只读 C30 启动审计，输出当前 price source signature、target mode、baseline 是否受价格签名保护，以及 `refresh_months=1` 风险；只增加可观测性，不改变 cache key、调度参数或生产训练口径。审计/签名聚焦测试本地/远端均 `3/3`，本地完整回归 `293/293`；`full_train_batched.py` SHA256 `7bbeeea223b3418917c00cd1ab3b433edc2147856440042d8d26e9b9caebc23d`、共享测试文件 SHA256 `c0dec131bd2926d07f67d5b4bf9e33c89a56576f8c7afc2a6ac9c6cc484828e8` 均逐文件一致。新增显式 `--enforce-c30-gates`：开启时 baseline recipe 纳入 `price_source_signature`，价格源变化必然改变窗口缓存身份，并拒绝 `refresh_months=1`（仅允许 `0` 或 `>=2`）；默认关闭保持现有缓存和调度兼容。C30 cache/refresh/strict-label/signature 聚焦测试远端 `4/4`、远端完整回归 `300/300`；`full_train_batched.py` SHA256 `3032598c7e2ab1fa55a600a6f75f4588efb0c7eee8ac8629f134981bcbc8d260`、共享测试文件 SHA256 `d5529bf87d5aee387633604ad27ac3fb8db44df6fd739abcae750c1bb4f5d5ae` 本地/远端一致。财报/预告因子新增显式 `strict_announcement_lag`：交易日公告严格延后一开市 session，周末/节假日公告映射下一开市日，日历无后续覆盖时丢弃，且继续禁止回退 `report_date`。公告 lag/周末映射/缺公告日/预告聚焦测试远端 `4/4`、远端完整回归 `301/301`；`engineering.py` SHA256 `de4c3e74d5986f444dd70eea271acf5d6f5e23bdc8dbc9a1b10b238f0ad91fdd`、共享测试文件 SHA256 `164b3ad6c76fa3e7573688d2db0cebfbc3d8347396ded40726c50425d957a5e9` 本地/远端一致。新增显式 `require_adjustment_factor` 严格复权策略并贯通单股、批量和 `broker_daily_prices()`：开启时因子缺失、请求股票不在因子宽表、价格日期早于首个可用因子、因子非正/非有限或 QFQ 归一化基准无效均 fail-closed；默认 `False`，继续保留生产现有的原始价回退语义，未改变任务、调度或缓存默认行为。复权模块聚焦测试远端 `18/18`、C30/cache 定点测试 `4/4`、远端完整回归 `309/309`；`stock_analyzer/amazingdata_source.py` SHA256 `b6e875dbe1f99b34a0fab351ceb8ac4a001accd458933184e530e8c9b6c27f03`、`stock_analyzer/test_amazingdata_adjust.py` SHA256 `1515fb3dbfe670a6bc0f47460a90910dfecf5ae4f6a89011ac595cb7175259be`、`quant/datafeed.py` SHA256 `f23cdf0f3c42b062a863153489ee38486c2fda6af197221c319a8b24c63e6196` 本地/远端一致。`ANN_DATE` 与 `ACTUAL_ANN_DATE` 的修订优先级仍待闭合；真实后复权因子日期索引覆盖仍需成功供应商响应证明。2026-08-11 对隔离 warehouse 复核发现：`financial_yjbb.parquet` 为 `267776×19`、`performance_forecast.parquet` 为 `122479×14`，两者实际均只有小写 `ann_date`，没有 `ACTUAL_ANN_DATE`；因此现有落盘数据无法证明供应商两公告字段的优先级，继续禁止把 `report_date` 作为公告日回退。2026-08-11 在现有 `stock-scheduler:latest` 依赖与隔离凭证环境中实际调用 3 只样本（`600000.SH`、`000001.SZ`、`300750.SZ`），调用成功但三者均返回 `None`，没有可记录的因子表或日期索引，因此覆盖结论继续保持“未证明”；证据 `audit_20260811_c30_factor_coverage.json` SHA256 `c8bb222e83427fb4ab218cc48e719c59d60164fb85f487ac05aa9fc7616a536a`，本地/远端一致。
 
 ### C31 修复会误报并中止发布的网格异常
 
@@ -361,7 +356,7 @@
 - **问题**：`best` 只在 `try` 内绑定，网格异常后触发 `UnboundLocalError`，再被包装成“无法读取 incumbent 参数”，导致一次网格失败中止日更并误导排障。
 - **动作**：在 `try` 前初始化 `best=None`，保留原参数的失败语义；区分网格失败、incumbent 读取失败和发布失败。
 - **验收**：构造网格异常时发布不漂移、不误报；错误类型和原始异常保留；正常网格路径回归通过。
-- **状态**：已完成代码修复与隔离验证：incumbent 读取异常单独拒绝发布，short grid 异常只保留 incumbent，缺失的 swing grid 调用不再包装成 incumbent 读取失败；本地完整回归 `265/265`、远端隔离聚焦测试 `51/51` 通过，生产路径未触碰。
+- **状态**：已完成代码修复、隔离测试和真实数据验证：incumbent 读取异常单独拒绝发布，short grid 异常只保留 incumbent，缺失的 swing grid 调用不再包装成 incumbent 读取失败；本地完整回归 `265/265`、远端隔离聚焦测试 `51/51` 通过，生产路径未触碰。2026-08-11 在源码和数据均只读挂载的容器中，使用真实 `1402229` 行短线预测、真实 `3193` 只优化股票池及 active manifest 的 champion 参数注入网格异常；函数返回 `None`，日志保留原始 `RuntimeError: audit-real-grid-failure` 并明确“保留原参数”，未误报 incumbent 读取失败。manifest、预测和股票池三个输入的前后 SHA256 完全一致。最终精确聚焦测试 `3/3`、完整隔离回归 `315/315`、92 个 Python 文件内存编译通过。证据 `audit_20260811_c24_c31_real_validation.json` SHA256 `69185ca944665daf449a6000db079a2c7e49927b73a72767c070e68ac65164f8`。
 
 ### C32 统一纯日线候选与在位 baseline 的冠军配置对比
 
@@ -369,7 +364,7 @@
 - **问题**：现有严格三腿工具的训练超参不是在位冠军配置，且仓库没有运行产物，因此不能回答“日更是否真的优于严格候选”。
 - **动作**：从 active manifest 固化 champion params，统一日期窗口、TopN、20bp、no-refill、可交易 join；输出 baseline、open Ridge/LGBM/ExtraTrees/RandomForest 的绝对与相对收益、CI、成交率和输入 hash。
 - **验收**：同一配置、同一宇宙、同一 holdout、同一成本下才允许比较；缺任一 source hash 或结果报告则标记不可用。
-- **状态**：待数据/待执行。
+- **状态**：待数据/待执行。2026-08-11 远端只读对账进一步确认当前 active manifest 本身口径混杂：short 样式同时出现 h1 源预测、h3 输出前缀和 h3 evaluation；swing 标记 h10，却复用 short h1 预测以及 h3 summary/returns/holdings。candidate promotion report 的 incumbent 参数只与 `champion_score_params` 对齐，不与用户可见 `score_params` 对齐；20 个候选通过数为 `0`，最佳候选平均 Sharpe 增益约 `0.2606`，显著改善 horizon 为 `0`。因此现有报告不能回答同配置候选是否优于在位 baseline，继续禁止晋级。
 
 ### C33 修正用户可见 horizon、融合权重和统计指标
 
@@ -377,7 +372,7 @@
 - **问题**：swing 显示 h10 但训练未进入 swing horizon，用户看到的“10 日预期”可能来自 h1；`lgbm_weight` 不进网格；池化 `_metrics` 与逐日选股能力混淆，Ridge/Ranker 使用不同切分。
 - **动作**：真正训练 h10 或将显示标签改回 h1；把 lgbm/影子腿权重纳入预注册搜索；统一 valid/test 窗口，所有 IC/分位数按日汇总。
 - **验收**：用户可见 horizon 与训练标签、预测文件列和 manifest 三者一致；报告包含逐日指标和统一切分；未完成前禁止展示 swing h10 alpha。
-- **状态**：待修复。
+- **状态**：部分完成。2026-08-11 远端只读对账确认 `DERIVE_FROM={"swing_7_15":"short_1_3"}` 且训练循环排除派生风格，旧 active manifest 却把复用的 short h1 预测标为 swing h10；增量刷新还会冻结陈旧 `prediction_horizon`。隔离修复新增 `_published_prediction_horizons()`：派生风格发布真实源模型 horizon，全量与增量 manifest 同步修正 `prediction_horizon/prediction_horizons`、artifact horizon 及 summary/returns/holdings 来源；7/10/15 仅保留为持有期评估集合，不再冒充 h10 模型输出。训练 profile 也改为明确“只训练短线，派生风格复用预测”。C33 定点测试远端 `1/1`、完整回归 `310/310`、编译通过；`scheduled_workflow.py` SHA256 `f345b9477bd0d61e072e3d5a28efd36b5b707eea7c457e9c8ac240b51548bed5`、共享测试文件 SHA256 `ac7c6796bd7c59f4887117fd0e8934f130be3f3a674376c845b4e96f099427cd` 本地/远端一致。追加真实 active 数据验证：short 文件 `1819978×18`（2024-02-02 起）、swing 文件 `6983002×18`（2020-02-03 起），历史长度不同，不能用整文件 SHA 相等作为复用判据；在共同最新日 `2026-08-07`，两者均为 `3011` 行且代码一一对应，`pred/ridge/lgbm/ic/base/elastic/extra_trees` 七列逐项完全一致，证明当前 swing 最新预测实际复用 short h1。隔离新映射将两者 `prediction_horizon` 均记为 `1`，与真实工件一致。证据 `audit_20260811_c33_real_active_horizon.json` SHA256 `a7823cc38d6b8c7efb4a5cb8a56f0b68fbff6f8048fb36a38e42c23fa5953a16`，本地/远端一致。尚未重建 active manifest，统一 valid/test 窗口和逐日统计仍待闭合，生产未启用新语义。
 
 ### C34 复核分数特征与规则 alpha 的可分离性
 
@@ -446,7 +441,7 @@
 - **共同日期诊断**：h3/h5/h10 共同 `205` 天（2025-09-02..2026-07-10），Top5、20bp、no-refill、`stride=horizon`。h3/h5/h10 分别 `69/41/21` 个周期；h5 tradable coverage `97.77%`，该缺口必须保留。
 - **配对控制结果**：h3 相对 market `+73.47bp/周期`，CI `[-19.86,172.47]bp`，Holm p=`0.9492`；h5 `+21.18bp`，CI `[-92.62,133.67]bp`，Holm p=`1.0`；h10 `+62.91bp`，CI `[-94.99,240.56]bp`，Holm p=`1.0`。三者相对 random/shuffle 的 CI 也全部跨 0。
 - **报告**：`audit_20260810_horizon_controls.json`，SHA256 `5eba3c2b6d37ffa580a7cea2eb982a36b413a68a0c0c0907ef3c0d4fac8638f4`；200 seeds、5000 bootstrap、block=5、9 项 Holm family。
-- **状态**：严格 h5 和共同日期控制已完成；没有 horizon 通过 Holm 0.05，全部禁止晋级或写入 active。
+- **状态**：仅严格 h5 和共同日期控制已完成；没有 horizon 通过 Holm 0.05，因此全部禁止晋级或写入 active，但这不等于“无 alpha”。观测上 h3/h5/h10 的毛收益分别约 `84.02/29.65/67.05bp`，扣除约 `18.11/17.69/18.81bp` 成本后净收益仍为 `+65.91/+11.96/+48.24bp/周期`，对应 market 为 `-7.56/-9.22/-14.67bp`，是值得继续验证的正向机制线索。当前功效不足：对 market 的观测差约 `73.47/21.18/62.91bp`，但 CI 均跨 0，不能把未显著反向解释为无效。更关键的是三条 horizon 不同流水线：`validation_summary.json` 明确 h3/h10 `strict=false`、原产物缺可交易列；h3 的 input SHA 与 `diagnostic_old_predictions_not_frozen_holdout` 报告相同，严格列来自事后 join，而 h5 才是逐股 purge、3 个月 validation 的严格重训，故当前效应大小不得用于 horizon 排名。报告还缺 `positive_only/pred_quantile/max_weight/no_refill/universe hash`，现金比例 h3/h5/h10 分别约 `45.51%/6.83%/0.95%`，必须统一并解释。下一步应在同一严格流水线、同一 universe/recipe、预注册参数和更长非重叠样本上重跑，并先做功效设计。
 
 ### C40 持久化 factor IC cache，避免重启重复计算
 
@@ -456,6 +451,12 @@
 - **状态**：已完成。本地完整回归 `264/264`、远端聚焦测试通过；prepared panel 104 个月直接复用，窗口 53–57 cache-hit 仅约 `0.07–0.09s/窗`，factor IC 已持久化为 parquet，后续窗口 selection 降至约 `35–38s`。
 
 ## 八、生产隔离和发布纪律
+
+### 快照与复核版本约束
+
+- 复核不得按同名文件路径或 mtime 猜测“最新清单”；每个导出批次必须只指定一份 canonical 清单，并用 manifest 同时绑定清单 SHA256、代码文件 SHA256、报告 SHA256 和 Git commit。
+- 2026-08-11 核查确认 GitHub `main` commit `feb2208` 是不完整复核快照：报告和多份清单已提交，但 C22-C40 的主体修复仍只存在于隔离 `research_runs/audit_20260810_v1/source`，Git 根代码对 15 个关键符号命中均为 `0`，8 个抽查关键文件 hash 与隔离 source 全部不同。此前“源代码已推送”的表述错误；在完成同批次代码导出前，GitHub 快照只能用于报告数据复核，不能用于判断清单代码状态。
+- 后续稳定批次提交时必须包含 canonical source、测试、清单和证据 manifest；提交后从 GitHub 新 clone 复算逐文件 SHA，并用符号 smoke test 验证关键入口存在，不能只核对远端工作树。
 
 - [x] 研究修改先在本地测试，再按文件同步远端并做 SHA256 校验。
 - [x] 远端生产 `/www/A` 原有 dirty 改动未被覆盖；已同步文件逐一核对。

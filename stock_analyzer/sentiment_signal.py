@@ -149,6 +149,19 @@ def _price_forward_returns(code: str) -> pd.DataFrame:
     return px[["date", "ret_1d", "ret_3d"]]
 
 
+def _authoritative_calendar() -> pd.DatetimeIndex:
+    path = Path(os.environ.get("QUANT_DATA_DIR", "quant_data")) / "trading_calendar.parquet"
+    if not path.exists():
+        raise RuntimeError(f"authoritative trading calendar unavailable: {path}")
+    frame = pd.read_parquet(path)
+    if list(frame.columns) != ["date"]:
+        raise ValueError("authoritative trading calendar must contain only the date column")
+    dates = pd.DatetimeIndex(pd.to_datetime(frame["date"], errors="coerce")).normalize()
+    if dates.empty or dates.hasnans or dates.has_duplicates or not dates.is_monotonic_increasing:
+        raise ValueError("authoritative trading calendar must be non-empty, unique, and increasing")
+    return dates
+
+
 def _candidate_daily(code: str, half_life: float, category_weights: dict,
                      start: pd.Timestamp, end: pd.Timestamp, signal_source: str = "lexicon") -> pd.DataFrame:
     """向量化生成日级衰减信号；每个交易日只使用当日及此前发布文章。"""
@@ -163,7 +176,23 @@ def _candidate_daily(code: str, half_life: float, category_weights: dict,
         articles = articles[articles["llm_impact"].notna()].copy()
     if articles.empty:
         return pd.DataFrame()
-    articles["date"] = articles["publish_dt"].dt.normalize()
+    authoritative = _authoritative_calendar()
+    end_session = pd.Timestamp(end).normalize()
+    if end_session > authoritative[-1]:
+        raise RuntimeError(
+            f"authoritative trading calendar ends at {authoritative[-1].date()}, before {end_session.date()}"
+        )
+    article_dates = pd.DatetimeIndex(articles["publish_dt"].dt.normalize())
+    positions = authoritative.searchsorted(article_dates, side="left")
+    valid = positions < len(authoritative)
+    articles = articles.loc[valid].copy()
+    positions = positions[valid]
+    if articles.empty:
+        return pd.DataFrame()
+    articles["date"] = authoritative.take(positions).to_numpy(dtype="datetime64[ns]")
+    articles = articles[articles["date"] <= end_session].copy()
+    if articles.empty:
+        return pd.DataFrame()
     articles["cat_weight"] = articles["category"].map(category_weights).fillna(0.5).astype(float)
     articles["signal_value"] = _article_sentiment(articles, signal_source)
     articles["weighted_sentiment"] = articles["signal_value"] * articles["cat_weight"]
@@ -171,18 +200,18 @@ def _candidate_daily(code: str, half_life: float, category_weights: dict,
         numerator=("weighted_sentiment", "sum"), denominator=("cat_weight", "sum"),
         article_count=("signal_value", "size"),
     )
-    calendar = pd.date_range(daily.index.min(), end, freq="D")
-    daily = daily.reindex(calendar, fill_value=0.0)
-    # adjust=False 递推式正好对应每过一天乘 0.5**(1/half_life)。
+    sessions = authoritative[(authoritative >= daily.index.min()) & (authoritative <= end_session)]
+    daily = daily.reindex(sessions, fill_value=0.0)
+    # One EWM step now means one exchange session, including across holidays/weekends.
     alpha = 1.0 - 0.5 ** (1.0 / max(half_life, 0.1))
     num = daily["numerator"].ewm(alpha=alpha, adjust=False).mean()
     den = daily["denominator"].ewm(alpha=alpha, adjust=False).mean()
     score = (num / den.replace(0.0, np.nan)).fillna(0.0)
-    # 滚动文章数量只用于样本收缩，不进入衰减分母。
+    # The article-count shrinkage window is also measured in exchange sessions.
     count = daily["article_count"].rolling(max(30, round(half_life * 5)), min_periods=1).sum()
     shrink = 1.0 - np.exp(-count / 5.0)
     signal = (score * shrink).clip(-2.0, 2.0)
-    sig = pd.DataFrame({"date": calendar, "sentiment_score": signal.to_numpy()})
+    sig = pd.DataFrame({"date": sessions, "sentiment_score": signal.to_numpy()})
     out = prices[(prices["date"] >= start) & (prices["date"] <= end)].merge(sig, on="date", how="left")
     out["sentiment_score"] = out["sentiment_score"].fillna(0.0)
     out["code"] = code

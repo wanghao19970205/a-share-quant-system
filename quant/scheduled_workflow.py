@@ -72,15 +72,23 @@ FINAL_TRADE_STYLES = {
     },
 }
 TRAINING_PROFILE = {
-    "label": "dual_short_swing_targets",
-    "source": "separate_full_a_prediction_artifacts",
-    "note": "定时任务分别训练短线3日目标和波段10日目标；UI按 final_trade_styles 的 predictions_file 读取对应预测。",
+    "label": "short_target_with_derived_trade_styles",
+    "source": "short_model_predictions_reused_by_derived_styles",
+    "note": "定时任务只训练短线目标；波段保留独立持有期评估，但打分和排名复用短线模型预测。",
 }
 
 # 波段不再单独训练：直接复用短线模型的预测作为波段信号来源（省去 h10 训练，约减半训练耗时）。
 # 波段仍保留自己的持仓周期/止盈口径展示，只是打分/排名来自短线模型。
 DERIVE_FROM = {"swing_7_15": "short_1_3"}
 TRAIN_STYLE_ORDER = [s for s in FINAL_TRADE_STYLE_ORDER if s not in DERIVE_FROM]
+
+
+def _published_prediction_horizons(horizons: dict[str, int]) -> dict[str, int]:
+    """Report each style's actual model horizon, including derived styles."""
+    return {
+        style: int(horizons[DERIVE_FROM.get(style, style)])
+        for style in FINAL_TRADE_STYLE_ORDER
+    }
 
 # 派生风格（波段）在短线预测之上做白名单网格搜索，挑选最优参数以提升效果。
 SWING_GRID_HORIZONS = [7, 10, 15]
@@ -141,6 +149,7 @@ def run_short_grid(output_prefixes: dict[str, str], args: argparse.Namespace,
     watchlist = _optimization_universe(args)
     print(f"[short_grid] predictions={src.name} horizons={SHORT_GRID_HORIZONS} "
           f"mainboard_universe={len(watchlist)} -> {eval_file.name}", flush=True)
+    best = None
     try:
         _grid, best = watchlist_grid.run_grid(
             predictions=src,
@@ -156,8 +165,8 @@ def run_short_grid(output_prefixes: dict[str, str], args: argparse.Namespace,
 
     except Exception as e:  # noqa: BLE001
         print(f"[short_grid] 失败（保留原参数）：{type(e).__name__}: {e}", flush=True)
+        return None
     if best is None or best.empty:
-
         return None
     row = best.iloc[0]
     params: dict = {}
@@ -587,6 +596,7 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
     legacy_active = quant_dir / LEGACY_ACTIVE_FILE
     fresh: pd.DataFrame | None = None
     if publish_predictions:
+        assert_active_is_latest(source_predictions, strict=True)
         if merge_history:
             fresh_started = time.perf_counter()
             fresh = pd.read_parquet(source_predictions)
@@ -650,14 +660,26 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
             _atomic_copy(source_predictions, swing_active)
         swing_latest = _prediction_max_date(swing_active)
         swing_cfg = deepcopy(styles.get("swing_7_15") or FINAL_TRADE_STYLES["swing_7_15"])
-        swing_cfg["predictions_file"] = swing_active.name  # 冻结 score_params / prediction_horizon 不动
+        swing_cfg["predictions_file"] = swing_active.name
+        swing_cfg["prediction_horizon"] = short_artifact["horizon"]
         styles["swing_7_15"] = swing_cfg
         swing_artifact = deepcopy(artifacts.get("swing_7_15") or {})
-        swing_artifact["predictions_file"] = swing_active.name
-        swing_artifact["source_predictions_file"] = source_predictions.name
-        swing_artifact["prediction_latest_date"] = (
-            swing_latest.strftime("%Y-%m-%d") if swing_latest is not None else "")
+        swing_artifact.update({
+            "horizon": short_artifact["horizon"],
+            "predictions_file": swing_active.name,
+            "source_predictions_file": source_predictions.name,
+            "summary_file": short_artifact["summary_file"],
+            "returns_file": short_artifact["returns_file"],
+            "holdings_file": short_artifact["holdings_file"],
+            "prediction_latest_date": (
+                swing_latest.strftime("%Y-%m-%d") if swing_latest is not None else ""),
+        })
         artifacts["swing_7_15"] = swing_artifact
+    prediction_horizons = {
+        style: int(artifact["horizon"])
+        for style, artifact in artifacts.items()
+        if artifact.get("horizon") is not None
+    }
     params = deepcopy(manifest.get("params") or {})
     params.update(training_params)
     payload = deepcopy(manifest)
@@ -666,6 +688,8 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
         "predictions_file": LEGACY_ACTIVE_FILE,
         "style_artifacts": artifacts,
         "published_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "prediction_horizon": short_artifact["horizon"],
+        "prediction_horizons": prediction_horizons,
         "prediction_latest_date": latest.strftime("%Y-%m-%d") if latest is not None else manifest.get("prediction_latest_date", ""),
         "final_trade_styles": styles,
         "params": params,
@@ -687,16 +711,22 @@ def publish_active_models(output_prefixes: dict[str, str], horizons: dict[str, i
     manifest = quant_dir / "active_quant_model.json"
     style_artifacts: dict[str, dict] = {}
     active_paths: list[Path] = []
+    price_latest = None if dry_run else _latest_price_date()
+    published_horizons = _published_prediction_horizons(horizons)
 
     for style in FINAL_TRADE_STYLE_ORDER:
         active_file = ACTIVE_STYLE_FILES[style]
         # 波段等派生风格的预测来源指向其基准风格（短线）的产物文件。
         src_style = DERIVE_FROM.get(style, style)
-        artifact = _style_artifact(output_prefixes[src_style], active_file, horizons[style])
+        artifact = _style_artifact(
+            output_prefixes[src_style], active_file, published_horizons[style]
+        )
         src = quant_dir / artifact["source_predictions_file"]
         active = artifact["active_path"]
         print(f"[publish:{style}] {src.name} -> {active.name}", flush=True)
         if not dry_run:
+            assert_active_is_latest(src, strict=True, price_latest=price_latest)
+
             _atomic_copy(src, active)
         pred_latest = None if dry_run else _prediction_max_date(active)
         style_artifacts[style] = {
@@ -709,7 +739,6 @@ def publish_active_models(output_prefixes: dict[str, str], horizons: dict[str, i
     if not dry_run:
         # Keep the legacy single-file entry pointing at the short model for older callers.
         _atomic_copy(active_paths[0], quant_dir / LEGACY_ACTIVE_FILE)
-        price_latest = _latest_price_date()
         styles = deepcopy(FINAL_TRADE_STYLES)
         # 短线/波段均采用网格搜索得到的最优参数（若有），使实盘打分/排名自动吃到调优结果。
         if short_score_params:
@@ -733,8 +762,8 @@ def publish_active_models(output_prefixes: dict[str, str], horizons: dict[str, i
             "predictions_file": LEGACY_ACTIVE_FILE,
             "style_artifacts": style_artifacts,
             "published_at": dt.datetime.now().isoformat(timespec="seconds"),
-            "prediction_horizon": horizons.get("short_1_3", 1),
-            "prediction_horizons": horizons,
+            "prediction_horizon": published_horizons["short_1_3"],
+            "prediction_horizons": published_horizons,
             "prediction_latest_date": min(latest_dates) if latest_dates else "",
             "price_latest_date": price_latest.strftime("%Y-%m-%d") if price_latest is not None else "",
             "training_profile": TRAINING_PROFILE,
@@ -869,6 +898,22 @@ def _uses_rolling_training(args: argparse.Namespace) -> bool:
     return args.strategy_mode == "candidate-upgrade" or bool(getattr(args, "incumbent_rolling_factor_select", False))
 
 
+def _uses_purge_training(args: argparse.Namespace) -> bool:
+    return bool(
+        getattr(args, "purge_horizon", False)
+        or args.strategy_mode == "candidate-upgrade"
+        or getattr(args, "incumbent_purge_horizon", False)
+    )
+
+
+def _minimum_validation_months(horizon: int) -> int:
+    if int(horizon) >= 10:
+        return 3
+    if int(horizon) >= 3:
+        return 2
+    return 1
+
+
 def _uses_elastic_training(args: argparse.Namespace) -> bool:
     return args.strategy_mode == "candidate-upgrade" or bool(getattr(args, "incumbent_elastic_net", False))
 
@@ -884,6 +929,7 @@ def _uses_extra_trees_training(args: argparse.Namespace) -> bool:
 def _apply_incumbent_training_config(args: argparse.Namespace) -> None:
     """Keep daily refresh on the last approved training method without invoking the promotion gate."""
     args.incumbent_rolling_factor_select = False
+    args.incumbent_purge_horizon = False
     args.incumbent_elastic_net = False
     args.incumbent_catboost_ranker = False
     args.incumbent_extra_trees = False
@@ -913,6 +959,7 @@ def _apply_incumbent_training_config(args: argparse.Namespace) -> None:
         args.incumbent_extra_trees = True
         args.extra_trees_estimators = int(params.get("extra_trees_estimators") or args.extra_trees_estimators)
         args.extra_trees_max_train_rows = int(params.get("extra_trees_max_train_rows") or args.extra_trees_max_train_rows)
+    args.incumbent_purge_horizon = bool(params.get("purge_horizon"))
     if bool(params.get("rolling_factor_select")):
         args.incumbent_rolling_factor_select = True
         args.rolling_top_factors = int(params.get("rolling_top_factors") or args.rolling_top_factors)
@@ -947,10 +994,18 @@ def run_training(args: argparse.Namespace, env: dict[str, str]) -> None:
             max_weight = float(score_params["gross_exposure"]) / max(top_n, 1)
         if max_weight is None:
             max_weight = args.max_weight
+        validation_months = int(getattr(args, "validation_months", 1))
+        required_validation_months = _minimum_validation_months(horizon)
+        if validation_months < required_validation_months:
+            raise ValueError(
+                f"horizon={horizon} requires validation_months>="
+                f"{required_validation_months}; got {validation_months}"
+            )
         print(
             f"[train:{style}] horizon={horizon} output_prefix={prefix} panel={panel_name} "
             f"top_n={top_n} max_weight={max_weight} ridge_quantile={ridge_quantile} "
-            f"lgbm_weight={lgbm_weight} ic_weight={ic_weight}",
+            f"lgbm_weight={lgbm_weight} ic_weight={ic_weight} "
+            f"validation_months={validation_months} purge_horizon={_uses_purge_training(args)}",
             flush=True,
         )
         cmd = [
@@ -974,6 +1029,7 @@ def run_training(args: argparse.Namespace, env: dict[str, str]) -> None:
             "--min-weight", str(args.min_weight),
             "--month-cache-size", str(args.month_cache_size),
             "--train-months", str(args.train_months),
+            "--validation-months", str(validation_months),
         ]
         if args.positive_only:
             cmd.append("--positive-only")
@@ -990,8 +1046,9 @@ def run_training(args: argparse.Namespace, env: dict[str, str]) -> None:
                 "--rolling-factor-select",
                 "--rolling-top-factors", str(args.rolling_top_factors),
                 "--max-factor-ic-corr", str(args.max_factor_ic_corr),
-                "--purge-horizon",
             ])
+        if _uses_purge_training(args):
+            cmd.append("--purge-horizon")
         if _uses_elastic_training(args):
             cmd.extend([
                 "--elastic-net",
@@ -1040,8 +1097,9 @@ def build_params(args: argparse.Namespace) -> dict:
         "max_windows": args.max_windows,
         "recent_windows": args.recent_windows,
         "strategy_mode": args.strategy_mode,
+        "validation_months": int(getattr(args, "validation_months", 1)),
         "rolling_factor_select": _uses_rolling_training(args),
-        "purge_horizon": _uses_rolling_training(args),
+        "purge_horizon": _uses_purge_training(args),
         "rolling_top_factors": args.rolling_top_factors,
         "max_factor_ic_corr": args.max_factor_ic_corr,
         "elastic_net": _uses_elastic_training(args),
@@ -1123,6 +1181,10 @@ def main() -> None:
     ap.add_argument("--train-months", type=int, default=24,
                     help="length of each rolling walk-forward train window in months; larger = each "
                          "independent model sees more history (peak memory is bounded by ONE window)")
+    ap.add_argument("--validation-months", type=int, default=1,
+                    help="validation window months; horizons >=3 require 2 and horizons >=10 require 3")
+    ap.add_argument("--purge-horizon", action="store_true",
+                    help="enable label-horizon purge independently of rolling factor selection")
     ap.add_argument("--skip-windows", type=int, default=0)
     ap.add_argument("--max-windows", type=int, default=0)
     ap.add_argument("--recent-windows", type=int, default=0,
@@ -1210,17 +1272,41 @@ def main() -> None:
                 short_cfg = incumbent_styles.get("short_1_3") or {}
                 champion_params = dict(short_cfg.get("champion_score_params") or short_cfg.get("score_params") or {})
                 short_score_params = dict(champion_params)
-                if not args.skip_short_grid:
-                    daily_candidate = run_short_grid(_output_prefixes(args), args, champion_params)
-                    if daily_candidate:
-                        short_score_params.update(daily_candidate)
-                        print(f"[publish] daily short adjustment anchored to champion: {daily_candidate}", flush=True)
                 swing_score_params = dict((incumbent_styles.get("swing_7_15") or {}).get("score_params") or {})
-                if not args.skip_swing_grid:
-                    run_swing_grid(_output_prefixes(args), args)  # monitoring only; active swing params remain frozen
-                print("[publish] monthly champion retained as anchor; daily bounded adjustment applied", flush=True)
             except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(f"无法读取 incumbent 参数，拒绝发布以避免策略漂移: {exc}") from exc
+                raise RuntimeError(
+                    f"无法读取 incumbent 参数，拒绝发布以避免策略漂移: {exc}"
+                ) from exc
+            if not args.skip_short_grid:
+                try:
+                    daily_candidate = run_short_grid(
+                        _output_prefixes(args), args, champion_params
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    daily_candidate = None
+                    print(
+                        f"[short_grid] 异常（保留 incumbent）："
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                if daily_candidate:
+                    short_score_params.update(daily_candidate)
+                    print(
+                        f"[publish] daily short adjustment anchored to champion: "
+                        f"{daily_candidate}",
+                        flush=True,
+                    )
+            if not args.skip_swing_grid:
+                print(
+                    "[swing_grid] 当前研究副本无可调用实现，跳过监控网格；"
+                    "active swing params 保持 incumbent",
+                    flush=True,
+                )
+            print(
+                "[publish] monthly champion retained as anchor; "
+                "daily bounded adjustment applied",
+                flush=True,
+            )
     if args.strategy_mode == "incumbent-refresh" and args.dry_run:
         print("[publish] dry-run: incumbent short would refresh; swing champion would remain unchanged", flush=True)
         return

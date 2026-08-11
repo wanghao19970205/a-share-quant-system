@@ -531,6 +531,83 @@ def run_snapshots(snapshot_dir: str, codes: list[str] | None = None) -> int:
     return int(res.returncode)
 
 
+def refresh_trading_calendar() -> dict:
+    """Refresh the authoritative AmazingData open-session calendar when available."""
+    if not datafeed.broker_available():
+        return {
+            "status": "broker-unavailable",
+            "path": config.TRADING_CALENDAR_FILE,
+            "exists": os.path.isfile(config.TRADING_CALENDAR_FILE),
+        }
+    calendar = datafeed.broker_trading_calendar().copy()
+    if list(calendar.columns) != ["date"]:
+        raise ValueError("broker trading calendar must contain only the date column")
+    calendar["date"] = pd.to_datetime(calendar["date"], errors="coerce").astype("datetime64[ns]")
+    if calendar.empty or calendar["date"].isna().any():
+        raise ValueError("broker trading calendar is empty or invalid")
+    if calendar["date"].duplicated().any() or not calendar["date"].is_monotonic_increasing:
+        raise ValueError("broker trading calendar must be unique and increasing")
+    warehouse.save("trading_calendar", calendar)
+    return {
+        "status": "refreshed",
+        "path": config.TRADING_CALENDAR_FILE,
+        "rows": int(len(calendar)),
+        "first_date": str(calendar["date"].iloc[0].date()),
+        "last_date": str(calendar["date"].iloc[-1].date()),
+    }
+
+
+def refresh_pit_reference_data(index_codes: list[str] | None = None) -> dict:
+    """Refresh PIT security-master and index-membership inputs without activating them."""
+    if not datafeed.broker_available():
+        return {
+            "status": "broker-unavailable",
+            "security_master_path": config.SECURITY_MASTER_FILE,
+            "index_history_path": config.INDEX_CONSTITUENT_HISTORY_FILE,
+        }
+    requested = index_codes or ["000300.SH", "000905.SH", "000852.SH"]
+    security_master = datafeed.broker_security_master()
+    index_history = datafeed.broker_index_constituent_history(requested)
+    warehouse.save("security_master", security_master)
+    warehouse.save("index_constituent_history", index_history)
+    return {
+        "status": "refreshed",
+        "security_master_path": config.SECURITY_MASTER_FILE,
+        "security_master_rows": int(len(security_master)),
+        "security_master_first_list_date": str(security_master["list_date"].min().date()),
+        "index_history_path": config.INDEX_CONSTITUENT_HISTORY_FILE,
+        "index_history_rows": int(len(index_history)),
+        "index_codes": sorted(index_history["index_code"].astype(str).unique().tolist()),
+        "index_history_first_in_date": str(index_history["in_date"].min().date()),
+    }
+
+
+def refresh_trading_status_reference(codes: list[str]) -> dict:
+    """Refresh selected PIT status histories without activating trading filters."""
+    normalized = sorted({str(code).strip()[:6] for code in codes if re.fullmatch(r"\d{6}(?:\.[A-Z]{2})?", str(code).strip())})
+    if not normalized:
+        raise ValueError("codes must contain at least one six-digit security")
+    if not datafeed.broker_available():
+        return {
+            "status": "broker-unavailable",
+            "path": config.TRADING_STATUS_HISTORY_FILE,
+            "requested_codes": len(normalized),
+        }
+    history = datafeed.broker_history_stock_status(normalized)
+    warehouse.save("trading_status_history", history)
+    return {
+        "status": "refreshed",
+        "path": config.TRADING_STATUS_HISTORY_FILE,
+        "requested_codes": len(normalized),
+        "rows": int(len(history)),
+        "first_date": str(history["date"].min().date()),
+        "last_date": str(history["date"].max().date()),
+        "st_rows": int(history["is_st"].sum()),
+        "suspended_rows": int(history["is_suspended"].sum()),
+        "withdrawal_rows": int(history["is_withdrawal"].sum()),
+    }
+
+
 def _refresh_mainboard_universe_isolated() -> None:
     """在子进程里刷新主板股票池，隔离 akshare 抓表对 TGW 连接的进程级污染。
 
@@ -564,6 +641,7 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
         skip_snapshots: bool = False, limit: int = 0, force_latest: bool = False,
         intraday_spot: bool = False, codes_file: str | None = None) -> dict:
     config.ensure_dirs()
+    calendar_summary = refresh_trading_calendar()
     u = config.UNIVERSES[universe]
     if codes_file:
         with open(codes_file, encoding="utf-8") as fh:
@@ -576,7 +654,11 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
         codes = codes[:limit]
     print(f"[universe] {universe} codes={len(codes)} quant_dir={config.QUANT_DIR}")
 
-    summary: dict = {"universe": universe, "n_codes": len(codes)}
+    summary: dict = {
+        "universe": universe,
+        "n_codes": len(codes),
+        "trading_calendar": calendar_summary,
+    }
     if not skip_price:
         if intraday_spot:
             summary["price"] = update_intraday_spot(codes, workers=workers)

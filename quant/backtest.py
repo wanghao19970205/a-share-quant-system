@@ -79,6 +79,19 @@ def _daily_zscore(s: pd.Series) -> pd.Series:
     return (s - s.mean()) / std
 
 
+def _apply_rebalance_stride(pred: pd.DataFrame, rebalance_stride: int) -> pd.DataFrame:
+    stride = max(int(rebalance_stride), 1)
+    if pred.empty or stride == 1:
+        return pred.copy()
+    dates = pd.Index(
+        pd.to_datetime(pred["date"], errors="coerce").dropna().sort_values().unique()
+    )
+    rebalance_dates = dates[::stride]
+    return pred[
+        pd.to_datetime(pred["date"], errors="coerce").isin(rebalance_dates)
+    ].copy()
+
+
 def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int = 20,
                                max_weight: float = 0.1, positive_only: bool = False,
                                pred_quantile: float | None = None,
@@ -204,7 +217,7 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
                  n_estimators: int = 200, learning_rate: float | None = None,
                  early_stopping_rounds: int = 40,
                  use_open_fill: bool | None = None, filter_untradable: bool | None = None,
-                 cost_roundtrip: float | None = None) -> dict:
+                 cost_roundtrip: float | None = None, rebalance_stride: int = 1) -> dict:
     df = panel.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     dates = pd.Series(sorted(df["date"].dropna().unique()))
@@ -285,6 +298,8 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
         current = test_end
 
     pred = pd.concat(preds, ignore_index=True) if preds else pd.DataFrame()
+    stride = max(int(rebalance_stride), 1)
+    pred = _apply_rebalance_stride(pred, stride)
     side_cols = [c for c in ("volatility_10", "turnover", "rule_score",
                              f"open_ret_{horizon}d", f"tradable_ret_{horizon}d",
                              "buyable_next", "buyable_close") if c in df.columns]
@@ -298,7 +313,10 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
                                                    ridge_quantile=ridge_quantile,
                                                    use_open_fill=use_open_fill, filter_untradable=filter_untradable,
                                                    cost_roundtrip=cost_roundtrip)
-    summary = evaluate_returns(returns["ret"] if not returns.empty else pd.Series(dtype=float), periods_per_year=max(1, 252 // horizon))
+    summary = evaluate_returns(
+        returns["ret"] if not returns.empty else pd.Series(dtype=float),
+        periods_per_year=max(1, int(round(252 / stride))),
+    )
     if not returns.empty:
         summary["avg_turnover"] = float(returns["turnover"].mean())
         summary["avg_holdings"] = float(returns["n_holdings"].mean())
@@ -307,6 +325,7 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
             summary["gross_total_return"] = float((1 + returns["gross_ret"]).prod() - 1)
         _use_open = use_open_fill if use_open_fill is not None else bt_use_open_fill()
         summary["fill"] = "next_open" if (_use_open and f"open_ret_{horizon}d" in pred.columns) else "close"
+    summary["rebalance_stride"] = stride
     if ensemble_model:
         summary["ridge_quantile"] = ridge_quantile
         summary["lgbm_weight"] = lgbm_weight
@@ -322,6 +341,8 @@ def main():
     ap.add_argument("--train-months", type=int, default=24)
     ap.add_argument("--validation-months", type=int, default=1, help="训练窗口末尾用于早停/调参的验证月份，不参与最终测试回测")
     ap.add_argument("--test-months", type=int, default=1)
+    ap.add_argument("--rebalance-stride", type=int, default=1,
+                    help="只在每 N 个可用交易日调仓；用于非重叠持有期研究")
     ap.add_argument("--top-n", type=int, default=3)
     ap.add_argument("--max-weight", type=float, default=None, help="单票最大权重；默认 1/top_n，即 topN 满仓等权")
     ap.add_argument("--ridge-alpha", type=float, default=10.0, help="Ridge L2 正则强度")
@@ -370,10 +391,11 @@ def main():
                        rule_weight=args.rule_weight, min_rule_score=args.min_rule_score,
                        ridge_quantile=args.ridge_quantile, lgbm_weight=args.lgbm_weight,
                        n_estimators=args.n_estimators, learning_rate=args.learning_rate,
-                       early_stopping_rounds=early_stopping_rounds,
-                       use_open_fill=(args.fill == "next_open"),
-                       filter_untradable=(False if args.no_tradable_filter else bt_filter_untradable()),
-                       cost_roundtrip=args.cost_roundtrip)
+                        early_stopping_rounds=early_stopping_rounds,
+                        use_open_fill=(args.fill == "next_open"),
+                        filter_untradable=(False if args.no_tradable_filter else bt_filter_untradable()),
+                        cost_roundtrip=args.cost_roundtrip,
+                        rebalance_stride=args.rebalance_stride)
     name_prefix = f"{args.output_prefix}_" if args.output_prefix else ""
     warehouse.save(f"{name_prefix}bt_{args.model}_returns", res["returns"])
     warehouse.save(f"{name_prefix}bt_{args.model}_holdings", res["holdings"])

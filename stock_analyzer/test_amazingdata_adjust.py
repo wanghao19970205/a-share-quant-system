@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import pandas as pd
 
@@ -20,6 +21,173 @@ def _kline(dates, closes):
         "open": closes, "high": closes, "low": closes, "close": closes,
         "volume": [100] * len(closes),
     })
+
+
+class TradingCalendarTest(unittest.TestCase):
+    def test_calendar_normalizes_sequence_to_sorted_dates(self):
+        with mock.patch.object(a, "_ensure_login", return_value=True), \
+                mock.patch.object(a, "_base", mock.Mock()), \
+                mock.patch.object(a, "sdk_call", return_value=["20240103", "20240102"]):
+            result = a.fetch_trading_calendar()
+
+        self.assertEqual(result["date"].tolist(), [
+            pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03"),
+        ])
+
+    def test_calendar_rejects_duplicate_or_invalid_dates(self):
+        with mock.patch.object(a, "_ensure_login", return_value=True), \
+                mock.patch.object(a, "_base", mock.Mock()), \
+                mock.patch.object(a, "sdk_call", return_value=["20240102", "20240102"]), \
+                self.assertRaisesRegex(ValueError, "duplicate"):
+            a.fetch_trading_calendar()
+        with mock.patch.object(a, "_ensure_login", return_value=True), \
+                mock.patch.object(a, "_base", mock.Mock()), \
+                mock.patch.object(a, "sdk_call", return_value=["not-a-date"]), \
+                self.assertRaisesRegex(ValueError, "invalid"):
+            a.fetch_trading_calendar()
+
+    def test_security_master_normalizes_listing_intervals(self):
+        basic = pd.DataFrame({
+            "MARKET_CODE": ["600000.SH", "000001.SZ"],
+            "SECURITY_NAME": ["A", "B"],
+            "LISTDATE": ["19991110", "19910403"],
+            "DELISTDATE": [None, "20240105"],
+            "LISTPLATE_NAME": ["main", "main"],
+            "IS_LISTED": [1, 0],
+        })
+        base = mock.Mock()
+        info = mock.Mock()
+        ad = mock.Mock()
+        ad.InfoData.return_value = info
+        with mock.patch.object(a, "_ensure_login", return_value=True), \
+                mock.patch.object(a, "_base", base), \
+                mock.patch.object(a, "_ad", ad), \
+                mock.patch.object(a, "sdk_call", side_effect=[["600000.SH", "000001.SZ"], basic]):
+            result = a.fetch_security_master()
+
+        self.assertEqual(result["code"].tolist(), ["000001", "600000"])
+        self.assertEqual(result.loc[0, "delist_date"], pd.Timestamp("2024-01-05"))
+        self.assertEqual(str(result["list_date"].dtype), "datetime64[ns]")
+
+    def test_index_history_normalizes_membership_intervals(self):
+        raw = {"000300.SH": pd.DataFrame({
+            "INDEX_CODE": ["000300.SH", "000300.SH"],
+            "CON_CODE": ["600000.SH", "000001.SZ"],
+            "INDATE": ["20050408", "20050408"],
+            "OUTDATE": [None, "20061019"],
+            "INDEX_NAME": ["HS300", "HS300"],
+        })}
+        info = mock.Mock()
+        ad = mock.Mock()
+        ad.InfoData.return_value = info
+        with mock.patch.object(a, "_ensure_login", return_value=True), \
+                mock.patch.object(a, "_ad", ad), \
+                mock.patch.object(a, "sdk_call", return_value=raw):
+            result = a.fetch_index_constituent_history(["000300.SH"])
+
+        self.assertEqual(result["code"].tolist(), ["000001", "600000"])
+        self.assertEqual(result.loc[0, "out_date"], pd.Timestamp("2006-10-19"))
+        self.assertEqual(str(result["in_date"].dtype), "datetime64[ns]")
+
+    def test_index_history_preserves_nonstandard_historical_members(self):
+        raw = pd.DataFrame({
+            "INDEX_CODE": ["000300.SH"], "CON_CODE": ["T00018.SH"],
+            "INDATE": ["20050408"], "OUTDATE": ["20061019"],
+            "INDEX_NAME": ["HS300"],
+        })
+        ad = mock.Mock()
+        ad.InfoData.return_value = mock.Mock()
+        with mock.patch.object(a, "_ensure_login", return_value=True), \
+                mock.patch.object(a, "_ad", ad), \
+                mock.patch.object(a, "sdk_call", return_value=raw):
+            result = a.fetch_index_constituent_history(["000300.SH"])
+
+        self.assertEqual(result.loc[0, "market_code"], "T00018.SH")
+        self.assertTrue(pd.isna(result.loc[0, "code"]))
+        self.assertFalse(result.loc[0, "is_standard_a_share"])
+
+    def test_index_history_rejects_reversed_interval(self):
+        raw = pd.DataFrame({
+            "INDEX_CODE": ["000300.SH"], "CON_CODE": ["600000.SH"],
+            "INDATE": ["20240105"], "OUTDATE": ["20240104"],
+            "INDEX_NAME": ["HS300"],
+        })
+        ad = mock.Mock()
+        ad.InfoData.return_value = mock.Mock()
+        with mock.patch.object(a, "_ensure_login", return_value=True), \
+                mock.patch.object(a, "_ad", ad), \
+                mock.patch.object(a, "sdk_call", return_value=raw), \
+                self.assertRaisesRegex(ValueError, "before in_date"):
+            a.fetch_index_constituent_history(["000300.SH"])
+
+    def test_history_stock_status_normalizes_pit_limits_and_flags(self):
+        raw = {"600000.SH": pd.DataFrame({
+            "MARKET_CODE": ["600000.SH", "600000.SH"],
+            "TRADE_DATE": ["20240102", "20240103"],
+            "PRECLOSE": [10.0, 10.1],
+            "HIGH_LIMITED": [11.0, 11.11], "LOW_LIMITED": [9.0, 9.09],
+            "PRICE_HIGH_LMT_RATE": [0.1, 0.1], "PRICE_LOW_LMT_RATE": [0.1, 0.1],
+            "IS_ST_SEC": ["0", "1"], "IS_SUSP_SEC": ["0", "1"],
+            "IS_WD_SEC": ["0", "0"], "IS_XR_SEC": ["0", "1"],
+        })}
+        ad = mock.Mock()
+        ad.InfoData.return_value = mock.Mock()
+        with mock.patch.object(a, "_ensure_login", return_value=True), \
+                mock.patch.object(a, "_ad", ad), \
+                mock.patch.object(a, "sdk_call", return_value=raw):
+            result = a.fetch_history_stock_status(["600000"])
+
+        self.assertEqual(str(result["date"].dtype), "datetime64[ns]")
+        self.assertEqual(result["code"].tolist(), ["600000", "600000"])
+        self.assertEqual(result["is_st"].tolist(), [False, True])
+        self.assertEqual(result["is_suspended"].tolist(), [False, True])
+        self.assertEqual(result["high_limit"].tolist(), [11.0, 11.11])
+
+
+class NormalizeKlineTest(unittest.TestCase):
+    @staticmethod
+    def _frame(**columns):
+        base = {
+            "open": [10.0, 10.1],
+            "high": [10.2, 10.3],
+            "low": [9.9, 10.0],
+            "close": [10.1, 10.2],
+        }
+        base.update(columns)
+        return pd.DataFrame(base)
+
+    def test_preserves_unnamed_datetime_index(self):
+        frame = self._frame()
+        frame.index = pd.to_datetime(["2024-01-02", "2024-01-03"])
+
+        result = a._normalize_kline(frame)
+
+        self.assertEqual(result["date"].tolist(), list(frame.index))
+
+    def test_parses_compact_integer_dates_as_calendar_dates(self):
+        result = a._normalize_kline(self._frame(date=[20240103, 20240102]))
+
+        self.assertEqual(result["date"].tolist(), [
+            pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03"),
+        ])
+
+    def test_rejects_missing_date_source(self):
+        with self.assertRaisesRegex(ValueError, "date column unavailable"):
+            a._normalize_kline(self._frame())
+
+    def test_rejects_columns_that_both_normalize_to_date(self):
+        frame = self._frame(
+            date=["2024-01-02", "2024-01-03"],
+            kline_time=["2024-01-02", "2024-01-03"],
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate normalized K-line columns"):
+            a._normalize_kline(frame)
+
+    def test_rejects_invalid_or_duplicate_dates(self):
+        with self.assertRaisesRegex(ValueError, "invalid values"):
+            a._normalize_kline(self._frame(date=["2024-01-02", "not-a-date"]))
+        with self.assertRaisesRegex(ValueError, "duplicate timestamps"):
+            a._normalize_kline(self._frame(date=["2024-01-02", "2024-01-02"]))
 
 
 class ApplyAdjustTest(unittest.TestCase):
@@ -66,6 +234,52 @@ class ApplyAdjustTest(unittest.TestCase):
         """取不到因子时回退原始价，不报错、不返回错价。"""
         out = a._apply_adjust(self.raw, None, "qfq")
         self.assertEqual(out["close"].tolist(), [10.0, 5.0, 5.5])
+
+    def test_strict_adjustment_rejects_missing_factor(self):
+        with self.assertRaisesRegex(RuntimeError, "adjustment factor unavailable for 600000.SH"):
+            a._apply_adjust(
+                self.raw,
+                None,
+                "qfq",
+                require_adjustment_factor=True,
+                symbol="600000.SH",
+            )
+
+    def test_strict_adjustment_rejects_uncovered_price_dates(self):
+        factor = pd.Series(
+            [2.0, 2.0], index=pd.to_datetime(self.dates[1:]),
+        )
+        with self.assertRaisesRegex(RuntimeError, "does not cover 1/3 price dates"):
+            a._apply_adjust(
+                self.raw,
+                factor,
+                "qfq",
+                require_adjustment_factor=True,
+                symbol="600000.SH",
+            )
+
+    def test_fetch_daily_propagates_strict_adjustment_policy(self):
+        with mock.patch.object(a, "raw_kline", return_value=self.raw), \
+                mock.patch.object(a, "_backward_factor", return_value=None), \
+                self.assertRaisesRegex(RuntimeError, "adjustment factor unavailable for 600000.SH"):
+            a.fetch_daily(
+                "600000", "20240101", "20240103",
+                require_adjustment_factor=True,
+            )
+
+    def test_fetch_daily_batch_rejects_failed_factor_batch_in_strict_mode(self):
+        sdk = mock.Mock()
+        sdk.constant.Period.day.value = "day"
+        with mock.patch.object(a, "_ensure_login", return_value=True), \
+                mock.patch.object(a, "_ad", sdk), \
+                mock.patch.object(a, "_market", mock.Mock()), \
+                mock.patch.object(a, "sdk_call", return_value={"600000.SH": self.raw}), \
+                mock.patch.object(a, "_get_factor_frame", return_value=None), \
+                self.assertRaisesRegex(RuntimeError, "adjustment factor unavailable for 600000.SH"):
+            a.fetch_daily_batch(
+                ["600000"], "20240101", "20240103",
+                require_adjustment_factor=True,
+            )
 
     def test_ffill_on_missing_trading_day(self):
         """K 线某日在因子表缺失时按前值 ffill，不产生 NaN 价。"""

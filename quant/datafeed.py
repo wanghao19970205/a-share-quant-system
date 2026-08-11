@@ -190,6 +190,26 @@ def broker_available() -> bool:
     return amazingdata_source.available()
 
 
+def broker_trading_calendar() -> pd.DataFrame:
+    """Load the authoritative open-session calendar from AmazingData."""
+    return amazingdata_source.fetch_trading_calendar()
+
+
+def broker_security_master() -> pd.DataFrame:
+    """Load listing metadata used to build point-in-time universes."""
+    return amazingdata_source.fetch_security_master()
+
+
+def broker_index_constituent_history(index_codes: list[str]) -> pd.DataFrame:
+    """Load historical index membership intervals from AmazingData."""
+    return amazingdata_source.fetch_index_constituent_history(index_codes)
+
+
+def broker_history_stock_status(codes: list[str]) -> pd.DataFrame:
+    """Load PIT security status and exact daily price limits from AmazingData."""
+    return amazingdata_source.fetch_history_stock_status(codes)
+
+
 def daily_price(code: str, start: str = "20180101") -> pd.DataFrame:
     """单只日线（前复权），复用项目已有多源拉取（新浪直连可用）。"""
     code = _norm(code)
@@ -366,12 +386,14 @@ def margin_underlying_szse(date: str) -> pd.DataFrame:
 def broker_daily_prices(codes: list[str], start: str, end: str,
                         progress_offset: int = 0,
                         progress_total: int | None = None,
-                        adjust: str = "qfq") -> dict[str, pd.DataFrame]:
+                        adjust: str = "qfq",
+                        require_adjustment_factor: bool = False) -> dict[str, pd.DataFrame]:
     return amazingdata_source.fetch_daily_batch(
         codes, start, end,
         adjust=adjust,
         progress_offset=progress_offset,
         progress_total=progress_total,
+        require_adjustment_factor=require_adjustment_factor,
     )
 
 

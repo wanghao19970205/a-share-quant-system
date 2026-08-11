@@ -293,7 +293,7 @@ def add_asof_base_features(frame: pd.DataFrame) -> pd.DataFrame:
         lambda values: values.rolling(20, min_periods=5).median()
     )
     rolling_amount_median = grouped["amount"].transform(
-        lambda values: values.rolling(20, min_periods=5).median()
+        lambda values: values.shift(1).rolling(20, min_periods=5).median()
     )
     data["risk_volume_vs_median_20"] = data["volume"] / rolling_volume_median.replace(0, np.nan) - 1.0
     data["risk_amount_vs_median_20"] = data["amount"] / rolling_amount_median.replace(0, np.nan) - 1.0

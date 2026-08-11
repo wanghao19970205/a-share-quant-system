@@ -11,6 +11,10 @@ QUANT_DIR = os.environ.get("QUANT_DATA_DIR", os.path.join(_ROOT, "quant_data"))
 PRICE_DIR = os.path.join(QUANT_DIR, "price")          # 每股一份日线 parquet
 VALUATION_DIR = os.path.join(QUANT_DIR, "valuation")  # 每股一份估值时序 parquet
 MAINBOARD_UNIVERSE_FILE = os.path.join(QUANT_DIR, "mainboard_active_universe.txt")
+TRADING_CALENDAR_FILE = os.path.join(QUANT_DIR, "trading_calendar.parquet")
+SECURITY_MASTER_FILE = os.path.join(QUANT_DIR, "security_master.parquet")
+INDEX_CONSTITUENT_HISTORY_FILE = os.path.join(QUANT_DIR, "index_constituent_history.parquet")
+TRADING_STATUS_HISTORY_FILE = os.path.join(QUANT_DIR, "trading_status_history.parquet")
 
 # 股票池定义：kind 决定取成分的方式
 #   "all"          全市场 A 股（stock_info_a_code_name）

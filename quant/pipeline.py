@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+from pathlib import Path
 
 import pandas as pd
 
@@ -30,6 +32,53 @@ def _expand_selected_factors(selected: list[str], all_features: list[str]) -> li
         if f.startswith("cat_") and f not in expanded:
             expanded.append(f)
     return expanded
+
+
+def _validate_explicit_holdout_boundaries(
+    train_end: str | None,
+    valid_end: str | None,
+    predict_start: str | None,
+) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    if not all((train_end, valid_end, predict_start)):
+        raise ValueError(
+            "pipeline requires explicit train_end, valid_end and predict_start "
+            "to keep early-stopping validation separate from final evaluation"
+        )
+    train_cut = pd.Timestamp(train_end)
+    valid_cut = pd.Timestamp(valid_end)
+    prediction_cut = pd.Timestamp(predict_start)
+    if not train_cut < valid_cut < prediction_cut:
+        raise ValueError(
+            "pipeline boundaries must satisfy train_end < valid_end < predict_start"
+        )
+    return train_cut, valid_cut, prediction_cut
+
+
+def _selection_manifest(
+    selection_name: str,
+    label_col: str,
+    candidates: list[str],
+    selected: list[str],
+    train_end: pd.Timestamp,
+    valid_end: pd.Timestamp,
+    predict_start: pd.Timestamp,
+) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "selection_name": selection_name,
+        "label_col": label_col,
+        "train_end": str(train_end.date()),
+        "valid_end": str(valid_end.date()),
+        "predict_start": str(predict_start.date()),
+        "candidate_count": int(len(candidates)),
+        "selected_count": int(len(selected)),
+        "candidate_pool_sha256": hashlib.sha256(
+            "\n".join(sorted(map(str, candidates))).encode("utf-8")
+        ).hexdigest(),
+        "selected_sha256": hashlib.sha256(
+            "\n".join(map(str, selected)).encode("utf-8")
+        ).hexdigest(),
+        "generator_code_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }])
 
 
 def _continuous_selected(selected: list[str], all_features: list[str], max_base_features: int) -> list[str]:
@@ -72,6 +121,8 @@ def _add_feature_crosses(panel: pd.DataFrame, selected: list[str], all_features:
 def run(horizon: int = 5, panel_name: str = "factor_panel", selection_name: str = "factor_selection",
         top_factors: int = 50, models: list[str] | None = None, top_n: int = 3,
         train_months: int = 24, validation_months: int = 1, test_months: int = 1,
+        train_end: str | None = None, valid_end: str | None = None,
+        predict_start: str | None = None,
         decay_half_life_days: float | None = 90.0, min_weight: float = 0.05,
         ridge_alpha: float = 10.0, limit: int = 0, min_price_rows: int = 0,
         add_discrete: bool = True, add_crosses: bool = False,
@@ -83,12 +134,18 @@ def run(horizon: int = 5, panel_name: str = "factor_panel", selection_name: str 
         turnover_quantile: float | None = None, rule_weight: float = 0.0,
         min_rule_score: float | None = None, ridge_quantile: float | None = None,
         lgbm_weight: float = 1.0) -> pd.DataFrame:
+    train_cut, valid_cut, prediction_cut = _validate_explicit_holdout_boundaries(
+        train_end, valid_end, predict_start
+    )
     raw = engineering.build_panel(horizon=horizon, limit=limit, min_price_rows=min_price_rows)
     if raw.empty:
         raise RuntimeError("数据仓里没有可用价格数据，无法生成因子面板")
     panel, feats = engineering.prepare_features(raw, horizon=horizon, add_discrete=add_discrete)
 
-    picked = selector.select_factors(panel, horizon=horizon, top_n=top_factors)
+    label_col = f"target_ret_{horizon}d"
+    picked = selector.select_factors(
+        panel, horizon=horizon, top_n=top_factors, label_col=label_col
+    )
     selected = picked["factor"].tolist() if not picked.empty else feats
     cross_features: list[str] = []
     if add_crosses:
@@ -107,6 +164,16 @@ def run(horizon: int = 5, panel_name: str = "factor_panel", selection_name: str 
     feature_summary = engineering.summarize_features(feats)
     warehouse.save(f"{name_prefix}feature_summary", feature_summary)
     warehouse.save(selection_name, picked)
+    selection_manifest = _selection_manifest(
+        selection_name,
+        label_col,
+        feats,
+        selected,
+        train_cut,
+        valid_cut,
+        prediction_cut,
+    )
+    warehouse.save(f"{selection_name}_manifest", selection_manifest)
     factors = _expand_selected_factors(selected, feats) + [f for f in cross_features if f not in selected]
     model_feature_summary = engineering.summarize_features(factors)
     warehouse.save(f"{name_prefix}model_feature_summary", model_feature_summary)
@@ -143,10 +210,16 @@ def run(horizon: int = 5, panel_name: str = "factor_panel", selection_name: str 
         "min_rule_score": min_rule_score,
         "ridge_quantile": ridge_quantile,
         "lgbm_weight": lgbm_weight,
+        "train_end": str(train_cut.date()),
+        "valid_end": str(valid_cut.date()),
+        "predict_start": str(prediction_cut.date()),
+        "holdout_boundary_policy": "explicit_nonoverlapping",
     }
     rows = []
     holdout_models = [m for m in models if m != "ridge_lightgbm_ranker_ensemble"]
     for res in model.train_all(panel, horizon=horizon, models=holdout_models, factors=factors,
+                               train_end=str(train_cut.date()), valid_end=str(valid_cut.date()),
+                               predict_start=str(prediction_cut.date()),
                                decay_half_life_days=decay_half_life_days, min_weight=min_weight,
                                ridge_alpha=ridge_alpha, n_estimators=n_estimators,
                                learning_rate=learning_rate, early_stopping_rounds=early_stopping_rounds):
@@ -190,6 +263,9 @@ def main():
     ap.add_argument("--train-months", type=int, default=24)
     ap.add_argument("--validation-months", type=int, default=1, help="训练窗口末尾用于早停/调参的验证月份，不参与最终测试回测")
     ap.add_argument("--test-months", type=int, default=1)
+    ap.add_argument("--train-end", required=True, help="显式训练截止日期，不能省略")
+    ap.add_argument("--valid-end", required=True, help="显式验证截止日期，不能省略")
+    ap.add_argument("--predict-start", required=True, help="显式最终评估起始日期，必须晚于 valid-end")
     ap.add_argument("--decay-half-life-days", type=float, default=90.0, help="时间衰减半衰期；<=0 表示关闭")
     ap.add_argument("--min-weight", type=float, default=0.05, help="旧样本最小权重")
     ap.add_argument("--ridge-alpha", type=float, default=10.0, help="Ridge L2 正则强度")
@@ -217,7 +293,8 @@ def main():
     early_stopping_rounds = args.early_stopping_rounds if args.early_stopping_rounds > 0 else 0
     summary = run(horizon=args.horizon, top_factors=args.top_factors, models=models, top_n=args.top_n,
                   train_months=args.train_months, validation_months=args.validation_months,
-                  test_months=args.test_months,
+                  test_months=args.test_months, train_end=args.train_end,
+                  valid_end=args.valid_end, predict_start=args.predict_start,
                   decay_half_life_days=decay, min_weight=args.min_weight,
                   ridge_alpha=args.ridge_alpha, limit=args.limit, min_price_rows=args.min_price_rows,
                   add_discrete=not args.no_discrete, add_crosses=args.add_crosses,

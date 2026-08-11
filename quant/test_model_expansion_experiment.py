@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import tempfile
@@ -11,19 +12,139 @@ from unittest import mock
 import numpy as np
 import pandas as pd
 
+from quant import backtest
 from quant import daily_update
 from quant import full_train_batched
 from quant import model as quant_model
+from quant import pipeline as quant_pipeline
 from quant import model_expansion_experiment as experiment
 from quant import scheduled_workflow
+from quant import select as factor_select
+from quant import tradability
 from quant import shadow_leg_evaluation
 from quant import warehouse
 from quant import watchlist_grid
 from quant.factors import engineering
-from stock_analyzer import amazingdata_source
+from stock_analyzer import amazingdata_source, sentiment_signal
+
+
+class SentimentCalendarTest(unittest.TestCase):
+    def test_weekend_article_moves_to_next_session_without_calendar_day_decay(self):
+        articles = pd.DataFrame({
+            "publish_dt": pd.to_datetime(["2026-01-09 10:00", "2026-01-11 10:00"]),
+            "category": ["news", "news"],
+            "sentiment": [1.0, -1.0],
+            "llm_score": [np.nan, np.nan],
+        })
+        prices = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-09", "2026-01-12", "2026-01-13"]),
+            "ret_1d": [0.0, 0.0, np.nan],
+            "ret_3d": [0.0, np.nan, np.nan],
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            pd.DataFrame({
+                "date": pd.to_datetime(["2026-01-09", "2026-01-12", "2026-01-13"])
+                .astype("datetime64[ns]")
+            }).to_parquet(Path(temporary) / "trading_calendar.parquet", index=False)
+            with mock.patch.dict(os.environ, {"QUANT_DATA_DIR": temporary}), \
+                    mock.patch.object(sentiment_signal, "_articles", return_value=articles), \
+                    mock.patch.object(sentiment_signal, "_price_forward_returns", return_value=prices):
+                result = sentiment_signal._candidate_daily(
+                    "600001", 1.0, {"news": 1.0},
+                    pd.Timestamp("2026-01-09"), pd.Timestamp("2026-01-13"),
+                )
+
+        monday = result.loc[result["date"] == pd.Timestamp("2026-01-12"), "sentiment_score"]
+        self.assertEqual(len(monday), 1)
+        self.assertAlmostEqual(float(monday.iloc[0]), 0.0)
+
+    def test_candidate_daily_requires_authoritative_calendar(self):
+        articles = pd.DataFrame({
+            "publish_dt": pd.to_datetime(["2026-01-09 10:00"]),
+            "category": ["news"], "sentiment": [1.0], "llm_score": [np.nan],
+        })
+        prices = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-09"]), "ret_1d": [0.0], "ret_3d": [0.0],
+        })
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.dict(os.environ, {"QUANT_DATA_DIR": temporary}), \
+                mock.patch.object(sentiment_signal, "_articles", return_value=articles), \
+                mock.patch.object(sentiment_signal, "_price_forward_returns", return_value=prices), \
+                self.assertRaisesRegex(RuntimeError, "authoritative trading calendar unavailable"):
+            sentiment_signal._candidate_daily(
+                "600001", 1.0, {"news": 1.0},
+                pd.Timestamp("2026-01-09"), pd.Timestamp("2026-01-09"),
+            )
 
 
 class IntradaySourcePriorityTest(unittest.TestCase):
+    def test_trading_calendar_refresh_saves_authoritative_dates(self):
+        calendar = pd.DataFrame({
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03"]).astype("datetime64[ns]")
+        })
+        with mock.patch.object(daily_update.datafeed, "broker_available", return_value=True), \
+                mock.patch.object(daily_update.datafeed, "broker_trading_calendar", return_value=calendar), \
+                mock.patch.object(daily_update.warehouse, "save") as save:
+            result = daily_update.refresh_trading_calendar()
+
+        save.assert_called_once()
+        self.assertEqual(save.call_args.args[0], "trading_calendar")
+        pd.testing.assert_frame_equal(save.call_args.args[1], calendar)
+        self.assertEqual(result["status"], "refreshed")
+        self.assertEqual(result["rows"], 2)
+
+    def test_trading_calendar_refresh_rejects_non_increasing_dates(self):
+        calendar = pd.DataFrame({"date": pd.to_datetime(["2024-01-03", "2024-01-02"])})
+        with mock.patch.object(daily_update.datafeed, "broker_available", return_value=True), \
+                mock.patch.object(daily_update.datafeed, "broker_trading_calendar", return_value=calendar), \
+                mock.patch.object(daily_update.warehouse, "save") as save, \
+                self.assertRaisesRegex(ValueError, "unique and increasing"):
+            daily_update.refresh_trading_calendar()
+        save.assert_not_called()
+
+    def test_pit_reference_refresh_saves_normalized_sources_without_activation(self):
+        security_master = pd.DataFrame({
+            "code": ["600000"],
+            "list_date": pd.to_datetime(["1999-11-10"]).astype("datetime64[ns]"),
+        })
+        index_history = pd.DataFrame({
+            "index_code": ["000300.SH"],
+            "code": ["600000"],
+            "in_date": pd.to_datetime(["2005-04-08"]).astype("datetime64[ns]"),
+        })
+        with mock.patch.object(daily_update.datafeed, "broker_available", return_value=True), \
+                mock.patch.object(daily_update.datafeed, "broker_security_master", return_value=security_master), \
+                mock.patch.object(daily_update.datafeed, "broker_index_constituent_history", return_value=index_history) as history, \
+                mock.patch.object(daily_update.warehouse, "save") as save:
+            result = daily_update.refresh_pit_reference_data(["000300.SH"])
+
+        history.assert_called_once_with(["000300.SH"])
+        self.assertEqual([call.args[0] for call in save.call_args_list], [
+            "security_master", "index_constituent_history",
+        ])
+        self.assertEqual(result["status"], "refreshed")
+        self.assertEqual(result["security_master_rows"], 1)
+        self.assertEqual(result["index_history_rows"], 1)
+
+    def test_trading_status_refresh_is_explicit_and_not_activated(self):
+        history = pd.DataFrame({
+            "code": ["600000", "600000"],
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03"]).astype("datetime64[ns]"),
+            "is_st": [False, True],
+            "is_suspended": [False, True],
+            "is_withdrawal": [False, False],
+        })
+        with mock.patch.object(daily_update.datafeed, "broker_available", return_value=True), \
+                mock.patch.object(daily_update.datafeed, "broker_history_stock_status", return_value=history) as fetch, \
+                mock.patch.object(daily_update.warehouse, "save") as save:
+            result = daily_update.refresh_trading_status_reference(["600000"])
+
+        fetch.assert_called_once_with(["600000"])
+        save.assert_called_once_with("trading_status_history", history)
+        self.assertEqual(result["rows"], 2)
+        self.assertEqual(result["st_rows"], 1)
+        self.assertEqual(result["suspended_rows"], 1)
+
     def test_intraday_prefers_amazingdata(self):
         frames = {
             "600001": pd.DataFrame({
@@ -206,7 +327,11 @@ class IntradaySourcePriorityTest(unittest.TestCase):
                 mock.patch.object(warehouse.config, "ensure_dirs"):
             path = Path(directory) / "600001.parquet"
             path.write_bytes(b"old")
-            frame = pd.DataFrame({"code": ["600001"], "date": pd.to_datetime(["2026-07-21"]), "close": [10.0]})
+            frame = pd.DataFrame({
+                "code": ["600001"],
+                "date": pd.to_datetime(["2026-07-21"]).astype("datetime64[ns]"),
+                "close": [10.0],
+            })
 
             warehouse.save_price("600001", frame)
 
@@ -439,6 +564,179 @@ class PublishAccelerationTest(unittest.TestCase):
 
 
 class DailyPanelAccelerationTest(unittest.TestCase):
+    def test_strict_announcement_lag_maps_to_next_exchange_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            calendar_path = root / "trading_calendar.parquet"
+            pd.DataFrame({
+                "date": pd.to_datetime([
+                    "2026-01-30", "2026-02-02", "2026-02-03",
+                ]).astype("datetime64[ns]"),
+            }).to_parquet(calendar_path, index=False)
+            report = pd.DataFrame({
+                "code": ["600001", "600002"],
+                "ann_date": ["2026-01-30", "2026-02-01"],
+                "ROE": [10.0, 12.0],
+            })
+            with mock.patch.object(engineering.warehouse, "load", return_value=report), \
+                    mock.patch.object(engineering.config, "TRADING_CALENDAR_FILE", str(calendar_path)):
+                strict = engineering._asof_report_factor(
+                    "income", "income", {"600001", "600002"},
+                    strict_announcement_lag=True,
+                )
+                legacy = engineering._asof_report_factor(
+                    "income", "income", {"600001", "600002"},
+                )
+
+        self.assertEqual(
+            strict["date"].tolist(),
+            [pd.Timestamp("2026-02-02"), pd.Timestamp("2026-02-02")],
+        )
+        self.assertEqual(strict["income_roe"].tolist(), [10.0, 12.0])
+        self.assertEqual(
+            legacy["date"].tolist(),
+            [pd.Timestamp("2026-01-30"), pd.Timestamp("2026-02-01")],
+        )
+
+    def test_report_factor_never_falls_back_to_reporting_period(self):
+        report = pd.DataFrame({
+            "code": ["600001"],
+            "report_date": ["2025-12-31"],
+            "ROE": [12.0],
+        })
+        with mock.patch.object(engineering.warehouse, "load", return_value=report):
+            result = engineering._asof_report_factor("income", "income", {"600001"})
+        self.assertTrue(result.empty)
+
+    def test_report_factor_drops_rows_without_announcement_date(self):
+        report = pd.DataFrame({
+            "code": ["600001", "600001"],
+            "ann_date": [None, "2026-04-30"],
+            "report_date": ["2025-09-30", "2025-12-31"],
+            "ROE": [10.0, 12.0],
+        })
+        with mock.patch.object(engineering.warehouse, "load", return_value=report):
+            result = engineering._asof_report_factor("income", "income", {"600001"})
+        self.assertEqual(result["date"].tolist(), [pd.Timestamp("2026-04-30")])
+        self.assertEqual(result["income_roe"].tolist(), [12.0])
+
+    def test_forecast_never_falls_back_to_reporting_period(self):
+        forecast = pd.DataFrame({
+            "code": ["600001"],
+            "report_date": ["2025-12-31"],
+            "预告类型": ["预增"],
+        })
+        with mock.patch.object(engineering.warehouse, "load", return_value=forecast):
+            result = engineering._forecast_events({"600001"})
+        self.assertTrue(result.empty)
+
+    def test_trading_gap_risk_uses_exchange_sessions_across_calendar_boundaries(self):
+        calendar = pd.DataFrame({
+            "date": pd.to_datetime([
+                "2025-09-30", "2025-10-09", "2025-12-31",
+                "2026-01-02", "2026-01-05",
+            ]).astype("datetime64[ns]"),
+        })
+        panel = pd.DataFrame({
+            "code": ["600001"] * 4 + ["600002"] * 2,
+            "date": pd.to_datetime([
+                "2025-09-30", "2025-10-09", "2025-12-31", "2026-01-05",
+                "2025-12-31", "2026-01-02",
+            ]).astype("datetime64[ns]"),
+            "close": [10.0, 10.1, 10.2, 10.3, 20.0, 20.1],
+        })
+        with mock.patch.object(engineering.warehouse, "load", return_value=calendar):
+            result = engineering._add_trading_gap_risk(panel)
+
+        first = result[result["code"] == "600001"]["risk_trading_gap_days"].tolist()
+        second = result[result["code"] == "600002"]["risk_trading_gap_days"].tolist()
+        self.assertTrue(np.isnan(first[0]))
+        self.assertEqual(first[1:], [1.0, 1.0, 2.0])
+        self.assertTrue(np.isnan(second[0]))
+        self.assertEqual(second[1:], [1.0])
+
+    def test_trading_gap_risk_rejects_price_date_missing_from_calendar(self):
+        calendar = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-02"]).astype("datetime64[ns]"),
+        })
+        panel = pd.DataFrame({
+            "code": ["600001", "600001"],
+            "date": pd.to_datetime(["2026-01-02", "2026-01-05"]),
+        })
+        with mock.patch.object(engineering.warehouse, "load", return_value=calendar), \
+                self.assertRaisesRegex(RuntimeError, "2026-01-05"):
+            engineering._add_trading_gap_risk(panel)
+
+    def test_trading_gap_risk_is_diagnostic_not_model_feature(self):
+        panel = pd.DataFrame({
+            "ret_5d": [0.01],
+            "risk_trading_gap_days": [2.0],
+        })
+        self.assertEqual(engineering.feature_columns(panel), ["ret_5d"])
+
+    def test_incremental_trading_gap_retains_previous_stock_session(self):
+        calendar = pd.DataFrame({
+            "date": pd.to_datetime([
+                "2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07",
+            ]).astype("datetime64[ns]"),
+        })
+        price = pd.DataFrame({
+            "code": ["600001"] * 3,
+            "date": pd.to_datetime(["2026-01-02", "2026-01-05", "2026-01-07"]),
+            "open": [10.0, 10.1, 10.2], "high": [10.1, 10.2, 10.3],
+            "low": [9.9, 10.0, 10.1], "close": [10.0, 10.1, 10.2],
+            "volume": [1000.0] * 3, "amount": [10000.0, 10100.0, 10200.0],
+            "turnover": [1.0, 1.1, 1.2],
+        })
+        output_start = pd.Timestamp("2026-01-07")
+        with mock.patch.object(engineering.warehouse, "load_price", return_value=price), \
+                mock.patch.object(engineering.warehouse, "load", return_value=calendar):
+            full = engineering._add_trading_gap_risk(
+                engineering._price_factors("600001")
+            )
+            incremental = engineering._add_trading_gap_risk(
+                engineering._price_factors(
+                    "600001", output_start, retain_previous_row=True,
+                )
+            )
+
+        expected = full[full["date"] >= output_start].reset_index(drop=True)
+        actual = incremental[incremental["date"] >= output_start].reset_index(drop=True)
+        self.assertEqual(actual["risk_trading_gap_days"].tolist(), [2.0])
+        pd.testing.assert_frame_equal(actual, expected)
+
+    def test_strict_calendar_factors_count_missing_market_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            calendar_path = root / "trading_calendar.parquet"
+            sessions = pd.to_datetime([
+                "2026-01-29", "2026-01-30", "2026-02-02", "2026-02-03", "2026-02-04",
+            ]).astype("datetime64[ns]")
+            pd.DataFrame({"date": sessions}).to_parquet(calendar_path, index=False)
+            observed = sessions[[0, 1, 3, 4]]
+            price = pd.DataFrame({
+                "code": ["600001"] * 4, "date": observed,
+                "open": [10.0, 10.1, 10.3, 10.4],
+                "high": [10.1, 10.2, 10.4, 10.5],
+                "low": [9.9, 10.0, 10.2, 10.3],
+                "close": [10.0, 10.1, 10.3, 10.4],
+                "volume": [1000.0] * 4, "amount": [10000.0] * 4,
+                "turnover": [1.0] * 4,
+            })
+            with mock.patch.object(engineering.warehouse, "load_price", return_value=price),                     mock.patch.object(engineering.config, "TRADING_CALENDAR_FILE", str(calendar_path)):
+                strict = engineering._price_factors(
+                    "600001", strict_calendar_factors=True,
+                )
+                row_based = engineering._price_factors("600001")
+
+        strict = strict.set_index("date")
+        row_based = row_based.set_index("date")
+        self.assertTrue(np.isnan(strict.loc[sessions[3], "ret_1d"]))
+        self.assertAlmostEqual(row_based.loc[sessions[3], "ret_1d"], 10.3 / 10.1 - 1)
+        self.assertAlmostEqual(strict.loc[sessions[4], "ret_3d"], 10.4 / 10.1 - 1)
+        self.assertAlmostEqual(row_based.loc[sessions[4], "ret_3d"], 10.4 / 10.0 - 1)
+        self.assertEqual(strict.index.tolist(), observed.tolist())
+
     def test_incremental_price_factors_match_full_history(self):
         dates = pd.bdate_range("2018-01-02", periods=1900)
         steps = np.arange(len(dates))
@@ -570,8 +868,10 @@ class DailyPanelAccelerationTest(unittest.TestCase):
                 "block_trades", "lhb",
             )
         }
+        calendar = pd.DataFrame({"date": dates.astype("datetime64[ns]")})
         with mock.patch.object(engineering.warehouse, "load_price", return_value=price), \
                 mock.patch.object(engineering.warehouse, "load_valuation", return_value=pd.DataFrame()), \
+                mock.patch.object(engineering.warehouse, "load", return_value=calendar), \
                 mock.patch.object(engineering, "_asof_report_factor") as report_loader, \
                 mock.patch.object(engineering, "_forecast_events") as forecast_loader, \
                 mock.patch.object(engineering, "_margin_underlying") as margin_loader, \
@@ -580,9 +880,11 @@ class DailyPanelAccelerationTest(unittest.TestCase):
                 codes=["600001"],
                 horizon=3,
                 shared_factors=shared,
+                include_trading_gap_risk=True,
             )
 
         self.assertFalse(panel.empty)
+        self.assertEqual(panel["risk_trading_gap_days"].iloc[1:].tolist(), [1.0] * 4)
         report_loader.assert_not_called()
         forecast_loader.assert_not_called()
         margin_loader.assert_not_called()
@@ -619,6 +921,92 @@ class DailyPanelAccelerationTest(unittest.TestCase):
         self.assertEqual(set(panel["code"]), {"600001"})
         self.assertEqual(float(panel.iloc[-1]["block_trade_cnt_1d"]), 1.0)
 
+    def test_pit_universe_resolver_uses_half_open_intervals_at_window_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            master_path = root / "security_master.parquet"
+            history_path = root / "index_constituent_history.parquet"
+            pd.DataFrame({
+                "code": ["600001", "600002", "600003", "600004"],
+                "list_date": pd.to_datetime([
+                    "2020-01-01", "2020-01-01", "2026-01-10", "2020-01-01",
+                ]),
+                "delist_date": pd.to_datetime([None, "2026-01-10", None, None]),
+            }).to_parquet(master_path, index=False)
+            pd.DataFrame({
+                "index_code": ["000300.SH"] * 6,
+                "code": ["600001", "600002", "600003", "600004", "600004", pd.NA],
+                "is_standard_a_share": [True, True, True, True, True, False],
+                "in_date": pd.to_datetime([
+                    "2020-01-01", "2020-01-01", "2026-01-10",
+                    "2020-01-01", "2026-01-09", "2020-01-01",
+                ]),
+                "out_date": pd.to_datetime([
+                    None, "2026-01-10", None, "2026-01-05", None, None,
+                ]),
+            }).to_parquet(history_path, index=False)
+
+            manifest = full_train_batched.resolve_pit_window_universe(
+                "000300.SH", pd.Timestamp("2026-01-10T14:00:00"),
+                master_path, history_path,
+            )
+
+        self.assertEqual(manifest["resolved_codes"], ["600001", "600003", "600004"])
+        self.assertEqual(manifest["resolved_code_count"], 3)
+        self.assertEqual(manifest["membership_interval"], "[in_date,out_date)")
+        self.assertEqual(len(manifest["universe_hash"]), 64)
+        self.assertEqual(len(manifest["manifest_hash"]), 64)
+        self.assertEqual(len(manifest["sources"]["security_master"]["sha256"]), 64)
+
+    def test_effective_pit_universe_intersects_static_codes(self):
+        manifest = {
+            "resolved_codes": ["600001", "600002"],
+            "manifest_hash": "manifest",
+        }
+        with mock.patch.object(
+            full_train_batched, "resolve_pit_window_universe", return_value=manifest,
+        ):
+            actual_manifest, codes = full_train_batched._resolve_effective_window_universe(
+                "000300.SH", pd.Timestamp("2026-01-05"), {"600002", "600003"},
+            )
+
+        self.assertIs(actual_manifest, manifest)
+        self.assertEqual(codes, {"600002"})
+
+    def test_effective_pit_universe_rejects_empty_intersection(self):
+        manifest = {"resolved_codes": ["600001"], "manifest_hash": "manifest"}
+        with mock.patch.object(
+            full_train_batched, "resolve_pit_window_universe", return_value=manifest,
+        ), self.assertRaisesRegex(RuntimeError, "effective PIT universe is empty"):
+            full_train_batched._resolve_effective_window_universe(
+                "000300.SH", pd.Timestamp("2026-01-05"), {"600002"},
+            )
+
+    def test_pit_universe_resolver_fails_closed_on_missing_schema(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            master_path = root / "security_master.parquet"
+            history_path = root / "index_constituent_history.parquet"
+            pd.DataFrame({"code": ["600001"]}).to_parquet(master_path, index=False)
+            pd.DataFrame({
+                "index_code": ["000300.SH"], "code": ["600001"],
+                "is_standard_a_share": [True], "in_date": pd.to_datetime(["2020-01-01"]),
+                "out_date": pd.to_datetime([None]),
+            }).to_parquet(history_path, index=False)
+            with self.assertRaisesRegex(ValueError, "security master missing columns"):
+                full_train_batched.resolve_pit_window_universe(
+                    "000300.SH", pd.Timestamp("2026-01-10"), master_path, history_path,
+                )
+
+    def test_recipe_signature_tracks_pit_universe_manifest(self):
+        first = full_train_batched._recipe_signature(
+            factors=["ret_20d"], horizon=3, pit_universe_manifest_hash="first",
+        )
+        second = full_train_batched._recipe_signature(
+            factors=["ret_20d"], horizon=3, pit_universe_manifest_hash="second",
+        )
+        self.assertNotEqual(first, second)
+
     def test_recipe_signature_ignores_universe_file_churn(self):
         first = full_train_batched._recipe_signature(
             factors=["ret_20d", "volatility_20"],
@@ -649,6 +1037,67 @@ class DailyPanelAccelerationTest(unittest.TestCase):
 
 
 class ModelExpansionExperimentTest(unittest.TestCase):
+    def test_pipeline_requires_nonoverlapping_explicit_holdout_boundaries(self):
+        result = quant_pipeline._validate_explicit_holdout_boundaries(
+            "2024-12-31", "2025-06-30", "2025-07-01"
+        )
+        self.assertEqual(result[0], pd.Timestamp("2024-12-31"))
+        with self.assertRaisesRegex(ValueError, "explicit train_end"):
+            quant_pipeline._validate_explicit_holdout_boundaries(None, "2025-06-30", "2025-07-01")
+        with self.assertRaisesRegex(ValueError, "train_end < valid_end < predict_start"):
+            quant_pipeline._validate_explicit_holdout_boundaries(
+                "2025-07-01", "2025-06-30", "2025-07-01"
+            )
+
+    def test_daily_ic_cache_persists_across_instances(self):
+        rows = []
+        for date in pd.to_datetime(["2026-01-05", "2026-01-06"]):
+            for index in range(6):
+                rows.append({
+                    "date": date,
+                    "factor": float(index),
+                    "target_ret_1d": float(index),
+                })
+        panel = pd.DataFrame(rows)
+        with tempfile.TemporaryDirectory() as temporary:
+            first = full_train_batched.DailyICCache(
+                workers=1, cache_dir=Path(temporary)
+            )
+            _, hits, misses = first.get(panel, ["factor"], 1)
+            self.assertEqual((hits, misses), (0, 2))
+            second = full_train_batched.DailyICCache(
+                workers=1, cache_dir=Path(temporary)
+            )
+            _, hits, misses = second.get(panel, ["factor"], 1)
+        self.assertEqual((hits, misses), (2, 0))
+
+    def test_rebalance_stride_uses_source_date_calendar_without_rephasing(self):
+        dates = pd.bdate_range("2026-01-05", periods=5)
+        pred = pd.DataFrame({
+            "date": dates,
+            "code": ["600001"] * len(dates),
+            "pred": np.arange(len(dates), dtype=float),
+        })
+        selected = backtest._apply_rebalance_stride(pred, 2)
+        self.assertEqual(selected["date"].tolist(), list(dates[::2]))
+        self.assertEqual(backtest._apply_rebalance_stride(pred, 1).shape, pred.shape)
+
+    def test_pipeline_selection_manifest_freezes_label_windows_and_hashes(self):
+        manifest = quant_pipeline._selection_manifest(
+            "factor_selection_test",
+            "tradable_ret_3d",
+            ["factor_b", "factor_a"],
+            ["factor_a"],
+            pd.Timestamp("2024-12-31"),
+            pd.Timestamp("2025-06-30"),
+            pd.Timestamp("2025-07-01"),
+        ).iloc[0]
+        self.assertEqual(manifest["label_col"], "tradable_ret_3d")
+        self.assertEqual(manifest["candidate_count"], 2)
+        self.assertEqual(manifest["selected_count"], 1)
+        self.assertEqual(len(manifest["candidate_pool_sha256"]), 64)
+        self.assertEqual(len(manifest["generator_code_sha256"]), 64)
+
     def test_score_pred_treats_missing_optional_ic_as_zero(self):
         frame = pd.DataFrame({
             "date": pd.to_datetime(["2026-01-05", "2026-01-05"]),
@@ -1384,6 +1833,9 @@ class FutureLabelFeatureSafetyTest(unittest.TestCase):
             "next_day_return": [0.06],
             "realized_return_5d": [0.07],
             "pnl_after_5d": [0.08],
+            "e4_daily_prior": [0.09],
+            "prior_model_score": [0.10],
+            "daily_pred_rank": [0.11],
         })
         self.assertEqual(engineering.feature_columns(panel, horizon=1), ["ret_5d"])
 
@@ -1393,11 +1845,358 @@ class FutureLabelFeatureSafetyTest(unittest.TestCase):
                 ["ret_5d", "target_ret_3d"], "test window"
             )
 
-    def test_open_targets_use_entry_offset_in_purge_span(self):
+    def test_selected_manifest_rejects_score_shaped_columns_but_allows_rule_score(self):
+        selection = pd.DataFrame({"factor": ["rule_score", "e4_daily_prior"]})
+        with mock.patch.object(warehouse, "load", return_value=selection), \
+                self.assertRaisesRegex(RuntimeError, "e4_daily_prior"):
+            full_train_batched._selected_factors("unsafe_selection", Path("unused"), 5)
+
+    def test_strict_purge_uses_authoritative_sessions_across_holiday(self):
+        calendar = pd.DataFrame({
+            "date": pd.to_datetime([
+                "2026-01-30", "2026-02-02", "2026-02-03", "2026-02-04",
+            ]).astype("datetime64[ns]"),
+        })
+        with mock.patch.object(
+            full_train_batched.warehouse, "load", return_value=calendar,
+        ):
+            h1 = full_train_batched._purged_end_by_calendar(
+                pd.Timestamp("2026-02-04"), 1,
+            )
+            h2 = full_train_batched._purged_end_by_calendar(
+                pd.Timestamp("2026-02-04"), 2,
+            )
+
+        self.assertEqual(h1, pd.Timestamp("2026-02-02"))
+        self.assertEqual(h2, pd.Timestamp("2026-01-30"))
+
+    def test_purge_boundary_uses_each_stock_trade_rows(self):
+        frame = pd.DataFrame({
+            "code": ["600001"] * 5 + ["600002"] * 3,
+            "date": pd.to_datetime([
+                "2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05",
+                "2026-01-01", "2026-01-02", "2026-01-05",
+            ]),
+        })
+        result = full_train_batched._purged_end_by_code(
+            frame, pd.Timestamp("2026-01-06"), 1
+        )
+        self.assertEqual(result, pd.Timestamp("2026-01-02"))
+
+    def test_missing_ohlc_is_not_marked_buyable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            price_dir = root / "price"
+            price_dir.mkdir()
+            pd.DataFrame({
+                "code": ["600001", "600001"],
+                "date": pd.to_datetime(["2026-01-01", "2026-01-02"]),
+                "close": [10.0, 10.1],
+            }).to_parquet(price_dir / "600001.parquet", index=False)
+            result = tradability.price_tradability(["600001"], [1], quant_dir=root)
+        self.assertFalse(bool(result.iloc[0]["buyable_next"]))
+        self.assertFalse(bool(result.iloc[0]["buyable_close"]))
+
+    def test_zero_volume_daily_bar_is_never_buyable_and_sell_rolls_forward(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            price_dir = root / "price"
+            price_dir.mkdir()
+            pd.DataFrame({
+                "code": ["600001"] * 3,
+                "date": pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"]),
+                "open": [10.0, 10.1, 10.2],
+                "high": [10.0, 10.1, 10.2],
+                "low": [10.0, 10.1, 10.2],
+                "close": [10.0, 10.1, 10.2],
+                "volume": [100.0, 0.0, 100.0],
+            }).to_parquet(price_dir / "600001.parquet", index=False)
+            result = tradability.price_tradability(["600001"], [1], quant_dir=root)
+
+        self.assertFalse(bool(result.iloc[0]["buyable_next"]))
+        self.assertFalse(bool(result.iloc[1]["buyable_close"]))
+        self.assertAlmostEqual(result.iloc[0]["tradable_ret_1d"], 0.02)
+
+    def test_sell_window_with_only_zero_volume_rows_has_no_fabricated_fill(self):
+        result = tradability.rolled_sell_close(
+            np.array([10.0, 9.9, 9.8]),
+            np.array([False, False, False]),
+            horizon=1,
+            cap=2,
+            sell_unavailable=np.array([False, True, True]),
+        )
+        self.assertTrue(np.isnan(result[0]))
+
+    def test_pit_status_applies_dynamic_st_limit_and_suspension_roll(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            price_dir = root / "price"
+            price_dir.mkdir()
+            dates = pd.to_datetime([
+                "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08",
+            ]).astype("datetime64[ns]")
+            pd.DataFrame({
+                "code": ["600001"] * 4, "date": dates,
+                "open": [10.0, 10.0, 10.5, 10.2],
+                "high": [10.0, 10.0, 10.5, 10.2],
+                "low": [10.0, 10.0, 10.4, 10.2],
+                "close": [10.0, 10.0, 10.5, 10.2],
+                "volume": [100.0] * 4,
+            }).to_parquet(price_dir / "600001.parquet", index=False)
+            pd.DataFrame({
+                "code": ["600001"] * 4, "date": dates,
+                "high_limit": [11.0, 11.0, 10.5, 11.55],
+                "low_limit": [9.0, 9.0, 9.5, 9.45],
+                "is_st": [False, False, True, False],
+                "is_suspended": [False, True, False, False],
+                "is_withdrawal": [False] * 4,
+                "is_ex_right": [False] * 4,
+            }).to_parquet(root / "trading_status_history.parquet", index=False)
+
+            strict = tradability.price_tradability(
+                ["600001"], [1], quant_dir=root, require_status=True,
+            )
+            legacy = tradability.price_tradability(["600001"], [1], quant_dir=root)
+
+        self.assertFalse(bool(strict.iloc[1]["buyable_close"]))
+        self.assertFalse(bool(strict.iloc[2]["buyable_close"]))
+        self.assertTrue(bool(legacy.iloc[2]["buyable_close"]))
+        self.assertAlmostEqual(strict.iloc[0]["tradable_ret_1d"], 0.05)
+
+    def test_pit_status_missing_date_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            price_dir = root / "price"
+            price_dir.mkdir()
+            dates = pd.to_datetime(["2026-01-05", "2026-01-06"]).astype("datetime64[ns]")
+            pd.DataFrame({
+                "code": ["600001"] * 2, "date": dates,
+                "open": [10.0, 10.1], "high": [10.0, 10.1],
+                "low": [10.0, 10.1], "close": [10.0, 10.1],
+                "volume": [100.0, 100.0],
+            }).to_parquet(price_dir / "600001.parquet", index=False)
+            pd.DataFrame({
+                "code": ["600001"], "date": dates[:1],
+                "high_limit": [11.0], "low_limit": [9.0],
+                "is_st": [False], "is_suspended": [False],
+                "is_withdrawal": [False], "is_ex_right": [False],
+            }).to_parquet(root / "trading_status_history.parquet", index=False)
+
+            result = tradability.price_tradability(
+                ["600001"], [1], quant_dir=root, require_status=True,
+            )
+
+        self.assertTrue(bool(result.iloc[0]["status_present"]))
+        self.assertFalse(bool(result.iloc[1]["status_present"]))
+        self.assertFalse(bool(result.iloc[0]["buyable_next"]))
+        self.assertFalse(bool(result.iloc[1]["buyable_close"]))
+        self.assertTrue(np.isnan(result.iloc[0]["tradable_ret_1d"]))
+
+    def test_listing_session_gate_uses_authoritative_calendar(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            price_dir = root / "price"
+            price_dir.mkdir()
+            dates = pd.to_datetime([
+                "2026-01-30", "2026-02-02", "2026-02-03", "2026-02-04",
+            ]).astype("datetime64[ns]")
+            pd.DataFrame({"date": dates}).to_parquet(
+                root / "trading_calendar.parquet", index=False,
+            )
+            pd.DataFrame({
+                "code": ["600001"], "list_date": pd.to_datetime(["2026-01-30"]),
+            }).to_parquet(root / "security_master.parquet", index=False)
+            pd.DataFrame({
+                "code": ["600001"] * 4, "date": dates,
+                "open": [10.0, 10.1, 10.2, 10.3],
+                "high": [10.1, 10.2, 10.3, 10.4],
+                "low": [9.9, 10.0, 10.1, 10.2],
+                "close": [10.0, 10.1, 10.2, 10.3],
+                "volume": [100.0] * 4, "amount": [1_000_000.0] * 4,
+            }).to_parquet(price_dir / "600001.parquet", index=False)
+
+            result = tradability.price_tradability(
+                ["600001"], [1], quant_dir=root, min_listing_sessions=3,
+            )
+
+        self.assertEqual(result["listing_sessions"].tolist(), [1.0, 2.0, 3.0, 4.0])
+        self.assertFalse(bool(result.iloc[1]["buyable_close"]))
+        self.assertTrue(bool(result.iloc[2]["buyable_close"]))
+        self.assertFalse(bool(result.iloc[0]["buyable_next"]))
+        self.assertTrue(bool(result.iloc[1]["buyable_next"]))
+
+    def test_absolute_adv_gate_uses_only_prior_twenty_sessions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            price_dir = root / "price"
+            price_dir.mkdir()
+            dates = pd.bdate_range("2026-01-02", periods=22).astype("datetime64[ns]")
+            pd.DataFrame({
+                "code": ["600001"] * 22, "date": dates,
+                "open": np.linspace(10.0, 10.21, 22),
+                "high": np.linspace(10.0, 10.21, 22),
+                "low": np.linspace(10.0, 10.21, 22),
+                "close": np.linspace(10.0, 10.21, 22),
+                "volume": [100.0] * 22,
+                "amount": [1_000_000.0] * 20 + [100_000_000.0, 1_000_000.0],
+            }).to_parquet(price_dir / "600001.parquet", index=False)
+
+            blocked = tradability.price_tradability(
+                ["600001"], [1], quant_dir=root, min_adv20=2_000_000.0,
+            )
+            allowed = tradability.price_tradability(
+                ["600001"], [1], quant_dir=root, min_adv20=500_000.0,
+            )
+
+        self.assertAlmostEqual(blocked.iloc[20]["adv20"], 1_000_000.0)
+        self.assertFalse(bool(blocked.iloc[20]["buyable_close"]))
+        self.assertTrue(bool(allowed.iloc[20]["buyable_close"]))
+        self.assertFalse(bool(blocked.iloc[19]["liquidity_pass"]))
+
+    def test_calendar_sessions_do_not_skip_missing_suspension_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            price_dir = root / "price"
+            price_dir.mkdir()
+            sessions = pd.to_datetime([
+                "2026-01-30", "2026-02-02", "2026-02-03", "2026-02-04",
+            ]).astype("datetime64[ns]")
+            pd.DataFrame({"date": sessions}).to_parquet(
+                root / "trading_calendar.parquet", index=False,
+            )
+            observed = sessions[[0, 1, 3]]
+            pd.DataFrame({
+                "code": ["600001"] * 3, "date": observed,
+                "open": [10.0, 10.1, 10.3], "high": [10.0, 10.1, 10.3],
+                "low": [10.0, 10.1, 10.3], "close": [10.0, 10.1, 10.3],
+                "volume": [100.0] * 3,
+            }).to_parquet(price_dir / "600001.parquet", index=False)
+            pd.DataFrame({
+                "code": ["600001"] * 4, "date": sessions,
+                "high_limit": [11.0, 11.0, 11.0, 11.0],
+                "low_limit": [9.0, 9.0, 9.0, 9.0],
+                "is_st": [False] * 4,
+                "is_suspended": [False, False, True, False],
+                "is_withdrawal": [False] * 4,
+                "is_ex_right": [False] * 4,
+            }).to_parquet(root / "trading_status_history.parquet", index=False)
+
+            strict = tradability.price_tradability(
+                ["600001"], [1], quant_dir=root,
+                require_status=True, require_calendar=True,
+            )
+            row_based = tradability.price_tradability(
+                ["600001"], [1], quant_dir=root, require_status=True,
+            )
+
+        self.assertTrue(np.isnan(strict.iloc[1]["target_ret_1d"]))
+        self.assertAlmostEqual(strict.iloc[1]["tradable_ret_1d"], 10.3 / 10.1 - 1)
+        self.assertAlmostEqual(row_based.iloc[1]["target_ret_1d"], 10.3 / 10.1 - 1)
+        self.assertEqual(strict["date"].tolist(), observed.tolist())
+        self.assertTrue(np.isnan(strict.iloc[-1]["target_ret_1d"]))
+
+    def test_execution_targets_use_full_label_span_for_purge(self):
         self.assertEqual(full_train_batched._purge_span("baseline", 1), 1)
-        self.assertEqual(full_train_batched._purge_span("tradable-label", 1), 1)
+        self.assertEqual(full_train_batched._purge_span("tradable-label", 1), 3)
+        with mock.patch.dict(os.environ, {"QUANT_BT_SELL_ROLL_MAX_DAYS": "5"}):
+            self.assertEqual(full_train_batched._purge_span("tradable-label", 1), 5)
         self.assertEqual(full_train_batched._purge_span("open-label", 1), 2)
         self.assertEqual(full_train_batched._purge_span("open-buyin-mask", 1), 2)
+
+    def test_tradable_label_recipe_tracks_sell_roll_days(self):
+        with mock.patch.dict(os.environ, {"QUANT_BT_SELL_ROLL_MAX_DAYS": "2"}):
+            first = full_train_batched._label_recipe_params("tradable-label")
+        with mock.patch.dict(os.environ, {"QUANT_BT_SELL_ROLL_MAX_DAYS": "5"}):
+            second = full_train_batched._label_recipe_params("tradable-label")
+        self.assertEqual(first["sell_roll_max_days"], 2)
+        self.assertEqual(second["sell_roll_max_days"], 5)
+        self.assertNotEqual(
+            full_train_batched._recipe_signature(**first),
+            full_train_batched._recipe_signature(**second),
+        )
+
+    def test_c30_strict_gate_protects_baseline_cache_and_rejects_one_month(self):
+        with mock.patch.object(
+            full_train_batched, "_price_source_signature", return_value="price-hash",
+        ):
+            legacy = full_train_batched._label_recipe_params("baseline")
+            strict = full_train_batched._label_recipe_params(
+                "baseline", enforce_c30_gates=True,
+            )
+
+        self.assertEqual(legacy, {})
+        self.assertEqual(strict["price_source_signature"], "price-hash")
+        self.assertTrue(strict["c30_gates"])
+        self.assertNotEqual(
+            full_train_batched._recipe_signature(**legacy),
+            full_train_batched._recipe_signature(**strict),
+        )
+        with self.assertRaisesRegex(ValueError, "refresh_months=0 or refresh_months>=2"):
+            full_train_batched._validate_c30_refresh_months(True, 1)
+        full_train_batched._validate_c30_refresh_months(True, 2)
+        full_train_batched._validate_c30_refresh_months(False, 1)
+
+    def test_c30_audit_reports_baseline_cache_and_refresh_month_risks(self):
+        with mock.patch.object(
+            full_train_batched, "_price_source_signature", return_value="price-hash",
+        ):
+            baseline = full_train_batched._c30_recipe_audit("baseline", 1)
+            strict_label = full_train_batched._c30_recipe_audit("tradable-label", 2)
+
+        self.assertEqual(baseline["price_source_signature"], "price-hash")
+        self.assertFalse(baseline["baseline_price_signature_protected"])
+        self.assertTrue(baseline["refresh_months_horizon_risk"])
+        self.assertTrue(strict_label["baseline_price_signature_protected"])
+        self.assertFalse(strict_label["refresh_months_horizon_risk"])
+
+    def test_strict_execution_labels_isolate_cache_and_recipe(self):
+        frame = pd.DataFrame({
+            "code": ["600001"], "date": pd.to_datetime(["2026-01-05"]),
+            "tradable_ret_1d": [0.01], "buyable_close": [True],
+        })
+        full_train_batched._TRAD_CACHE.clear()
+        with mock.patch.object(
+            full_train_batched.tradability, "price_tradability", return_value=frame,
+        ) as loader, mock.patch.object(
+            full_train_batched, "_price_source_signature", return_value="price-hash",
+        ):
+            full_train_batched._cached_price_tradability(["600001"], 1)
+            full_train_batched._cached_price_tradability(
+                ["600001"], 1, strict_execution_labels=True,
+            )
+            legacy = full_train_batched._label_recipe_params("tradable-label")
+            strict = full_train_batched._label_recipe_params(
+                "tradable-label", strict_execution_labels=True,
+            )
+
+        self.assertEqual(loader.call_count, 2)
+        self.assertEqual(loader.call_args_list[0].kwargs["require_status"], False)
+        self.assertEqual(loader.call_args_list[1].kwargs["require_status"], True)
+        self.assertEqual(loader.call_args_list[1].kwargs["require_calendar"], True)
+        self.assertNotIn("strict_execution_labels", legacy)
+        self.assertTrue(strict["strict_execution_labels"])
+        self.assertNotEqual(
+            full_train_batched._recipe_signature(**legacy),
+            full_train_batched._recipe_signature(**strict),
+        )
+        full_train_batched._TRAD_CACHE.clear()
+
+    def test_listing_gate_enters_training_recipe(self):
+        with mock.patch.object(
+            full_train_batched, "_price_source_signature", return_value="price-hash",
+        ):
+            first = full_train_batched._label_recipe_params(
+                "tradable-label", min_listing_sessions=20,
+            )
+            second = full_train_batched._label_recipe_params(
+                "tradable-label", min_listing_sessions=60,
+            )
+
+        self.assertEqual(first["min_listing_sessions"], 20)
+        self.assertNotEqual(
+            full_train_batched._recipe_signature(**first),
+            full_train_batched._recipe_signature(**second),
+        )
 
     def test_open_target_cache_signature_tracks_price_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1421,6 +2220,74 @@ class FutureLabelFeatureSafetyTest(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "unsafe future-label model features"):
             quant_model._xy(frame, ["future_return"], "target_ret_1d")
+
+    def test_factor_ic_accepts_explicit_label_column(self):
+        rows = []
+        for date in pd.to_datetime(["2026-01-02", "2026-01-05"]):
+            for index in range(6):
+                rows.append({
+                    "date": date,
+                    "factor": float(index),
+                    "target_ret_1d": float(5 - index),
+                    "tradable_ret_1d": float(index),
+                })
+        panel = pd.DataFrame(rows)
+        result = factor_select.daily_ic(
+            panel, ["factor"], horizon=1, label_col="tradable_ret_1d"
+        )
+        self.assertEqual(len(result), 2)
+        self.assertTrue((result["ic"] > 0).all())
+
+    def test_catboost_ranker_exposes_explicit_label_arguments(self):
+        parameters = inspect.signature(quant_model.train_catboost_ranker).parameters
+        self.assertIn("label_col", parameters)
+        self.assertIn("train_mask_col", parameters)
+
+    def test_purge_can_be_enabled_without_rolling_factor_selection(self):
+        args = types.SimpleNamespace(
+            strategy_mode="incumbent-refresh",
+            purge_horizon=True,
+            incumbent_purge_horizon=False,
+            incumbent_rolling_factor_select=False,
+        )
+        self.assertTrue(scheduled_workflow._uses_purge_training(args))
+        self.assertFalse(scheduled_workflow._uses_rolling_training(args))
+
+    def test_long_horizons_require_larger_validation_windows(self):
+        self.assertEqual(scheduled_workflow._minimum_validation_months(1), 1)
+        self.assertEqual(scheduled_workflow._minimum_validation_months(3), 2)
+        self.assertEqual(scheduled_workflow._minimum_validation_months(10), 3)
+        self.assertEqual(scheduled_workflow._minimum_validation_months(15), 3)
+
+    def test_short_grid_failure_preserves_incumbent_parameters(self):
+        args = types.SimpleNamespace()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "prefix_bt_ridge_lightgbm_ranker_ensemble_predictions.parquet"
+            source.write_bytes(b"prediction-artifact")
+            with mock.patch.object(scheduled_workflow, "_quant_dir", return_value=root), \
+                    mock.patch.object(scheduled_workflow, "_optimization_universe", return_value=["600001"]), \
+                    mock.patch.object(
+                        scheduled_workflow.watchlist_grid,
+                        "run_grid",
+                        side_effect=RuntimeError("grid unavailable"),
+                    ):
+                result = scheduled_workflow.run_short_grid(
+                    {"short_1_3": "prefix"}, args, {"top_n": 2},
+                )
+        self.assertIsNone(result)
+
+    def test_derived_style_reports_actual_source_prediction_horizon(self):
+        requested = {"short_1_3": 1, "swing_7_15": 10}
+
+        published = scheduled_workflow._published_prediction_horizons(requested)
+
+        self.assertEqual(published, {"short_1_3": 1, "swing_7_15": 1})
+        self.assertEqual(requested, {"short_1_3": 1, "swing_7_15": 10})
+        self.assertEqual(
+            scheduled_workflow.TRAINING_PROFILE["source"],
+            "short_model_predictions_reused_by_derived_styles",
+        )
 
 
 if __name__ == "__main__":

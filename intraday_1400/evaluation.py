@@ -35,8 +35,95 @@ def _bootstrap_ci(values: pd.Series, samples: int = 1000, seed: int = 42) -> lis
     return [float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))]
 
 
-def _metrics(selected: pd.DataFrame, gross_column: str, cost: float, rebalance_stride: int = 1) -> dict:
+def _circular_block_bootstrap_means(
+    values: np.ndarray,
+    samples: int,
+    block_length: int,
+    seed: int,
+) -> np.ndarray:
+    clean = np.asarray(values, dtype=float)
+    clean = clean[np.isfinite(clean)]
+    if not len(clean) or samples <= 0:
+        return np.asarray([], dtype=float)
+    length = len(clean)
+    block = min(max(int(block_length), 1), length)
+    block_count = int(np.ceil(length / block))
+    rng = np.random.default_rng(seed)
+    starts = rng.integers(0, length, size=(int(samples), block_count))
+    offsets = np.arange(block)
+    indices = (starts[:, :, None] + offsets[None, None, :]) % length
+    draws = clean[indices.reshape(int(samples), -1)[:, :length]]
+    return draws.mean(axis=1)
+
+
+def _paired_block_bootstrap(
+    model: pd.Series,
+    baseline: pd.Series,
+    samples: int = 2000,
+    block_length: int = 5,
+    seed: int = 42,
+) -> dict:
+    paired = pd.concat(
+        [model.rename("model"), baseline.rename("baseline")], axis=1, join="inner",
+    ).dropna()
+    gain = paired["model"] - paired["baseline"]
+    if gain.empty:
+        return {"days": 0, "available": False}
+    values = gain.to_numpy(dtype=float)
+    observed = float(values.mean())
+    boot = _circular_block_bootstrap_means(values, samples, block_length, seed)
+    centered_boot = _circular_block_bootstrap_means(
+        values - observed, samples, block_length, seed + 1,
+    )
+    result = {
+        "available": bool(len(values) >= 10 and len(boot)),
+        "days": int(len(values)),
+        "paired_mean_gain": observed,
+        "model_mean_return": float(paired["model"].mean()),
+        "baseline_mean_return": float(paired["baseline"].mean()),
+        "block_method": "circular_moving_block",
+        "block_length": min(max(int(block_length), 1), len(values)),
+        "bootstrap_samples": int(samples),
+        "seed": int(seed),
+    }
+    if result["available"]:
+        result["ci95"] = [
+            float(np.quantile(boot, 0.025)),
+            float(np.quantile(boot, 0.975)),
+        ]
+        result["p_value_one_sided"] = float(
+            (np.count_nonzero(centered_boot >= observed) + 1) / (len(centered_boot) + 1)
+        )
+    else:
+        result["ci95"] = None
+        result["p_value_one_sided"] = None
+    return result
+
+
+def _holm_adjust(p_values: list[float]) -> list[float]:
+    if not p_values:
+        return []
+    values = np.asarray(p_values, dtype=float)
+    order = np.argsort(values)
+    adjusted = np.empty(len(values), dtype=float)
+    running = 0.0
+    total = len(values)
+    for rank, index in enumerate(order):
+        running = max(running, (total - rank) * values[index])
+        adjusted[index] = min(running, 1.0)
+    return adjusted.tolist()
+
+
+def _daily_returns(
+    selected: pd.DataFrame,
+    gross_column: str,
+    cost: float,
+    rebalance_stride: int = 1,
+) -> tuple[pd.Series, pd.DataFrame, int, int, float]:
+    stride = max(int(rebalance_stride), 1)
     evaluated = selected.copy()
+    rebalance_dates = pd.Index(evaluated["date"].dropna().sort_values().unique())[::stride]
+    evaluated = evaluated[evaluated["date"].isin(rebalance_dates)].copy()
     observed_column = next(
         (column for column in ("target_outcome_observed_t1", "outcome_observed") if column in evaluated),
         None,
@@ -61,16 +148,23 @@ def _metrics(selected: pd.DataFrame, gross_column: str, cost: float, rebalance_s
     unsellable = buyable & evaluated[gross_column].isna()
     evaluated.loc[unsellable, gross_column] = unsellable_return + float(cost)
     daily = (evaluated.groupby("date")[gross_column].mean() - float(cost)).dropna()
-    daily = daily.iloc[::max(int(rebalance_stride), 1)]
+    return daily, evaluated, missing_targets, immature_targets, unsellable_return
+
+
+def _metrics(selected: pd.DataFrame, gross_column: str, cost: float, rebalance_stride: int = 1) -> dict:
+    daily, evaluated, missing_targets, immature_targets, unsellable_return = _daily_returns(
+        selected, gross_column, cost, rebalance_stride,
+    )
     if daily.empty:
         return {"days": 0}
     std = float(daily.std())
+    periods_per_year = 252.0 / max(int(rebalance_stride), 1)
     return {
         "days": int(len(daily)),
         "mean_return": float(daily.mean()),
         "median_return": float(daily.median()),
         "win_rate": float((daily > 0).mean()),
-        "sharpe": float(daily.mean() / std * np.sqrt(252)) if std > 0 else None,
+        "sharpe": float(daily.mean() / std * np.sqrt(periods_per_year)) if std > 0 else None,
         "max_drawdown": _max_drawdown(daily),
         "compound_return": float((1.0 + daily).prod() - 1.0),
         "mean_return_ci95": _bootstrap_ci(daily),
@@ -89,32 +183,7 @@ def _mean_return_only(
     rebalance_stride: int = 1,
 ) -> float:
     """Compute one control sample mean without bootstrap or auxiliary metrics."""
-    evaluated = selected.copy()
-    observed_column = next(
-        (column for column in ("target_outcome_observed_t1", "outcome_observed") if column in evaluated),
-        None,
-    )
-    observed = (
-        evaluated[observed_column].fillna(False).astype(bool)
-        if observed_column else pd.Series(True, index=evaluated.index)
-    )
-    buyable = (
-        evaluated["entry_buyable"].fillna(False).astype(bool)
-        if "entry_buyable" in evaluated else pd.Series(True, index=evaluated.index)
-    )
-    immature = buyable & ~observed
-    evaluated = evaluated[~immature].copy()
-    buyable = buyable[~immature]
-    if evaluated.empty:
-        return float("nan")
-    evaluated.loc[~buyable, gross_column] = float(cost)
-    unsellable_return = float(
-        os.environ.get("INTRADAY_1400_UNSELLABLE_RETURN", "-0.10") or -0.10
-    )
-    unsellable = buyable & evaluated[gross_column].isna()
-    evaluated.loc[unsellable, gross_column] = unsellable_return + float(cost)
-    daily = (evaluated.groupby("date")[gross_column].mean() - float(cost)).dropna()
-    daily = daily.iloc[::max(int(rebalance_stride), 1)]
+    daily, _, _, _, _ = _daily_returns(selected, gross_column, cost, rebalance_stride)
     return float(daily.mean()) if not daily.empty else float("nan")
 
 
@@ -137,7 +206,9 @@ def _init_control_worker(
     _CONTROL_REBALANCE_STRIDE = max(int(rebalance_stride), 1)
 
 
-def _control_seed_worker(args: tuple[int, int]) -> dict[tuple[int, str, float, str], float]:
+def _control_seed_worker(
+    args: tuple[int, int],
+) -> dict[tuple[int, str, float, str], tuple[float, pd.Series]]:
     top_n, seed = args
     if _CONTROL_FRAME is None:
         raise RuntimeError("control worker was not initialized")
@@ -153,12 +224,16 @@ def _control_seed_worker(args: tuple[int, int]) -> dict[tuple[int, str, float, s
         "random_topn": controlled[random_rank <= int(top_n)],
         "score_shuffle": controlled[shuffled_rank <= int(top_n)],
     }
-    output: dict[tuple[int, str, float, str], float] = {}
+    output: dict[tuple[int, str, float, str], tuple[float, pd.Series]] = {}
     for target, gross_column in _CONTROL_GROSS_COLUMNS.items():
         for cost in _CONTROL_COSTS:
             for kind, frame in selected.items():
-                output[(int(top_n), target, cost, kind)] = _mean_return_only(
+                daily, _, _, _, _ = _daily_returns(
                     frame, gross_column, cost, _CONTROL_REBALANCE_STRIDE,
+                )
+                output[(int(top_n), target, cost, kind)] = (
+                    float(daily.mean()) if not daily.empty else float("nan"),
+                    daily,
                 )
     return output
 
@@ -245,6 +320,16 @@ def _distribution_summary(values: list[float]) -> dict:
     }
 
 
+def _mean_control_daily(
+    results: list[dict],
+    key: tuple[int, str, float, str],
+) -> pd.Series:
+    series = [result[key][1].rename(index) for index, result in enumerate(results) if key in result]
+    if not series:
+        return pd.Series(dtype=float)
+    return pd.concat(series, axis=1).mean(axis=1).sort_index()
+
+
 def _evaluate_negative_controls(
     labels: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -255,12 +340,21 @@ def _evaluate_negative_controls(
     seed: int = 42,
     workers: int = 1,
     rebalance_stride: int = 1,
+    bootstrap_samples: int = 2000,
+    block_length: int = 5,
 ) -> dict:
     merged = labels.merge(predictions, on=["code", "date"], how="inner", validate="one_to_one")
     report = {
         "samples": int(samples),
         "seed": int(seed),
         "rebalance_stride": max(int(rebalance_stride), 1),
+        "paired_bootstrap": {
+            "method": "circular_moving_block",
+            "samples": int(bootstrap_samples),
+            "block_length": int(block_length),
+            "seed": int(seed),
+            "multiplicity": "holm_fwer",
+        },
         "overlap_rows": int(len(merged)),
         "overlap_days": int(merged["date"].nunique()),
         "market_equal_weight": {},
@@ -290,23 +384,61 @@ def _evaluate_negative_controls(
     else:
         _init_control_worker(merged, metadata["gross_columns"], costs, rebalance_stride)
         results = [_control_seed_worker(job) for job in jobs]
+    merged["model_rank"] = merged.groupby("date")["score"].rank(method="first", ascending=False)
+    inference_entries: list[dict] = []
     for top_n in top_values:
-        report["top"][str(top_n)] = {
-            target: {
-                f"cost_{int(round(cost * 10000))}bp": {
-                    "random_topn": _distribution_summary([
-                        result[(int(top_n), target, cost, "random_topn")] for result in results
-                        if (int(top_n), target, cost, "random_topn") in result
-                    ]),
-                    "score_shuffle": _distribution_summary([
-                        result[(int(top_n), target, cost, "score_shuffle")] for result in results
-                        if (int(top_n), target, cost, "score_shuffle") in result
-                    ]),
+        top_report: dict = {}
+        model_selected = merged[merged["model_rank"] <= int(top_n)]
+        for target, gross_column in metadata["gross_columns"].items():
+            target_report: dict = {}
+            for cost in costs:
+                cost_key = f"cost_{int(round(cost * 10000))}bp"
+                random_key = (int(top_n), target, cost, "random_topn")
+                shuffle_key = (int(top_n), target, cost, "score_shuffle")
+                random_values = [result[random_key][0] for result in results if random_key in result]
+                shuffle_values = [result[shuffle_key][0] for result in results if shuffle_key in result]
+                model_daily, _, _, _, _ = _daily_returns(
+                    model_selected, gross_column, cost, rebalance_stride,
+                )
+                market_daily, _, _, _, _ = _daily_returns(
+                    merged, gross_column, cost, rebalance_stride,
+                )
+                baselines = {
+                    "market_equal_weight": market_daily,
+                    "random_topn": _mean_control_daily(results, random_key),
+                    "score_shuffle": _mean_control_daily(results, shuffle_key),
                 }
-                for cost in costs
-            }
-            for target in metadata["gross_columns"]
-        }
+                paired = {}
+                for baseline_index, (baseline_name, baseline_daily) in enumerate(baselines.items()):
+                    comparison = _paired_block_bootstrap(
+                        model_daily,
+                        baseline_daily,
+                        samples=bootstrap_samples,
+                        block_length=block_length,
+                        seed=int(seed) + baseline_index,
+                    )
+                    comparison["baseline_definition"] = (
+                        "equal_weight_market_daily_return"
+                        if baseline_name == "market_equal_weight"
+                        else "mean_daily_return_across_control_seeds"
+                    )
+                    if baseline_name != "market_equal_weight":
+                        comparison["control_seed_samples"] = int(samples)
+                    paired[baseline_name] = comparison
+                    if comparison.get("p_value_one_sided") is not None:
+                        inference_entries.append(comparison)
+                target_report[cost_key] = {
+                    "random_topn": _distribution_summary(random_values),
+                    "score_shuffle": _distribution_summary(shuffle_values),
+                    "paired_comparisons": paired,
+                }
+            top_report[target] = target_report
+        report["top"][str(top_n)] = top_report
+    adjusted = _holm_adjust([entry["p_value_one_sided"] for entry in inference_entries])
+    for entry, value in zip(inference_entries, adjusted):
+        entry["p_value_holm"] = float(value)
+        entry["holm_family_size"] = len(inference_entries)
+        entry["reject_holm_0_05"] = bool(value <= 0.05)
     return report
 
 
@@ -323,6 +455,8 @@ def evaluate(
     control_samples: int = 200,
     control_seed: int = 42,
     control_workers: int = 1,
+    bootstrap_samples: int = 2000,
+    block_length: int = 5,
 ) -> dict:
     labels, metadata = _load_labels()
     manifest_path = config.MODEL_DIR / "intraday_1400_shadow_manifest.json"
@@ -399,6 +533,8 @@ def evaluate(
             samples=control_samples,
             seed=control_seed,
             workers=control_workers,
+            bootstrap_samples=bootstrap_samples,
+            block_length=block_length,
         )
     else:
         report["negative_controls"] = {"available": False, "sources": causal_names}
@@ -414,10 +550,20 @@ def main() -> None:
     parser.add_argument("--control-samples", type=int, default=200)
     parser.add_argument("--control-seed", type=int, default=42)
     parser.add_argument("--control-workers", type=int, default=1)
+    parser.add_argument("--bootstrap-samples", type=int, default=2000)
+    parser.add_argument("--block-length", type=int, default=5)
     args = parser.parse_args()
     top_values = tuple(int(value) for value in args.top.split(",") if int(value) > 0)
     costs = tuple(float(value) / 10000.0 for value in args.costs_bp.split(","))
-    evaluate(top_values, costs, args.control_samples, args.control_seed, args.control_workers)
+    evaluate(
+        top_values,
+        costs,
+        args.control_samples,
+        args.control_seed,
+        args.control_workers,
+        args.bootstrap_samples,
+        args.block_length,
+    )
 
 
 if __name__ == "__main__":

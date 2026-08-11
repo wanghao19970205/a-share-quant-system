@@ -218,6 +218,185 @@ def stock_name(symbol: str) -> str:
     return ""
 
 
+def fetch_trading_calendar() -> pd.DataFrame:
+    """Return the authoritative AmazingData open-session calendar.
+
+    ``BaseData.get_calendar`` may return a sequence or a one-column DataFrame.
+    Normalize both forms to one strictly increasing, duplicate-free ``date`` column.
+    """
+    if not _ensure_login():
+        raise RuntimeError(f"AmazingData 不可用：{_last_error or '未安装 SDK 或账号未配置'}")
+    raw = sdk_call(_base.get_calendar)
+    if isinstance(raw, pd.DataFrame):
+        if raw.shape[1] == 0:
+            raise ValueError("AmazingData trading calendar has no columns")
+        values = raw.iloc[:, 0]
+    else:
+        values = pd.Series(raw)
+    dates = pd.to_datetime(values.astype(str).str.strip(), format="%Y%m%d", errors="coerce")
+    if dates.isna().any():
+        raise ValueError("AmazingData trading calendar contains invalid dates")
+    if dates.duplicated().any():
+        raise ValueError("AmazingData trading calendar contains duplicate dates")
+    result = pd.DataFrame({"date": dates.astype("datetime64[ns]")}).sort_values("date").reset_index(drop=True)
+    if result.empty:
+        raise ValueError("AmazingData trading calendar is empty")
+    if not result["date"].is_monotonic_increasing:
+        raise ValueError("AmazingData trading calendar is not increasing")
+    return result
+
+
+def _sdk_frame(raw) -> pd.DataFrame:
+    if isinstance(raw, dict):
+        frames = [value for value in raw.values() if isinstance(value, pd.DataFrame) and not value.empty]
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return raw.copy() if isinstance(raw, pd.DataFrame) else pd.DataFrame()
+
+
+def _yyyymmdd(values: pd.Series) -> pd.Series:
+    return pd.to_datetime(
+        values.astype("string").str.strip(), format="%Y%m%d", errors="coerce"
+    ).astype("datetime64[ns]")
+
+
+def fetch_security_master() -> pd.DataFrame:
+    """Return normalized A-share listing metadata for PIT universe construction."""
+    if not _ensure_login():
+        raise RuntimeError(f"AmazingData 不可用：{_last_error or '未安装 SDK 或账号未配置'}")
+    broker_codes = list(sdk_call(_base.get_code_list, "EXTRA_STOCK_A", timeout=60.0))
+    if not broker_codes:
+        raise ValueError("AmazingData A-share code list is empty")
+    info = _ad.InfoData()
+    raw = _sdk_frame(sdk_call(info.get_stock_basic, broker_codes, timeout=_BROKER_TIMEOUT))
+    required = {
+        "MARKET_CODE", "SECURITY_NAME", "LISTDATE", "DELISTDATE",
+        "LISTPLATE_NAME", "IS_LISTED",
+    }
+    if raw.empty or not required.issubset(raw.columns):
+        raise ValueError(f"AmazingData security master missing columns: {sorted(required - set(raw.columns))}")
+    result = pd.DataFrame({
+        "code": raw["MARKET_CODE"].astype(str).str.split(".").str[0].str.zfill(6),
+        "market_code": raw["MARKET_CODE"].astype(str).str.strip(),
+        "name": raw["SECURITY_NAME"].astype("string").fillna("").str.strip(),
+        "list_date": _yyyymmdd(raw["LISTDATE"]),
+        "delist_date": _yyyymmdd(raw["DELISTDATE"]),
+        "list_plate": raw["LISTPLATE_NAME"].astype("string").fillna("").str.strip(),
+        "is_listed": pd.to_numeric(raw["IS_LISTED"], errors="coerce").astype("Int64"),
+    })
+    if result.empty or result["list_date"].isna().any():
+        raise ValueError("AmazingData security master has missing or invalid listing dates")
+    if result["code"].duplicated().any() or not result["code"].str.fullmatch(r"\d{6}").all():
+        raise ValueError("AmazingData security master has duplicate or invalid codes")
+    invalid_delist = result["delist_date"].notna() & (result["delist_date"] < result["list_date"])
+    if invalid_delist.any() or result["is_listed"].isna().any():
+        raise ValueError("AmazingData security master has invalid listing status history")
+    return result.sort_values("code").reset_index(drop=True)
+
+
+def fetch_index_constituent_history(index_codes: list[str]) -> pd.DataFrame:
+    """Return normalized historical index membership intervals from AmazingData."""
+    if not index_codes:
+        raise ValueError("index_codes must not be empty")
+    if not _ensure_login():
+        raise RuntimeError(f"AmazingData 不可用：{_last_error or '未安装 SDK 或账号未配置'}")
+    normalized = [_to_broker_code(code) if "." not in str(code) else str(code) for code in index_codes]
+    info = _ad.InfoData()
+    with tempfile.TemporaryDirectory(prefix="ad-index-") as cache:
+        raw = _sdk_frame(sdk_call(
+            info.get_index_constituent,
+            normalized,
+            local_path=cache,
+            is_local=False,
+            timeout=max(_BROKER_TIMEOUT, 180.0),
+        ))
+    required = {"INDEX_CODE", "CON_CODE", "INDATE", "OUTDATE", "INDEX_NAME"}
+    if raw.empty or not required.issubset(raw.columns):
+        raise ValueError(f"AmazingData index history missing columns: {sorted(required - set(raw.columns))}")
+    market_code = raw["CON_CODE"].astype("string").fillna("").str.strip()
+    code = market_code.str.split(".").str[0]
+    is_standard = code.str.fullmatch(r"\d{6}")
+    result = pd.DataFrame({
+        "index_code": raw["INDEX_CODE"].astype("string").fillna("").str.strip(),
+        "code": code.where(is_standard, pd.NA),
+        "market_code": market_code,
+        "is_standard_a_share": is_standard.astype(bool),
+        "in_date": _yyyymmdd(raw["INDATE"]),
+        "out_date": _yyyymmdd(raw["OUTDATE"]),
+        "index_name": raw["INDEX_NAME"].astype("string").fillna("").str.strip(),
+    })
+    if result.empty or result[["index_code", "market_code", "in_date"]].isna().any().any():
+        raise ValueError("AmazingData index history has missing membership keys")
+    if (result["index_code"] == "").any() or (result["market_code"] == "").any():
+        raise ValueError("AmazingData index history has empty membership keys")
+    raw_keys = ["index_code", "market_code", "in_date"]
+    if result.duplicated(raw_keys).any():
+        raise ValueError("AmazingData index history has duplicate membership keys")
+    invalid_out = result["out_date"].notna() & (result["out_date"] < result["in_date"])
+    if invalid_out.any():
+        raise ValueError("AmazingData index history has out_date before in_date")
+    return result.sort_values(raw_keys).reset_index(drop=True)
+
+
+def fetch_history_stock_status(symbols: list[str]) -> pd.DataFrame:
+    """Return normalized PIT price-limit and security-status rows for selected symbols."""
+    if not symbols:
+        raise ValueError("symbols must not be empty")
+    if not _ensure_login():
+        raise RuntimeError(f"AmazingData 不可用：{_last_error or '未安装 SDK 或账号未配置'}")
+    broker_codes = [_to_broker_code(code) if "." not in str(code) else str(code) for code in symbols]
+    info = _ad.InfoData()
+    with tempfile.TemporaryDirectory(prefix="ad-status-") as cache:
+        raw = _sdk_frame(sdk_call(
+            info.get_history_stock_status,
+            broker_codes,
+            local_path=cache,
+            is_local=False,
+            timeout=max(_BROKER_TIMEOUT, 180.0),
+        ))
+    required = {
+        "MARKET_CODE", "TRADE_DATE", "PRECLOSE", "HIGH_LIMITED", "LOW_LIMITED",
+        "PRICE_HIGH_LMT_RATE", "PRICE_LOW_LMT_RATE", "IS_ST_SEC", "IS_SUSP_SEC",
+        "IS_WD_SEC", "IS_XR_SEC",
+    }
+    if raw.empty or not required.issubset(raw.columns):
+        raise ValueError(f"AmazingData stock status missing columns: {sorted(required - set(raw.columns))}")
+
+    def flag(column: str) -> pd.Series:
+        values = pd.to_numeric(raw[column], errors="coerce").astype("Int8")
+        if values.isna().any() or not values.isin([0, 1]).all():
+            raise ValueError(f"AmazingData stock status has invalid {column} values")
+        return values.astype(bool)
+
+    result = pd.DataFrame({
+        "code": raw["MARKET_CODE"].astype(str).str.split(".").str[0].str.zfill(6),
+        "market_code": raw["MARKET_CODE"].astype("string").str.strip(),
+        "date": _yyyymmdd(raw["TRADE_DATE"]),
+        "preclose": pd.to_numeric(raw["PRECLOSE"], errors="coerce"),
+        "high_limit": pd.to_numeric(raw["HIGH_LIMITED"], errors="coerce"),
+        "low_limit": pd.to_numeric(raw["LOW_LIMITED"], errors="coerce"),
+        "high_limit_rate": pd.to_numeric(raw["PRICE_HIGH_LMT_RATE"], errors="coerce"),
+        "low_limit_rate": pd.to_numeric(raw["PRICE_LOW_LMT_RATE"], errors="coerce"),
+        "is_st": flag("IS_ST_SEC"),
+        "is_suspended": flag("IS_SUSP_SEC"),
+        "is_withdrawal": flag("IS_WD_SEC"),
+        "is_ex_right": flag("IS_XR_SEC"),
+    })
+    required_values = ["code", "market_code", "date", "preclose", "high_limit_rate", "low_limit_rate"]
+    if result.empty or result[required_values].isna().any().any():
+        raise ValueError("AmazingData stock status has missing required values")
+    if not result["code"].str.fullmatch(r"\d{6}").all() or result.duplicated(["code", "date"]).any():
+        raise ValueError("AmazingData stock status has duplicate or invalid keys")
+    one_limit_missing = result["high_limit"].isna() ^ result["low_limit"].isna()
+    invalid_limits = (
+        result["high_limit"].notna()
+        & (result["high_limit"] < result["low_limit"])
+    )
+    invalid_rates = (result[["high_limit_rate", "low_limit_rate"]] < 0).any(axis=1)
+    if one_limit_missing.any() or invalid_limits.any() or invalid_rates.any():
+        raise ValueError("AmazingData stock status has invalid price-limit values")
+    return result.sort_values(["code", "date"]).reset_index(drop=True)
+
+
 def raw_kline(symbol: str, start_date: str, end_date: str):
     """返回券商原始 K线 DataFrame（用于首次联调时查看真实列名）。"""
     if not _ensure_login():
@@ -231,27 +410,55 @@ def raw_kline(symbol: str, start_date: str, end_date: str):
 def _normalize_kline(df: pd.DataFrame | None) -> pd.DataFrame | None:
     if df is None or len(df) == 0:
         return None
-    out = df.reset_index() if df.index.name else df.copy()
-    out = out.rename(columns={
-        c: _KL_COLMAP.get(str(c).lower(), _KL_COLMAP.get(str(c), c))
-        for c in out.columns
+    has_datetime_index = isinstance(df.index, pd.DatetimeIndex)
+    if df.index.name or has_datetime_index:
+        index_name = df.index.name or "date"
+        if index_name in df.columns:
+            raise ValueError(f"K-line index conflicts with column: {index_name}")
+        out = df.rename_axis(index_name).reset_index()
+    else:
+        out = df.copy()
+    normalized_columns = [
+        _KL_COLMAP.get(str(column).lower(), _KL_COLMAP.get(str(column), column))
+        for column in out.columns
+    ]
+    duplicates = sorted({
+        str(column) for column in normalized_columns
+        if normalized_columns.count(column) > 1
     })
+    if duplicates:
+        raise ValueError(f"duplicate normalized K-line columns: {duplicates}")
+    out.columns = normalized_columns
     need = {"open", "high", "low", "close"}
     if not need.issubset(set(out.columns)):
         raise ValueError(f"K线列不匹配，实际列：{list(out.columns)}（请用 raw_kline 联调）")
     if "date" not in out.columns:
-        out["date"] = pd.RangeIndex(len(out))
-    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        raise ValueError("K-line date column unavailable")
+    raw_dates = out["date"]
+    compact = raw_dates.astype("string").str.fullmatch(r"\d{8}(?:\.0)?")
+    dates = pd.to_datetime(
+        raw_dates.astype("string").str.replace(r"\.0$", "", regex=True).where(compact),
+        format="%Y%m%d",
+        errors="coerce",
+    )
+    dates = dates.fillna(pd.to_datetime(raw_dates.where(~compact), errors="coerce"))
+    if dates.isna().any():
+        raise ValueError("K-line date column contains invalid values")
+    out["date"] = dates.astype("datetime64[ns]")
+    if out["date"].duplicated().any():
+        raise ValueError("K-line date column contains duplicate timestamps")
     return out.sort_values("date").reset_index(drop=True)
 
 
 def fetch_daily_batch(symbols: list[str], start_date: str, end_date: str,
                       adjust: str = "qfq", progress_offset: int = 0,
-                      progress_total: int | None = None) -> dict[str, pd.DataFrame]:
+                      progress_total: int | None = None,
+                      require_adjustment_factor: bool = False) -> dict[str, pd.DataFrame]:
     """Fetch daily bars in bounded SDK requests and merge results by symbol.
 
     与 fetch_daily 口径一致：原始价按 ``adjust`` 用后复权因子换算（默认前复权）。
-    因子逐票拉取并进程内缓存；某票取不到因子时该票回退不复权（不影响其它票）。
+    默认兼容旧行为，某票取不到因子时回退不复权；研究审计可显式启用
+    ``require_adjustment_factor``，因子缺失或不能覆盖价格日期时直接失败。
     """
     if not _ensure_login():
         raise RuntimeError(f"AmazingData 不可用：{_last_error or '未安装 SDK 或账号未配置'}")
@@ -292,14 +499,21 @@ def fetch_daily_batch(symbols: list[str], start_date: str, end_date: str,
         for code, broker_code in chunk:
             frame = _normalize_kline(raw.get(broker_code))
             factor = _factor_series(factor_frame, broker_code) if adjust else None
-            frame = _apply_adjust(frame, factor, adjust)
+            frame = _apply_adjust(
+                frame,
+                factor,
+                adjust,
+                require_adjustment_factor=require_adjustment_factor,
+                symbol=broker_code,
+            )
             if frame is not None and not frame.empty:
                 result[code] = frame
     return result
 
 
 def _apply_adjust(frame: pd.DataFrame | None, factor: "pd.Series | None",
-                  adjust: str) -> pd.DataFrame | None:
+                  adjust: str, require_adjustment_factor: bool = False,
+                  symbol: str = "") -> pd.DataFrame | None:
     """把原始 K 线按复权方式换算（qfq 前复权 / hfq 后复权 / 空=不复权）。
 
     券商 query_kline 只返回原始价（手册确认无复权参数），复权走独立的
@@ -308,25 +522,38 @@ def _apply_adjust(frame: pd.DataFrame | None, factor: "pd.Series | None",
       - 前复权 qfq：raw * factor / factor[最新交易日]
         （归一化到最新日 → 最新价保持真实，历史被连续缩放，符合前复权语义）
     因子只作用于价格列（open/high/low/close），成交量/额不动。
-    factor 为空时回退原始价（宁可不复权也不返回错价）。
+    默认兼容旧行为，factor 为空时回退原始价；严格模式拒绝缺失、非正、
+    非有限或不能覆盖 K 线起始日期的因子，防止研究数据混入未复权价格。
     """
     if frame is None or frame.empty or not adjust:
         return frame
+    identity = f" for {symbol}" if symbol else ""
     if factor is None or factor.empty:
+        if require_adjustment_factor:
+            raise RuntimeError(f"adjustment factor unavailable{identity}")
         return frame
+    factor = pd.to_numeric(factor, errors="coerce").sort_index()
     out = frame.copy()
     dates = pd.to_datetime(out["date"])
     # 因子按交易日 ffill 对齐到 K 线日期（停牌日无因子则沿用前值）
     aligned = factor.reindex(factor.index.union(dates.values)).ffill().reindex(dates.values)
-    aligned = aligned.to_numpy()
-    if pd.isna(aligned).all():
+    valid_aligned = aligned.notna() & aligned.gt(0) & aligned.lt(float("inf"))
+    if require_adjustment_factor and not bool(valid_aligned.all()):
+        missing = int((~valid_aligned).sum())
+        raise RuntimeError(
+            f"adjustment factor does not cover {missing}/{len(aligned)} price dates{identity}"
+        )
+    aligned_values = aligned.to_numpy()
+    if pd.isna(aligned_values).all():
         return frame
     if adjust == "qfq":
         # 归一化基准：因子表内最新交易日（而非本窗口末尾），保证不同起止窗口口径一致
         base = float(factor.dropna().iloc[-1])
-        scale = aligned / base
+        if require_adjustment_factor and not (0 < base < float("inf")):
+            raise RuntimeError(f"invalid qfq adjustment base{identity}: {base!r}")
+        scale = aligned_values / base
     else:  # hfq
-        scale = aligned
+        scale = aligned_values
     for col in ("open", "high", "low", "close"):
         if col in out.columns:
             out[col] = out[col].to_numpy() * scale
@@ -378,13 +605,21 @@ def _backward_factor(broker_code: str) -> "pd.Series | None":
 
 
 def fetch_daily(symbol: str, start_date: str, end_date: str,
-                adjust: str = "qfq") -> pd.DataFrame | None:
+                adjust: str = "qfq",
+                require_adjustment_factor: bool = False) -> pd.DataFrame | None:
     """拉取日线并标准化为项目通用列（date/open/high/low/close/volume/...）。
 
     券商 query_kline 返回原始价；这里按 ``adjust`` 用后复权因子换算：
     qfq=前复权（默认，与免费源口径一致）/ hfq=后复权 / ""=不复权。
-    列名做了容错映射，首次联调后如有出入可据 raw_kline() 结果微调。
+    ``require_adjustment_factor`` 默认关闭；开启后拒绝静默回退原始价。
     """
     frame = _normalize_kline(raw_kline(symbol, start_date, end_date))
-    factor = _backward_factor(_to_broker_code(symbol)) if adjust else None
-    return _apply_adjust(frame, factor, adjust)
+    broker_code = _to_broker_code(symbol)
+    factor = _backward_factor(broker_code) if adjust else None
+    return _apply_adjust(
+        frame,
+        factor,
+        adjust,
+        require_adjustment_factor=require_adjustment_factor,
+        symbol=broker_code,
+    )
