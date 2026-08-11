@@ -369,7 +369,7 @@
 - **问题**：现有严格三腿工具的训练超参不是在位冠军配置，且仓库没有运行产物，因此不能回答“日更是否真的优于严格候选”。
 - **动作**：从 active manifest 固化 champion params，统一日期窗口、TopN、20bp、no-refill、可交易 join；输出 baseline、open Ridge/LGBM/ExtraTrees/RandomForest 的绝对与相对收益、CI、成交率和输入 hash。
 - **验收**：同一配置、同一宇宙、同一 holdout、同一成本下才允许比较；缺任一 source hash 或结果报告则标记不可用。
-- **状态**：待数据/待执行。
+- **状态**：待数据/待执行。2026-08-11 远端只读对账进一步确认当前 active manifest 本身口径混杂：short 样式同时出现 h1 源预测、h3 输出前缀和 h3 evaluation；swing 标记 h10，却复用 short h1 预测以及 h3 summary/returns/holdings。candidate promotion report 的 incumbent 参数只与 `champion_score_params` 对齐，不与用户可见 `score_params` 对齐；20 个候选通过数为 `0`，最佳候选平均 Sharpe 增益约 `0.2606`，显著改善 horizon 为 `0`。因此现有报告不能回答同配置候选是否优于在位 baseline，继续禁止晋级。
 
 ### C33 修正用户可见 horizon、融合权重和统计指标
 
