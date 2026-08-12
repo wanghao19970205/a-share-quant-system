@@ -189,15 +189,39 @@ def _window_month_signature(prepared_dir: Path, start: pd.Timestamp, end: pd.Tim
     return sig
 
 
-def _price_source_signature() -> str:
+def _price_source_signature(
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+) -> str:
+    """Hash price files that can contribute rows to the requested window.
+
+    Without bounds this preserves the legacy whole-directory identity. With bounds,
+    only files whose observed dates intersect ``[start, end)`` are included, so a
+    daily rewrite of the latest price file does not invalidate historical windows.
+    Read failures are included conservatively to avoid unsafe cache reuse.
+    """
     price_dir = Path(config.QUANT_DIR) / "price"
     payload = []
+    bounded = start is not None and end is not None
+    start_ts = pd.Timestamp(start) if bounded else None
+    end_ts = pd.Timestamp(end) if bounded else None
     if price_dir.is_dir():
         for path in sorted(price_dir.iterdir()):
             if path.suffix != ".parquet":
                 continue
             stat = path.stat()
-            payload.append((path.name, int(stat.st_size), int(stat.st_mtime_ns)))
+            entry = [path.name, int(stat.st_size), int(stat.st_mtime_ns)]
+            if bounded:
+                try:
+                    dates = pd.to_datetime(
+                        pd.read_parquet(path, columns=["date"])["date"],
+                        errors="coerce",
+                    ).dropna()
+                    if dates.empty or not ((dates >= start_ts) & (dates < end_ts)).any():
+                        continue
+                except Exception:  # noqa: BLE001
+                    entry.append("unreadable")
+            payload.append(entry)
     return hashlib.sha1(json.dumps(payload, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -425,12 +449,13 @@ def _label_recipe_params(
     enforce_c30_gates: bool = False,
     min_adv20: float | None = None,
     min_listing_sessions: int | None = None,
+    price_source_signature: str | None = None,
 ) -> dict:
     if train_target_mode == "baseline" and not enforce_c30_gates:
         return {}
     params = {
         "train_target_mode": train_target_mode,
-        "price_source_signature": _price_source_signature(),
+        "price_source_signature": price_source_signature or _price_source_signature(),
     }
     if train_target_mode != "baseline":
         params["sell_roll_max_days"] = backtest.bt_sell_roll_max_days()
@@ -532,6 +557,12 @@ class DailyICCache:
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._frames: dict[tuple[str, int, str, tuple[str, ...]], pd.DataFrame] = {}
+
+    def set_recipe_signature(self, recipe_signature: str) -> None:
+        recipe_signature = str(recipe_signature)
+        if recipe_signature != self.recipe_signature:
+            self.recipe_signature = recipe_signature
+            self._frames.clear()
 
     def _path(self, key: tuple[str, int, str, tuple[str, ...]]) -> Path | None:
         recipe_signature, horizon, target, factors = key
@@ -1344,16 +1375,22 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             continue
         pit_manifest = None
         effective_codes = universe_codes
+        window_price_signature = _price_source_signature(train_start, test_end)
         window_recipe_sig = recipe_sig
+        if recipe_params is not None:
+            window_recipe_params = dict(recipe_params)
+            window_recipe_params["price_source_signature"] = window_price_signature
+            window_recipe_sig = _recipe_signature(**window_recipe_params)
+            daily_ic_cache.set_recipe_signature(
+                _canonical_sha256(window_recipe_params)
+            )
         if pit_index_code:
             pit_manifest, effective_codes = _resolve_effective_window_universe(
                 pit_index_code, train_start, universe_codes,
             )
             if recipe_params is not None:
-                window_recipe_sig = _recipe_signature(
-                    **recipe_params,
-                    pit_universe_manifest_hash=pit_manifest["manifest_hash"],
-                )
+                window_recipe_params["pit_universe_manifest_hash"] = pit_manifest["manifest_hash"]
+                window_recipe_sig = _recipe_signature(**window_recipe_params)
             pit_manifest_rows.append({
                 "window": int(windows),
                 "train_start": pd.Timestamp(train_start),

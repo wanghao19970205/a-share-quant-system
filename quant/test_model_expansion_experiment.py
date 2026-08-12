@@ -2968,6 +2968,49 @@ class FutureLabelFeatureSafetyTest(unittest.TestCase):
         self.assertNotEqual(first_window_key, second_window_key)
         self.assertNotIn("trading_status_source_signature", legacy)
 
+    def test_price_source_signature_is_stable_outside_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            price = root / "price"
+            price.mkdir()
+            pd.DataFrame({"date": pd.to_datetime(["2025-01-02"]), "close": [10.0]}).to_parquet(
+                price / "inside.parquet", index=False
+            )
+            pd.DataFrame({"date": pd.to_datetime(["2026-01-02"]), "close": [20.0]}).to_parquet(
+                price / "outside.parquet", index=False
+            )
+            with mock.patch.object(full_train_batched.config, "QUANT_DIR", root):
+                first = full_train_batched._price_source_signature(
+                    pd.Timestamp("2025-01-01"), pd.Timestamp("2025-02-01")
+                )
+                outside = price / "outside.parquet"
+                stat = outside.stat()
+                os.utime(outside, (stat.st_atime, stat.st_mtime + 10))
+                second = full_train_batched._price_source_signature(
+                    pd.Timestamp("2025-01-01"), pd.Timestamp("2025-02-01")
+                )
+        self.assertEqual(first, second)
+
+    def test_price_source_signature_changes_inside_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            price = root / "price"
+            price.mkdir()
+            path = price / "inside.parquet"
+            pd.DataFrame({"date": pd.to_datetime(["2025-01-02"]), "close": [10.0]}).to_parquet(
+                path, index=False
+            )
+            with mock.patch.object(full_train_batched.config, "QUANT_DIR", root):
+                first = full_train_batched._price_source_signature(
+                    pd.Timestamp("2025-01-01"), pd.Timestamp("2025-02-01")
+                )
+                stat = path.stat()
+                os.utime(path, (stat.st_atime, stat.st_mtime + 10))
+                second = full_train_batched._price_source_signature(
+                    pd.Timestamp("2025-01-01"), pd.Timestamp("2025-02-01")
+                )
+        self.assertNotEqual(first, second)
+
     def test_strict_window_cache_never_uses_legacy_fallback(self):
         self.assertTrue(full_train_batched._legacy_window_cache_allowed(False, ""))
         self.assertFalse(full_train_batched._legacy_window_cache_allowed(True, ""))
