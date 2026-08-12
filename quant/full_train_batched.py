@@ -1814,6 +1814,9 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         max_weight=max_weight if max_weight is not None else 1.0 / max(int(top_n), 1),
         positive_only=positive_only,
         ridge_quantile=ridge_quantile,
+        filter_untradable=True,
+        no_refill=True,
+        require_tradability=True,
         hold_rank_buffer=max(int(hold_rank_buffer), 0),
     )
     periods_per_year = max(1, int(round(252 / max(horizon, stride))))

@@ -24,12 +24,16 @@ import numpy as np
 import pandas as pd
 
 from quant import config
+from intraday_1400.evaluation import _paired_block_bootstrap
 from intraday_1400.storage import artifact_hash, atomic_json
 
-PROTOCOL = "daily_optimization_pipeline_v1"
+PROTOCOL = "daily_optimization_pipeline_v2"
 TOP_N = 2
 COST = 0.002
 MIN_FILLED = 1.0
+BOOTSTRAP_SAMPLES = 2000
+BOOTSTRAP_BLOCK_LENGTH = 5
+BOOTSTRAP_SEED = 42
 
 BRANCHES = {
     "open_buyin_ridge": {
@@ -83,7 +87,12 @@ def protocol_payload() -> dict[str, Any]:
         "minimum_filled_names": MIN_FILLED,
         "branches": BRANCHES,
         "selection": {
-            "mean_return_gt_zero": True,
+            "paired_baseline_required": True,
+            "paired_ci95_lower_gt_zero": True,
+            "bootstrap_method": "circular_moving_block",
+            "bootstrap_samples": BOOTSTRAP_SAMPLES,
+            "bootstrap_block_length": BOOTSTRAP_BLOCK_LENGTH,
+            "bootstrap_seed": BOOTSTRAP_SEED,
             "minimum_filled_names": MIN_FILLED,
             "max_drawdown_floor": -0.60,
             "minimum_positive_months": 3,
@@ -201,7 +210,11 @@ def validate_attempt_manifest(
         prediction_path = Path(metrics["prediction_path"])
         if not prediction_path.is_file() or artifact_hash(prediction_path) != metrics.get("prediction_sha256"):
             raise RuntimeError("daily optimization prediction artifact changed")
-        if manifest.get("decision") != choose_next_branch(str(manifest["branch"]), {"metrics": metrics}):
+        if manifest.get("decision") != choose_next_branch(
+            str(manifest["branch"]),
+            {"metrics": metrics},
+            manifest.get("baseline_metrics"),
+        ):
             raise RuntimeError("daily optimization decision does not match persisted metrics")
 
 
@@ -273,13 +286,52 @@ def _metrics(prediction_path: Path) -> dict[str, Any]:
         "fill_rate": float(selected["filled"].mean()),
         "positive_months": int((monthly > 0).sum()),
         "months": int(len(monthly)),
+        "daily_returns": [
+            {"date": str(pd.Timestamp(date).date()), "return": float(value)}
+            for date, value in daily.items()
+        ],
     }
 
 
-def choose_next_branch(current: str, result: dict[str, Any]) -> dict[str, Any]:
+def _daily_return_series(metrics: dict[str, Any]) -> pd.Series:
+    rows = metrics.get("daily_returns")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("metrics missing daily returns for paired baseline comparison")
+    frame = pd.DataFrame(rows)
+    if set(frame.columns) != {"date", "return"}:
+        raise ValueError("daily returns must contain only date and return")
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame["return"] = pd.to_numeric(frame["return"], errors="coerce")
+    if (
+        frame["date"].isna().any()
+        or frame["date"].duplicated().any()
+        or not np.isfinite(frame["return"].to_numpy(dtype=float)).all()
+    ):
+        raise ValueError("daily returns contain invalid or duplicate observations")
+    return frame.set_index("date")["return"].sort_index()
+
+
+def choose_next_branch(
+    current: str,
+    result: dict[str, Any],
+    baseline_metrics: dict[str, Any] | None,
+) -> dict[str, Any]:
     metrics = result.get("metrics", result)
+    if baseline_metrics is None:
+        raise ValueError("paired incumbent baseline metrics are required")
+    comparison = _paired_block_bootstrap(
+        _daily_return_series(metrics),
+        _daily_return_series(baseline_metrics),
+        samples=BOOTSTRAP_SAMPLES,
+        block_length=BOOTSTRAP_BLOCK_LENGTH,
+        seed=BOOTSTRAP_SEED,
+    )
+    ci95 = comparison.get("ci95")
     passed = (
-        float(metrics.get("mean_return", float("nan"))) > 0.0
+        bool(comparison.get("available"))
+        and isinstance(ci95, list)
+        and len(ci95) == 2
+        and float(ci95[0]) > 0.0
         and float(metrics.get("mean_filled_names", 0.0)) >= MIN_FILLED
         and float(metrics.get("max_drawdown", -1.0)) >= -0.60
         and int(metrics.get("positive_months", 0)) >= 3
@@ -289,7 +341,8 @@ def choose_next_branch(current: str, result: dict[str, Any]) -> dict[str, Any]:
             "status": "candidate_requires_independent_reproduction",
             "selected": current,
             "next_branch": "independent_reproduction",
-            "reason": "daily candidate passed development gates",
+            "reason": "candidate passed paired incumbent and development gates",
+            "paired_incumbent_comparison": comparison,
         }
     index = BRANCH_ORDER.index(current)
     if index + 1 < len(BRANCH_ORDER):
@@ -297,13 +350,15 @@ def choose_next_branch(current: str, result: dict[str, Any]) -> dict[str, Any]:
             "status": "branch_failed",
             "selected": "daily_baseline_retained",
             "next_branch": BRANCH_ORDER[index + 1],
-            "reason": "candidate failed development gates",
+            "reason": "candidate failed paired incumbent or development gates",
+            "paired_incumbent_comparison": comparison,
         }
     return {
         "status": "all_registered_daily_branches_failed",
         "selected": "daily_baseline_retained",
         "next_branch": "human_review_required",
         "reason": "registered pure-daily branch order exhausted",
+        "paired_incumbent_comparison": comparison,
     }
 
 
@@ -445,6 +500,7 @@ def run_once(
     execute: bool = True,
     timeout_seconds: int = 8 * 60 * 60,
     max_retries: int = 1,
+    baseline_prediction_path: Path | None = None,
 ) -> dict[str, Any]:
     if branch not in BRANCHES:
         raise ValueError(f"unregistered daily branch: {branch}")
@@ -475,6 +531,11 @@ def run_once(
         "output_dir": str(output_dir),
         "cache_dir": str(cache_dir),
         "prediction_path": str(prediction_path.resolve()),
+        "baseline_prediction": (
+            _file_identity(Path(baseline_prediction_path))
+            if baseline_prediction_path is not None
+            else None
+        ),
         "command": command,
         "command_hash": _canonical_hash(command),
         "controller_sha256": artifact_hash(Path(__file__)),
@@ -583,8 +644,20 @@ def run_once(
         return _persist_attempt(result, manifest_path)
 
     try:
+        if baseline_prediction_path is None:
+            raise ValueError("paired incumbent baseline prediction artifact is required")
+        baseline_path = Path(baseline_prediction_path).resolve()
+        if not baseline_path.is_file():
+            raise ValueError(
+                f"incumbent baseline prediction artifact unavailable: {baseline_path}"
+            )
+        if _file_identity(baseline_path) != result["baseline_prediction"]:
+            raise RuntimeError("incumbent baseline prediction artifact changed")
         result["metrics"] = _metrics(prediction_path)
-        result["decision"] = choose_next_branch(branch, result)
+        result["baseline_metrics"] = _metrics(baseline_path)
+        result["decision"] = choose_next_branch(
+            branch, result, result["baseline_metrics"],
+        )
         result["status"] = "evaluated"
     except Exception as error:  # Persist malformed artifacts instead of losing the attempt.
         result["status"] = "artifact_validation_failed"
@@ -652,6 +725,7 @@ def run_pipeline(
     execute: bool = True,
     timeout_seconds: int = 8 * 60 * 60,
     max_retries: int = 1,
+    baseline_prediction_path: Path | None = None,
 ) -> dict[str, Any]:
     if initial_branch not in BRANCHES:
         raise ValueError(f"unregistered daily branch: {initial_branch}")
@@ -715,6 +789,7 @@ def run_pipeline(
                 execute=execute,
                 timeout_seconds=timeout_seconds,
                 max_retries=max_retries,
+                baseline_prediction_path=baseline_prediction_path,
             )
             attempt_path = Path(result["output_dir"]) / "attempt.json"
             pipeline_state["attempts"].append({
@@ -753,6 +828,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Automatic pure-daily optimization pipeline")
     parser.add_argument("--branch", choices=BRANCH_ORDER, default=BRANCH_ORDER[0])
     parser.add_argument("--research-root", type=Path, required=True)
+    parser.add_argument(
+        "--baseline-predictions", type=Path, required=True,
+        help="frozen incumbent prediction artifact for paired common-date comparison",
+    )
     parser.add_argument("--recent-windows", type=int, default=12)
     parser.add_argument("--timeout-seconds", type=int, default=8 * 60 * 60)
     parser.add_argument("--max-retries", type=int, default=1)
@@ -765,6 +844,7 @@ def main() -> None:
         execute=not args.dry_run,
         timeout_seconds=args.timeout_seconds,
         max_retries=args.max_retries,
+        baseline_prediction_path=args.baseline_predictions,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     if result.get("status") == "pipeline_blocked":

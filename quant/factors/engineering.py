@@ -191,9 +191,10 @@ def _price_factors(
         df, observed_dates = _align_price_factor_sessions(df)
 
     close = df["close"]
-    df["ret_1d"] = close.pct_change()
+    pct_change_kwargs = {"fill_method": None} if strict_calendar_factors else {}
+    df["ret_1d"] = close.pct_change(**pct_change_kwargs)
     for n in (3, 5, 10, 20, 60):
-        df[f"ret_{n}d"] = close.pct_change(n)
+        df[f"ret_{n}d"] = close.pct_change(n, **pct_change_kwargs)
         df[f"ma_gap_{n}"] = close / close.rolling(n).mean() - 1
     for n in (5, 10, 20):
         df[f"volatility_{n}"] = df["ret_1d"].rolling(n).std()
@@ -214,9 +215,13 @@ def _price_factors(
     if "high" in df.columns and "low" in df.columns:
         df["intraday_range"] = (df["high"] - df["low"]) / close.replace(0, np.nan)
     if "turnover" in df.columns:
-        df["turnover_chg_5"] = df["turnover"].pct_change(5)
+        df["turnover_chg_5"] = df["turnover"].pct_change(
+            5, **pct_change_kwargs
+        )
     if "amount" in df.columns:
-        df["amount_chg_5"] = df["amount"].pct_change(5)
+        df["amount_chg_5"] = df["amount"].pct_change(
+            5, **pct_change_kwargs
+        )
     # 隔夜跳空因子（factor family C，2026-07 并入）：close[D-1]->open[D] 的隔夜跳空，
     # 在 close[D] 收盘前决策时已实现（生产口径=当日收盘前买入、T+1 卖出），PIT 安全、无前视。
     # 仅并入去前视诊断确认携带信号的 3 个"干净"因子（不含 close[D]，与 target 无共享价格）；
@@ -424,6 +429,27 @@ def _filter_codes_by_price_rows(codes: list[str], min_price_rows: int = 0) -> li
         except Exception:  # noqa: BLE001
             continue
     return kept
+
+
+def _price_row_eligibility_dates(
+    codes: list[str], min_price_rows: int,
+) -> dict[str, pd.Timestamp]:
+    if min_price_rows <= 0:
+        return {str(code): pd.Timestamp.min for code in codes}
+    eligible: dict[str, pd.Timestamp] = {}
+    for code in codes:
+        path = os.path.join(config.PRICE_DIR, f"{code}.parquet")
+        if not os.path.exists(path):
+            continue
+        try:
+            dates = pd.to_datetime(
+                pd.read_parquet(path, columns=["date"])["date"], errors="coerce",
+            ).dropna().drop_duplicates().sort_values()
+        except Exception:  # noqa: BLE001
+            continue
+        if len(dates) >= int(min_price_rows):
+            eligible[str(code)] = pd.Timestamp(dates.iloc[int(min_price_rows) - 1])
+    return eligible
 
 
 def _factor_subset(factor: pd.DataFrame, codes: set[str]) -> pd.DataFrame:

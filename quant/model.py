@@ -1025,6 +1025,8 @@ def train_all(panel: pd.DataFrame, horizon: int = 5, models: list[str] | None = 
         }
         if m == "ridge":
             kwargs["alpha"] = ridge_alpha
+            kwargs["valid_end"] = valid_end
+            kwargs["predict_start"] = predict_start
         elif m in {"lightgbm", "xgboost", "lightgbm_ranker", "xgboost_ranker"}:
             kwargs["valid_end"] = valid_end
             kwargs["predict_start"] = predict_start

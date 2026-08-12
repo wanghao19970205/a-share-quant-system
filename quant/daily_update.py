@@ -582,17 +582,46 @@ def refresh_pit_reference_data(index_codes: list[str] | None = None) -> dict:
     }
 
 
-def refresh_trading_status_reference(codes: list[str]) -> dict:
+def refresh_trading_status_reference(
+    codes: list[str],
+    batch_size: int = 0,
+) -> dict:
     """Refresh selected PIT status histories without activating trading filters."""
-    normalized = sorted({str(code).strip()[:6] for code in codes if re.fullmatch(r"\d{6}(?:\.[A-Z]{2})?", str(code).strip())})
-    if not normalized:
-        raise ValueError("codes must contain at least one six-digit security")
+    normalized = sorted({
+        datafeed._norm(code) for code in codes if datafeed._norm(code).isdigit()
+    })
     if not datafeed.broker_available():
         return {
             "status": "broker-unavailable",
             "path": config.TRADING_STATUS_HISTORY_FILE,
             "requested_codes": len(normalized),
         }
+    effective_batch_size = int(batch_size)
+    if effective_batch_size < 0:
+        raise ValueError("batch_size must be non-negative")
+    if effective_batch_size:
+        batches = [
+            normalized[offset:offset + effective_batch_size]
+            for offset in range(0, len(normalized), effective_batch_size)
+        ]
+        frames = [datafeed.broker_history_stock_status(batch) for batch in batches]
+        history = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    else:
+        batches = [normalized]
+        history = datafeed.broker_history_stock_status(normalized)
+    warehouse.save("trading_status_history", history)
+    return {
+        "status": "refreshed",
+        "path": config.TRADING_STATUS_HISTORY_FILE,
+        "rows": int(len(history)),
+        "codes": int(history["code"].nunique()),
+        "batches": int(len(batches)),
+        "batch_size": effective_batch_size,
+        "st_rows": int(history["is_st"].fillna(False).astype(bool).sum()),
+        "suspended_rows": int(history["is_suspended"].fillna(False).astype(bool).sum()),
+        "withdrawal_rows": int(history["is_withdrawal"].fillna(False).astype(bool).sum()),
+    }
+
     history = datafeed.broker_history_stock_status(normalized)
     warehouse.save("trading_status_history", history)
     return {
@@ -645,7 +674,9 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
     u = config.UNIVERSES[universe]
     if codes_file:
         with open(codes_file, encoding="utf-8") as fh:
-            codes = sorted({line.strip() for line in fh if re.fullmatch(r"\\d{6}", line.strip())})
+            codes = sorted({line.strip() for line in fh if re.fullmatch(r"\d{6}", line.strip())})
+        if not codes:
+            raise ValueError(f"codes file contains no valid six-digit codes: {codes_file}")
     else:
         if u["kind"] == "mainboard_active":
             _refresh_mainboard_universe_isolated()

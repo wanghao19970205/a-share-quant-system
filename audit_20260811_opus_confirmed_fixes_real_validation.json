@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "validation": "opus_confirmed_fixes_real_data",
+  "validated_at": "2026-08-11",
+  "isolation": {
+    "source_root": "/www/A/research_runs/audit_20260810_v1/source",
+    "container_source_root": "/audit_source",
+    "production_price_mount": "/www/A/quant_data/full_a_2018_wide/price",
+    "authoritative_calendar_source": "/www/A/research_runs/audit_20260810_v1/quant_data_c27/trading_calendar.parquet",
+    "data_mount_read_only": true,
+    "production_publication": false
+  },
+  "verification": {
+    "local_unittest": {
+      "passed": 327,
+      "failed": 0
+    },
+    "remote_unittest": {
+      "image": "stock-scheduler:latest",
+      "passed": 327,
+      "failed": 0
+    },
+    "remote_in_memory_compile": {
+      "python_files": 125,
+      "failed": 0
+    },
+    "initial_app_image_collection_error": {
+      "image": "stock-app:latest",
+      "reason": "image lacks joblib and threadpoolctl; rerun succeeded in the production training image",
+      "code_failure": false
+    }
+  },
+  "real_codes": [
+    "000001",
+    "000002",
+    "000004",
+    "000006",
+    "000007"
+  ],
+  "pit_min_price_rows": {
+    "min_rows": 120,
+    "checks": [
+      {"code": "000001", "expected": "2018-07-02", "actual": "2018-07-02", "equal": true},
+      {"code": "000002", "expected": "2018-07-02", "actual": "2018-07-02", "equal": true},
+      {"code": "000004", "expected": "2018-07-02", "actual": "2018-07-02", "equal": true},
+      {"code": "000006", "expected": "2018-08-29", "actual": "2018-08-29", "equal": true},
+      {"code": "000007", "expected": "2018-09-13", "actual": "2018-09-13", "equal": true}
+    ]
+  },
+  "strict_calendar_factors": {
+    "code": "000001",
+    "rows": 2086,
+    "min_date": "2018-01-02",
+    "max_date": "2026-08-07",
+    "all_dates_in_authoritative_calendar": true,
+    "missing_session_pct_change_fill_disabled": true
+  },
+  "strict_tradability_adv": {
+    "codes": ["000001", "000002", "000004", "000006", "000007"],
+    "rows": 10247,
+    "positive_volume_rows": 10247,
+    "adv20_non_null": 9912,
+    "adv_guard_rejected_without_strict_calendar_labels": true
+  },
+  "authoritative_stride": {
+    "calendar_sessions": 40,
+    "prediction_sessions_after_middle_drop": 39,
+    "stride": 5,
+    "selected_dates": [
+      "2026-06-16",
+      "2026-06-24",
+      "2026-07-01",
+      "2026-07-08",
+      "2026-07-15",
+      "2026-07-22",
+      "2026-07-29",
+      "2026-08-05"
+    ],
+    "expected_dates_equal": true
+  },
+  "c09_paired_incumbent": {
+    "real_return_days": 60,
+    "bootstrap_method": "circular_moving_block",
+    "bootstrap_samples": 2000,
+    "block_length": 5,
+    "positive_gain": {
+      "daily_gain": 0.001,
+      "ci95": [0.0010000000000000005, 0.0010000000000000007],
+      "status": "candidate_requires_independent_reproduction"
+    },
+    "null_gain": {
+      "ci95": [0.0, 0.0],
+      "status": "branch_failed"
+    },
+    "production_publication": false
+  },
+  "health_gate": {
+    "sampling": "exchange-stratified SHA256 ordering",
+    "sample_size": 20,
+    "expected_date": "2026-08-11",
+    "current_stale_count": 20,
+    "current_status": "expected_paused_routine_jobs",
+    "intentional_stale_observation_rejected": true,
+    "note": "The optional fail-on-stale gate works. The snapshot is intentionally stale because routine jobs were paused for the audit; this is not a data-pipeline defect."
+  },
+  "quant_data_dir": {
+    "parent": "/quant_data",
+    "child": "/quant_data",
+    "equal": true
+  },
+  "source_files_sha256": {
+    "quant/backtest.py": "d126f340c5803366e41c3f86ff73167daf6e2f98d9dfd4673ea674476c72ffb1",
+    "quant/check_daily_update.py": "8d49ecdae57b8bab6eae479483479fe25fa9c6cfa5b749700d81a8a107bf0798",
+    "quant/config.py": "4f1d0834b361555b7ee6e6bb92c90b31bd9f4110a85535a13cee2dfb2b3158c3",
+    "quant/daily_optimization_pipeline.py": "d6448981b0a98d32c8c9aaf3f35d27c91a12944e8958a342f016b4192619b298",
+    "quant/daily_update.py": "3b94674083cf510f095f3ee1586031dac638c4dd0b1bafe98bda610bb194f55d",
+    "quant/factors/engineering.py": "9dc6d119fa69c1b4655c92294d6f9d80902dd44e6bf9de6659bf8c17f6a37ea1",
+    "quant/full_train_batched.py": "37d600532d0498a9ce21b9e2639d3c6108670b7a595b85fa9d638b702f6470ed",
+    "quant/scheduled_workflow.py": "73472b51ea6cec4da7943d1a3ff3ff71ec7374cadc71d165520883530fbab814",
+    "quant/tradability.py": "d9edcc7a995b7f160d0b453517fa071791696e453233c510c5ee180d7f17a982"
+  }
+}

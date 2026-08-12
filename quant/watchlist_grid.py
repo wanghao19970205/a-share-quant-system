@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from threadpoolctl import threadpool_limits
 
-from quant import backtest, config, tradability
+from quant import backtest, config, tradability, warehouse
 
 # 回测成交口径由 backtest 的环境变量开关决定（默认：当日收盘成交、无成本、不过滤涨停/停牌）。
 
@@ -53,6 +53,25 @@ def _empty_to_none(value):
     except TypeError:
         pass
     return value
+
+
+def _rebalance_stride(params: pd.Series | dict) -> int:
+    return max(int(_empty_to_none(params.get("rebalance_stride")) or 1), 1)
+
+
+def _hold_rank_buffer(params: pd.Series | dict) -> int:
+    return max(int(_empty_to_none(params.get("hold_rank_buffer")) or 0), 0)
+
+
+def _stride_calendar(stride: int) -> pd.DataFrame | None:
+    return warehouse.load("trading_calendar") if stride > 1 else None
+
+
+def _stride_predictions(pred: pd.DataFrame, params: pd.Series | dict) -> pd.DataFrame:
+    stride = _rebalance_stride(params)
+    return backtest._apply_rebalance_stride(
+        pred, stride, trading_calendar=_stride_calendar(stride),
+    )
 
 
 def _load_predictions(path: Path, watchlist: set[str]) -> pd.DataFrame:
@@ -109,12 +128,26 @@ def _base_combos(path: Path, kind: str) -> pd.DataFrame:
     if path.exists():
         loaded = pd.read_parquet(path)
         if kind == "short":
-            cols = ["ic_weight", "top_n", "gross_exposure", "slot_weight", "ridge_quantile", "pred_quantile", "naive_weight"]
+            cols = ["ic_weight", "top_n", "gross_exposure", "slot_weight", "ridge_quantile", "pred_quantile", "naive_weight", "rebalance_stride", "hold_rank_buffer"]
         else:
-            cols = ["ic_weight", "max_weight", "ridge_quantile", "pred_quantile", "naive_weight"]
+            cols = ["ic_weight", "max_weight", "ridge_quantile", "pred_quantile", "naive_weight", "rebalance_stride", "hold_rank_buffer"]
         cols = [c for c in cols if c in loaded.columns]
         if cols:
             template = loaded[cols].drop_duplicates().reset_index(drop=True)
+            if "rebalance_stride" not in template.columns:
+                template["rebalance_stride"] = 1
+            else:
+                template["rebalance_stride"] = (
+                    pd.to_numeric(template["rebalance_stride"], errors="coerce")
+                    .fillna(1).clip(lower=1).astype(int)
+                )
+            if "hold_rank_buffer" not in template.columns:
+                template["hold_rank_buffer"] = 0
+            else:
+                template["hold_rank_buffer"] = (
+                    pd.to_numeric(template["hold_rank_buffer"], errors="coerce")
+                    .fillna(0).clip(lower=0).astype(int)
+                )
     if kind == "short":
         rows = []
         for ic in (0.0, 0.03, 0.06, 0.10, 0.15):
@@ -129,8 +162,11 @@ def _base_combos(path: Path, kind: str) -> pd.DataFrame:
                                     "gross_exposure": gross,
                                     "slot_weight": gross / top_n,
                                     "ridge_quantile": rq,
-                                    "pred_quantile": pq,
-                                    "naive_weight": naive,
+                        "pred_quantile": pq,
+                        "rebalance_stride": 1,
+                        "hold_rank_buffer": 0,
+
+                                    "hold_rank_buffer": 0,
                                 })
         standard = pd.DataFrame(rows)
         if template.empty:
@@ -141,7 +177,11 @@ def _base_combos(path: Path, kind: str) -> pd.DataFrame:
         for mw in (0.07, 0.08, 0.09, 0.10):
             for rq in (0.30, 0.35, 0.40, 0.45):
                 for pq in (None, 0.55, 0.60):
-                    rows.append({"ic_weight": ic, "max_weight": mw, "ridge_quantile": rq, "pred_quantile": pq})
+                    rows.append({
+                        "ic_weight": ic, "max_weight": mw,
+                        "ridge_quantile": rq, "pred_quantile": pq,
+                        "rebalance_stride": 1,
+                    })
     standard = pd.DataFrame(rows)
     if template.empty:
         return standard
@@ -158,13 +198,15 @@ def _template_combos(path: Path, kind: str) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def _evaluate_returns(ret: pd.Series, horizon: int) -> dict:
+def _evaluate_returns(
+    ret: pd.Series, horizon: int, rebalance_stride: int = 1,
+) -> dict:
     ret = pd.to_numeric(ret, errors="coerce").dropna()
     if ret.empty:
         return {}
     ret = ret.clip(lower=-0.99)
     nav = (1 + ret).cumprod()
-    periods_per_year = 252 / max(int(horizon), 1)
+    periods_per_year = 252 / max(int(horizon), int(rebalance_stride), 1)
     annual = nav.iloc[-1] ** (periods_per_year / max(len(ret), 1)) - 1 if nav.iloc[-1] > 0 else np.nan
     vol = ret.std() * np.sqrt(periods_per_year)
     peak = nav.cummax()
@@ -254,9 +296,12 @@ def _prepare_fast_grid(pred: pd.DataFrame, horizons: list[int]) -> dict:
         buy_col = "buyable_next" if use_open else "buyable_close"
         if buy_col not in pred.columns and "buyable_next" in pred.columns:
             buy_col = "buyable_next"
-        if buy_col in pred.columns:
-            bm = _to_matrix(pred, dates, codes, buy_col)
-            buyable = np.nan_to_num(bm, nan=0.0) > 0.5
+        if buy_col not in pred.columns:
+            raise ValueError(
+                f"严格可交易网格缺少 {buy_col}；不能静默降级到乐观口径"
+            )
+        bm = _to_matrix(pred, dates, codes, buy_col)
+        buyable = np.nan_to_num(bm, nan=0.0) > 0.5
     ridge = _to_matrix(pred, dates, codes, "ridge_pred")
     lgbm = _to_matrix(pred, dates, codes, "lgbm_pred")
 
@@ -282,8 +327,24 @@ def _prepare_fast_grid(pred: pd.DataFrame, horizons: list[int]) -> dict:
         "rule_z": rule_z,
         "targets": target_mats,
         "buyable": buyable,
+        "stride_indices": {},
     }
 
+
+def _prepared_stride_indices(prepared: dict, stride: int) -> np.ndarray:
+    if stride <= 1:
+        return np.arange(np.asarray(prepared["ridge"]).shape[0])
+    cache = prepared.setdefault("stride_indices", {})
+    if stride not in cache:
+        dates = pd.DatetimeIndex(prepared["dates"])
+        selected = backtest._apply_rebalance_stride(
+            pd.DataFrame({"date": dates}),
+            stride,
+            trading_calendar=_stride_calendar(stride),
+        )
+        selected_dates = pd.DatetimeIndex(selected["date"])
+        cache[stride] = np.flatnonzero(dates.isin(selected_dates))
+    return cache[stride]
 
 
 def _apply_row_quantile(mask: np.ndarray, values: np.ndarray, q: float | None, min_count: int = 5) -> np.ndarray:
@@ -325,9 +386,18 @@ def _fast_combo_metrics(prepared: dict, row: pd.Series, kind: str, horizon: int,
         score = score + extra_trees_weight * prepared["extra_trees_z"]
     if naive_weight and prepared.get("rule_z") is not None:
         score = score + naive_weight * prepared["rule_z"]
+    stride = _rebalance_stride(row)
+    stride_indices = _prepared_stride_indices(prepared, stride)
+    score = score[stride_indices]
+    target = target[stride_indices]
     top_n = int(row.get("top_n", 3)) if kind == "short" else 3
     raw_max_weight = row.get("slot_weight", row.get("max_weight", 1.0 / max(top_n, 1))) if kind == "short" else row.get("max_weight", 1.0 / max(top_n, 1))
     max_weight = float(raw_max_weight) if _empty_to_none(raw_max_weight) is not None else 1.0 / max(top_n, 1)
+    gross_exposure = float(
+        _empty_to_none(row.get("gross_exposure"))
+        or min(max_weight * max(top_n, 1), 1.0)
+    )
+    no_refill = True
     pred_quantile = _empty_to_none(row.get("pred_quantile"))
     ridge_quantile = _empty_to_none(row.get("ridge_quantile"))
 
@@ -336,9 +406,10 @@ def _fast_combo_metrics(prepared: dict, row: pd.Series, kind: str, horizon: int,
         mask &= score > 0
     buyable = prepared.get("buyable")
     if buyable is not None:
+        buyable = buyable[stride_indices]
         mask &= buyable
     mask = _apply_row_quantile(mask, score, float(pred_quantile) if pred_quantile is not None else None)
-    ridge = prepared["ridge"]
+    ridge = prepared["ridge"][stride_indices]
     if ridge_quantile is not None and np.isfinite(ridge).any():
         ridge_mask = mask & np.isfinite(ridge)
         mask = _apply_row_quantile(ridge_mask, ridge, float(ridge_quantile))
@@ -346,43 +417,62 @@ def _fast_combo_metrics(prepared: dict, row: pd.Series, kind: str, horizon: int,
         return None
 
     n_pick = min(max(top_n, 1), score.shape[1])
-    ranked_score = np.where(mask, score, -np.inf)
-    order = np.argpartition(-ranked_score, kth=n_pick - 1, axis=1)[:, :n_pick]
-    top_score = np.take_along_axis(ranked_score, order, axis=1)
-    sort_idx = np.argsort(-top_score, axis=1)
-    order = np.take_along_axis(order, sort_idx, axis=1)
-    top_score = np.take_along_axis(top_score, sort_idx, axis=1)
-    picked = np.isfinite(top_score)
-    counts = picked.sum(axis=1)
+    hold_rank_buffer = _hold_rank_buffer(row)
+    pick_bool = np.zeros_like(mask, dtype=bool)
+    if hold_rank_buffer > 0:
+        previous_codes: set[str] = set()
+        codes = np.asarray(prepared["codes"]).astype(str)
+        for date_index in range(mask.shape[0]):
+            indices = backtest._select_with_rank_hysteresis(
+                codes,
+                score[date_index],
+                mask[date_index],
+                top_n,
+                hold_rank_buffer,
+                previous_codes,
+            )
+            actual = np.zeros(mask.shape[1], dtype=bool)
+            actual[indices] = True
+            if no_refill and buyable is not None:
+                actual &= buyable[date_index]
+            pick_bool[date_index] = actual
+            previous_codes = set(codes[actual])
+    else:
+        ranked_score = np.where(mask, score, -np.inf)
+        order = np.argpartition(-ranked_score, kth=n_pick - 1, axis=1)[:, :n_pick]
+        top_score = np.take_along_axis(ranked_score, order, axis=1)
+        sort_idx = np.argsort(-top_score, axis=1)
+        order = np.take_along_axis(order, sort_idx, axis=1)
+        top_score = np.take_along_axis(top_score, sort_idx, axis=1)
+        picked = np.isfinite(top_score)
+        if no_refill and buyable is not None:
+            picked &= np.take_along_axis(buyable, order, axis=1)
+        row_idx = np.arange(mask.shape[0])[:, None]
+        pick_bool[row_idx, order] = picked
+    counts = pick_bool.sum(axis=1)
+    weights = np.minimum(max_weight, gross_exposure / np.maximum(counts, 1))
+    if kind == "short":
+        weights = np.minimum(weights, 0.15)
     valid_rows = counts > 0
     if not valid_rows.any():
         return None
-
-    picked_target = np.take_along_axis(target, order, axis=1)
-    weights = np.zeros_like(counts, dtype=float)
-    weights[valid_rows] = np.minimum(1.0 / counts[valid_rows], max_weight)
-    ret = (np.where(picked, picked_target, 0.0).sum(axis=1) * weights)[valid_rows]
-    if ret.size == 0:
-        return None
-
-    pick_bool = np.zeros_like(mask, dtype=bool)
-    row_idx = np.arange(mask.shape[0])[:, None]
-    pick_bool[row_idx, order] = picked
-    active_picks = pick_bool[valid_rows]
-    turnover = np.ones(len(active_picks), dtype=float)
-    if len(active_picks) > 1:
-        prev = active_picks[:-1]
-        curr = active_picks[1:]
-        union = (prev | curr).sum(axis=1)
-        diff = (prev ^ curr).sum(axis=1)
-        turnover[1:] = np.divide(diff, np.maximum(union, 1), dtype=float)
+    stock_weights = pick_bool.astype(float) * weights[:, None]
+    active_weights = stock_weights[valid_rows]
+    picked_target = target[valid_rows]
+    picked = pick_bool[valid_rows]
+    ret = np.nansum(picked_target * active_weights, axis=1)
+    previous_weights = np.vstack([
+        np.zeros((1, active_weights.shape[1]), dtype=float),
+        active_weights[:-1],
+    ])
+    turnover = backtest._weight_turnover(previous_weights, active_weights)
 
     # 计提调仓成本（按换手比例）；QUANT_BT_COST_ROUNDTRIP=0 时忽略
     _cost = backtest.bt_cost_roundtrip()
     if _cost:
         ret = ret - turnover * _cost
 
-    metrics = _evaluate_returns(pd.Series(ret), horizon)
+    metrics = _evaluate_returns(pd.Series(ret), horizon, rebalance_stride=stride)
     if not metrics:
         return None
     all_targets = picked_target[picked]
@@ -411,6 +501,8 @@ def _run_combo(pred: pd.DataFrame, row: pd.Series, kind: str, horizon: int, posi
         max_weight = float(row.get("max_weight", 1.0 / max(top_n, 1)))
     pred_quantile = _empty_to_none(row.get("pred_quantile"))
     ridge_quantile = _empty_to_none(row.get("ridge_quantile"))
+    stride = _rebalance_stride(row)
+    data = _stride_predictions(data, row)
     returns, holdings = backtest.portfolio_from_predictions(
         data,
         horizon=horizon,
@@ -419,10 +511,16 @@ def _run_combo(pred: pd.DataFrame, row: pd.Series, kind: str, horizon: int, posi
         positive_only=positive_only,
         pred_quantile=float(pred_quantile) if pred_quantile is not None else None,
         ridge_quantile=float(ridge_quantile) if ridge_quantile is not None else None,
+        filter_untradable=True,
+        no_refill=True,
+        require_tradability=True,
+        hold_rank_buffer=_hold_rank_buffer(row),
     )
     if returns.empty or holdings.empty:
         return None
-    metrics = _evaluate_returns(returns["ret"], horizon)
+    metrics = _evaluate_returns(
+        returns["ret"], horizon, rebalance_stride=stride,
+    )
     if not metrics:
         return None
     target = f"target_ret_{horizon}d"
@@ -438,7 +536,7 @@ def _selection_summary(grid: pd.DataFrame) -> pd.DataFrame:
     numeric = grid.copy()
     for col in ("sharpe", "annual_return", "max_drawdown", "win_rate", "direction_win_rate", "avg_turnover"):
         numeric[col] = pd.to_numeric(numeric.get(col), errors="coerce")
-    group_cols = [c for c in ("param_id", "source", "lgbm_weight", "ic_weight", "elastic_weight", "catboost_weight", "extra_trees_weight", "top_n", "gross_exposure", "slot_weight", "max_weight", "ridge_quantile", "pred_quantile", "naive_weight") if c in numeric.columns]
+    group_cols = [c for c in ("param_id", "source", "lgbm_weight", "ic_weight", "elastic_weight", "catboost_weight", "extra_trees_weight", "top_n", "gross_exposure", "slot_weight", "max_weight", "ridge_quantile", "pred_quantile", "naive_weight", "rebalance_stride", "hold_rank_buffer") if c in numeric.columns]
     out = numeric.groupby(group_cols, dropna=False).agg(
         horizons=("horizon", lambda s: "/".join(str(int(x)) for x in sorted(s.dropna().unique()))),
         avg_sharpe=("sharpe", "mean"),
@@ -535,6 +633,8 @@ def evaluate_prepared_returns(pred: pd.DataFrame, params: dict, horizons: list[i
         max_weight = 1.0 / max(top_n, 1)
     pred_quantile = _empty_to_none(normalized.get("pred_quantile"))
     ridge_quantile = _empty_to_none(normalized.get("ridge_quantile"))
+    stride = _rebalance_stride(normalized)
+    pred = _stride_predictions(pred, normalized)
     result: dict[int, pd.DataFrame] = {}
     for horizon in horizons:
         returns, _ = backtest.portfolio_from_predictions(
@@ -545,10 +645,16 @@ def evaluate_prepared_returns(pred: pd.DataFrame, params: dict, horizons: list[i
             positive_only=positive_only,
             pred_quantile=float(pred_quantile) if pred_quantile is not None else None,
             ridge_quantile=float(ridge_quantile) if ridge_quantile is not None else None,
+            filter_untradable=True,
+            no_refill=True,
+            require_tradability=True,
+            hold_rank_buffer=_hold_rank_buffer(normalized),
         )
         if not returns.empty:
             returns = returns.copy()
             returns["date"] = pd.to_datetime(returns["date"], errors="coerce")
+            returns["rebalance_stride"] = stride
+            returns["hold_rank_buffer"] = _hold_rank_buffer(normalized)
             result[int(horizon)] = returns.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     return result
 
@@ -571,13 +677,27 @@ def stability_decision(candidate: dict[int, pd.DataFrame], baseline: dict[int, p
     improved = significant = acceptable = 0
     month_wins = month_total = 0
     for horizon in sorted(set(candidate) & set(baseline)):
-        merged = candidate[horizon][["date", "ret"]].merge(
+        candidate_frame = candidate[horizon]
+        stride_values = pd.to_numeric(
+            candidate_frame.get("rebalance_stride", pd.Series([1])),
+            errors="coerce",
+        ).dropna()
+        stride = max(int(stride_values.max()) if not stride_values.empty else 1, 1)
+        merged = candidate_frame[["date", "ret"]].merge(
             baseline[horizon][["date", "ret"]], on="date", suffixes=("_candidate", "_baseline"))
         if merged.empty:
             continue
-        sampled = merged.iloc[::max(int(horizon), 1)].copy()
-        c_metrics = _evaluate_returns(sampled["ret_candidate"], int(horizon))
-        b_metrics = _evaluate_returns(sampled["ret_baseline"], int(horizon))
+        sampling_step = max(int(np.ceil(int(horizon) / stride)), 1)
+        sampled = merged.iloc[::sampling_step].copy()
+        effective_stride = stride * sampling_step
+        c_metrics = _evaluate_returns(
+            sampled["ret_candidate"], int(horizon),
+            rebalance_stride=effective_stride,
+        )
+        b_metrics = _evaluate_returns(
+            sampled["ret_baseline"], int(horizon),
+            rebalance_stride=effective_stride,
+        )
         c_sharpe = c_metrics.get("sharpe")
         b_sharpe = b_metrics.get("sharpe")
         sharpe_gain = None
@@ -783,6 +903,14 @@ def main() -> None:
     ap.add_argument("--output", required=True, help="output grid parquet")
     ap.add_argument("--best-output", default="", help="output best-summary parquet; default derives from --output")
     ap.add_argument("--horizons", required=True, help="comma-separated horizons, e.g. 1,2,3")
+    ap.add_argument(
+        "--rebalance-stride", type=int, default=1,
+        help="evaluate every N authoritative exchange sessions; 1 keeps daily evaluation",
+    )
+    ap.add_argument(
+        "--hold-rank-buffer", type=int, default=0,
+        help="retain held names through top_n + buffer rank; 0 disables hysteresis",
+    )
     ap.add_argument("--kind", choices=["short", "swing"], required=True)
     ap.add_argument("--watchlist", default=config.MAINBOARD_UNIVERSE_FILE)
     ap.add_argument("--start-date", default="", help="inclusive evaluation start date")
@@ -807,6 +935,10 @@ def main() -> None:
         positive_only=not args.no_positive_only,
         start_date=args.start_date or None,
         end_date=args.end_date or None,
+        fixed_params={
+            "rebalance_stride": max(int(args.rebalance_stride), 1),
+            "hold_rank_buffer": max(int(args.hold_rank_buffer), 0),
+        },
     )
     print(f"[grid] rows={len(grid)} horizons={sorted(grid['horizon'].dropna().astype(int).unique())} -> {output}", flush=True)
     if not best.empty:

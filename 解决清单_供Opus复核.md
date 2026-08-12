@@ -501,7 +501,8 @@
 - **真实状态输入**：按精确 9 个 PIT 窗口冻结状态并集 917 股（SHA256 `d65c9144...`），官方 AmazingData 状态 `2,487,183` 行、2014-01-02 至 2026-08-11、917 股全覆盖、`code/date` 重复 0，artifact SHA256 `0b51af15...`。这是 9 窗口精确输入，不宣称全主板状态仓。
 - **确认性运行**：复用 55 个 prepared monthly parts、不 rebuild；最近 9 窗口全部通过严格标签 coverage gate，9/9 明确记录 `stage=lightgbm_ranker skipped=ridge_only`；115,165 条预测全部 Ridge 有效，`lgbm_pred` 非空数 0；PIT manifest 9 行、9 个唯一 hash，有效股票 609-684。summary/predictions/manifest SHA256 分别为 `ce2d19dc...`、`b8e5d270...`、`40a7a1f8...`。
 - **结论边界**：本次技术回测记录 total return `38.23%`、Sharpe `2.87`，但 `factor_selection_lh1000_cont.parquet` 仅有 pandas metadata，无 producer/window/label provenance（SHA256 `2cf907e0...`），因此这些数值不得解释为 alpha、晋级或可发布证据，也不做 control/promotion 比较。必须先重建有 provenance 的 factor selection。
-- **证据与验证**：`audit_20260812_strict_ridge_sentiment_validation.json`；远端聚焦 8/8、受影响模块 156/156、仓库 349/349、编译与最终 code review 均通过；本地未跑测试。
+- **证据与验证**：`audit_20260812_strict_ridge_sentiment_validation.json`；远端聚焦 8/8、受影响模块 156/156、仓库 349/349、编译与最终 code review 均通过；本地未跑测试。随后 rolling provenance 修复远端模块 `138/138`、仓库 `354/354`，GitHub 提交 `ab8e684`；candidate pool 修复提交 `d93451c`。
+- **Rolling v2 真实结果（2026-08-12）**：9 个 purged 窗口，候选池每窗 `67` 个安全特征，selected 每窗 Top30；`tradable_ret_1d`、purge span `3`、9 行/9 个唯一 manifest hash；LightGBM 9/9 跳过，115,165 条 Ridge 预测，`lgbm_pred` 非空 0。total return `49.84%`、Sharpe `3.53`、avg turnover `25.51%`。固定 33 因子对照为 total return `38.23%`、Sharpe `2.87`、avg turnover `19.55%`。方向上有希望，但尚未做独立 control、multiple-comparison/paired CI 和成本消融，不能写成已确认收益提升或 promotion readiness。
 
 ## 八、生产隔离和发布纪律
 

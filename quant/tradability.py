@@ -185,6 +185,10 @@ def price_tradability(
                     continue
         if px.empty:
             continue
+        if require_calendar and "volume" not in px.columns:
+            raise ValueError(f"strict tradability requires volume for {str(code).zfill(6)}")
+        if min_adv20 is not None and "amount" not in px.columns:
+            raise ValueError(f"ADV20 gate requires amount for {str(code).zfill(6)}")
         px = px.copy()
         px["code"] = px["code"].astype(str).str.zfill(6)
         px["date"] = pd.to_datetime(px["date"], errors="coerce")

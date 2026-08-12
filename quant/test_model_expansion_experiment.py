@@ -1549,7 +1549,8 @@ class ModelExpansionExperimentTest(unittest.TestCase):
                 "base_pred": score,
                 "ridge_pred": score,
                 "lgbm_pred": score,
-                "target_ret_1d": score / 100.0,
+                "target_ret_1d": 0.01 if code in {"600001", "600002"} else 0.0,
+                "buyable_close": True,
             }
             for date, scores in zip(dates, daily_scores)
             for code, score in scores.items()
@@ -2197,6 +2198,7 @@ class ModelExpansionExperimentTest(unittest.TestCase):
                     "target_ret_1d": float(code_index - 10) / 1000.0,
                     "target_ret_2d": float(code_index - 10) / 900.0,
                     "target_ret_3d": float(code_index - 10) / 800.0,
+                    "buyable_close": True,
                 })
         frame = pd.DataFrame(rows)
         params = {
@@ -2280,6 +2282,7 @@ class ModelExpansionExperimentTest(unittest.TestCase):
                     "target_ret_1d": score / 1000.0,
                     "target_ret_2d": score / 900.0,
                     "target_ret_3d": score / 800.0,
+                    "buyable_close": True,
                 })
         frame = pd.DataFrame(rows)
         params = {

@@ -79,17 +79,126 @@ def _daily_zscore(s: pd.Series) -> pd.Series:
     return (s - s.mean()) / std
 
 
-def _apply_rebalance_stride(pred: pd.DataFrame, rebalance_stride: int) -> pd.DataFrame:
+def _weight_turnover(
+    previous: np.ndarray,
+    current: np.ndarray,
+) -> float | np.ndarray:
+    """Return one-way traded NAV from stock weights plus residual cash."""
+    previous = np.asarray(previous, dtype=float)
+    current = np.asarray(current, dtype=float)
+    if previous.shape != current.shape or previous.ndim not in (1, 2):
+        raise ValueError("weight arrays must have the same one- or two-dimensional shape")
+    if (
+        not np.isfinite(previous).all()
+        or not np.isfinite(current).all()
+        or (previous < 0).any()
+        or (current < 0).any()
+    ):
+        raise ValueError("portfolio weights must be finite and non-negative")
+    axis = previous.ndim - 1
+    previous_exposure = previous.sum(axis=axis)
+    current_exposure = current.sum(axis=axis)
+    if (previous_exposure > 1.0 + 1e-12).any() or (
+        current_exposure > 1.0 + 1e-12
+    ).any():
+        raise ValueError("portfolio stock weights must not exceed total NAV")
+    previous_cash = np.maximum(1.0 - previous_exposure, 0.0)
+    current_cash = np.maximum(1.0 - current_exposure, 0.0)
+    stock_turnover = np.abs(current - previous).sum(axis=axis)
+    turnover = 0.5 * (stock_turnover + np.abs(current_cash - previous_cash))
+    if previous.ndim == 1:
+        return float(turnover)
+    return turnover
+
+
+def _mapping_turnover(
+    previous: dict[str, float],
+    current: dict[str, float],
+) -> float:
+    codes = sorted(set(previous) | set(current))
+    previous_weights = np.asarray([previous.get(code, 0.0) for code in codes])
+    current_weights = np.asarray([current.get(code, 0.0) for code in codes])
+    return float(_weight_turnover(previous_weights, current_weights))
+
+
+def _apply_rebalance_stride(
+    pred: pd.DataFrame,
+    rebalance_stride: int,
+    trading_calendar: pd.DataFrame | pd.DatetimeIndex | None = None,
+) -> pd.DataFrame:
     stride = max(int(rebalance_stride), 1)
     if pred.empty or stride == 1:
         return pred.copy()
-    dates = pd.Index(
+    pred_dates = pd.DatetimeIndex(
         pd.to_datetime(pred["date"], errors="coerce").dropna().sort_values().unique()
     )
-    rebalance_dates = dates[::stride]
+    if trading_calendar is None:
+        rebalance_dates = pred_dates[::stride]
+    else:
+        if isinstance(trading_calendar, pd.DataFrame):
+            if trading_calendar.empty or list(trading_calendar.columns) != ["date"]:
+                raise ValueError(
+                    "authoritative trading calendar must contain only date"
+                )
+            raw_dates = trading_calendar["date"]
+        else:
+            raw_dates = trading_calendar
+        calendar_dates = pd.DatetimeIndex(
+            pd.to_datetime(raw_dates, errors="coerce")
+        )
+        if (
+            calendar_dates.empty
+            or calendar_dates.hasnans
+            or calendar_dates.has_duplicates
+            or not calendar_dates.is_monotonic_increasing
+        ):
+            raise ValueError(
+                "authoritative trading calendar must be unique and increasing"
+            )
+        if not pred_dates.isin(calendar_dates).all():
+            raise RuntimeError(
+                "prediction dates absent from authoritative trading calendar"
+            )
+        rebalance_dates = calendar_dates[::stride]
     return pred[
         pd.to_datetime(pred["date"], errors="coerce").isin(rebalance_dates)
     ].copy()
+
+
+def _select_with_rank_hysteresis(
+    codes: np.ndarray,
+    scores: np.ndarray,
+    eligible: np.ndarray,
+    top_n: int,
+    hold_rank_buffer: int,
+    previous_codes: set[str],
+) -> np.ndarray:
+    """Select positions while retaining incumbents inside the exit-rank buffer."""
+    limit = max(int(top_n), 0)
+    if limit == 0:
+        return np.asarray([], dtype=int)
+    code_values = np.asarray(codes).astype(str)
+    score_values = np.asarray(scores, dtype=float)
+    mask = np.asarray(eligible, dtype=bool) & np.isfinite(score_values)
+    candidates = np.flatnonzero(mask)
+    if candidates.size == 0:
+        return np.asarray([], dtype=int)
+    order = np.lexsort((code_values[candidates], -score_values[candidates]))
+    ranked = candidates[order]
+    buffer = max(int(hold_rank_buffer), 0)
+    if buffer == 0 or not previous_codes:
+        return ranked[:limit]
+    retention_pool = ranked[:limit + buffer]
+    retained = [
+        index for index in retention_pool
+        if code_values[index] in previous_codes
+    ][:limit]
+    retained_set = set(retained)
+    selected = retained + [
+        index for index in ranked
+        if index not in retained_set
+    ][:limit - len(retained)]
+    return np.asarray(selected, dtype=int)
 
 
 def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int = 20,
@@ -101,7 +210,8 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
                                ridge_quantile: float | None = None,
                                use_open_fill: bool | None = None, filter_untradable: bool | None = None,
                                cost_roundtrip: float | None = None, no_refill: bool = False,
-                               require_tradability: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+                               require_tradability: bool = False,
+                               hold_rank_buffer: int = 0) -> tuple[pd.DataFrame, pd.DataFrame]:
     """由每日预测构建组合并计算收益。
 
     成交口径由参数或环境变量决定（默认：当日收盘成交、20bp 双边成本、过滤涨停/停牌）：
@@ -137,7 +247,7 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
         )
     holdings = []
     returns = []
-    last_codes: set[str] = set()
+    last_weights: dict[str, float] = {}
     if pred.empty or "pred" not in pred.columns or ret_col not in pred.columns:
         return pd.DataFrame(), pd.DataFrame()
     for date, g in pred.dropna(subset=["pred", ret_col]).groupby("date"):
@@ -160,21 +270,45 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
             pool["ensemble_pred"] = _daily_zscore(pool["pred"]) + float(rule_weight) * _daily_zscore(pool["rule_score"])
             rank_col = "ensemble_pred"
         ranked = pool.sort_values(rank_col, ascending=False)
+
+        def select(candidates: pd.DataFrame) -> pd.DataFrame:
+            if int(hold_rank_buffer) <= 0:
+                return candidates.head(top_n).copy()
+            selected = _select_with_rank_hysteresis(
+                candidates["code"].astype(str).to_numpy(),
+                pd.to_numeric(candidates[rank_col], errors="coerce").to_numpy(),
+                np.ones(len(candidates), dtype=bool),
+                top_n,
+                hold_rank_buffer,
+                set(last_weights),
+            )
+            return candidates.iloc[selected].copy()
+
         if no_refill:
-            # Select the fixed slots first. Unbuyable names become cash and are not replaced.
-            pick = ranked.head(top_n).copy()
+            # Select the fixed slots first. Unbuyable names become cash instead of
+            # being backfilled by lower-ranked candidates.
+            pick = select(ranked)
             if filter_untradable and buy_col in pick.columns:
-                pick = pick[pick[buy_col].fillna(False).astype(bool)].copy()
+                pick = pick[pick[buy_col].fillna(False).astype(bool)]
         else:
             if filter_untradable and buy_col in pool.columns:
                 pool = pool[pool[buy_col].fillna(False).astype(bool)]
-            pick = pool.sort_values(rank_col, ascending=False).head(top_n).copy()
+            pick = select(pool.sort_values(rank_col, ascending=False))
         if pick.empty:
             if no_refill:
-                returns.append({"date": date, "ret": 0.0, "gross_ret": 0.0, "cost": 0.0,
-                                "cash": 1.0, "turnover": 0.0 if not last_codes else 1.0,
-                                "n_holdings": 0})
-                last_codes = set()
+                current_weights: dict[str, float] = {}
+                turnover = _mapping_turnover(last_weights, current_weights)
+                cost = float(turnover) * float(cost_roundtrip)
+                returns.append({
+                    "date": date,
+                    "ret": -cost,
+                    "gross_ret": 0.0,
+                    "cost": cost,
+                    "cash": 1.0,
+                    "turnover": turnover,
+                    "n_holdings": 0,
+                })
+                last_weights = current_weights
             continue
         denominator = int(top_n) if no_refill else len(pick)
         w = min(1.0 / max(denominator, 1), max_weight)
@@ -185,9 +319,12 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
         pick["weight"] = w
         if rank_col != "pred":
             pick["pred"] = pick[rank_col]
-        codes = set(pick["code"].astype(str))
-        turnover = 1.0 if not last_codes else len(codes.symmetric_difference(last_codes)) / max(len(codes.union(last_codes)), 1)
-        last_codes = codes
+        current_weights = dict(zip(
+            pick["code"].astype(str),
+            pick["weight"].astype(float),
+        ))
+        turnover = _mapping_turnover(last_weights, current_weights)
+        last_weights = current_weights
         gross_ret = float((pick[ret_col] * pick["weight"]).sum())
         cost = float(turnover) * float(cost_roundtrip)
         period_ret = gross_ret - cost
@@ -217,7 +354,8 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
                  n_estimators: int = 200, learning_rate: float | None = None,
                  early_stopping_rounds: int = 40,
                  use_open_fill: bool | None = None, filter_untradable: bool | None = None,
-                 cost_roundtrip: float | None = None, rebalance_stride: int = 1) -> dict:
+                 cost_roundtrip: float | None = None, rebalance_stride: int = 1,
+                 trading_calendar: pd.DataFrame | pd.DatetimeIndex | None = None) -> dict:
     df = panel.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     dates = pd.Series(sorted(df["date"].dropna().unique()))
@@ -299,7 +437,7 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
 
     pred = pd.concat(preds, ignore_index=True) if preds else pd.DataFrame()
     stride = max(int(rebalance_stride), 1)
-    pred = _apply_rebalance_stride(pred, stride)
+    pred = _apply_rebalance_stride(pred, stride, trading_calendar=trading_calendar)
     side_cols = [c for c in ("volatility_10", "turnover", "rule_score",
                              f"open_ret_{horizon}d", f"tradable_ret_{horizon}d",
                              "buyable_next", "buyable_close") if c in df.columns]
@@ -326,6 +464,7 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
         _use_open = use_open_fill if use_open_fill is not None else bt_use_open_fill()
         summary["fill"] = "next_open" if (_use_open and f"open_ret_{horizon}d" in pred.columns) else "close"
     summary["rebalance_stride"] = stride
+    summary["authoritative_rebalance_calendar"] = trading_calendar is not None
     if ensemble_model:
         summary["ridge_quantile"] = ridge_quantile
         summary["lgbm_weight"] = lgbm_weight
@@ -343,6 +482,10 @@ def main():
     ap.add_argument("--test-months", type=int, default=1)
     ap.add_argument("--rebalance-stride", type=int, default=1,
                     help="只在每 N 个可用交易日调仓；用于非重叠持有期研究")
+    ap.add_argument(
+        "--authoritative-rebalance-calendar", action="store_true",
+        help="按权威交易日历固定调仓相位；缺失预测日不会重置后续相位",
+    )
     ap.add_argument("--top-n", type=int, default=3)
     ap.add_argument("--max-weight", type=float, default=None, help="单票最大权重；默认 1/top_n，即 topN 满仓等权")
     ap.add_argument("--ridge-alpha", type=float, default=10.0, help="Ridge L2 正则强度")
@@ -380,6 +523,11 @@ def main():
         factors = engineering.feature_columns(panel, args.horizon)
     decay = args.decay_half_life_days if args.decay_half_life_days > 0 else None
     early_stopping_rounds = args.early_stopping_rounds if args.early_stopping_rounds > 0 else 0
+    trading_calendar = (
+        warehouse.load("trading_calendar")
+        if args.authoritative_rebalance_calendar
+        else None
+    )
     res = walk_forward(panel, factors, model_name=args.model, horizon=args.horizon,
                        train_months=args.train_months, validation_months=args.validation_months,
                        test_months=args.test_months, top_n=args.top_n,
@@ -395,7 +543,8 @@ def main():
                         use_open_fill=(args.fill == "next_open"),
                         filter_untradable=(False if args.no_tradable_filter else bt_filter_untradable()),
                         cost_roundtrip=args.cost_roundtrip,
-                        rebalance_stride=args.rebalance_stride)
+                        rebalance_stride=args.rebalance_stride,
+                        trading_calendar=trading_calendar)
     name_prefix = f"{args.output_prefix}_" if args.output_prefix else ""
     warehouse.save(f"{name_prefix}bt_{args.model}_returns", res["returns"])
     warehouse.save(f"{name_prefix}bt_{args.model}_holdings", res["holdings"])
