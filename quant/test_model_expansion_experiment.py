@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from quant import backtest
+from quant import check_daily_update
 from quant import daily_update
 from quant import full_train_batched
 from quant import model as quant_model
@@ -57,6 +58,204 @@ class SentimentCalendarTest(unittest.TestCase):
         monday = result.loc[result["date"] == pd.Timestamp("2026-01-12"), "sentiment_score"]
         self.assertEqual(len(monday), 1)
         self.assertAlmostEqual(float(monday.iloc[0]), 0.0)
+
+    def test_strict_runtime_cutoff_excludes_close_and_date_only_articles(self):
+        stored = pd.DataFrame({
+            "publish_time": [
+                "2026-01-09 14:59:00",
+                "2026-01-09 15:00:00",
+                "2026-01-09 15:01:00",
+                "2026-01-09",
+            ],
+            "sentiment": [1.0, -1.0, -1.0, -1.0],
+            "category": ["news"] * 4,
+        })
+        base_model = {
+            "name": "strict-cutoff-test",
+            "half_life_days": 7.0,
+            "lookback_days": 30,
+            "category_weights": {"news": 1.0},
+            "signal_source": "lexicon",
+            "enabled": False,
+        }
+        calendar = pd.DatetimeIndex(pd.to_datetime([
+            "2026-01-09", "2026-01-12",
+        ]))
+        with mock.patch.object(sentiment_signal.news_store, "read_store", return_value=stored), \
+                mock.patch.object(sentiment_signal, "_authoritative_calendar", return_value=calendar):
+            legacy = sentiment_signal.score_at(
+                "600001", pd.Timestamp("2026-01-09"), base_model,
+            )
+            strict = sentiment_signal.score_at(
+                "600001", pd.Timestamp("2026-01-09"),
+                {**base_model, "strict_announcement_lag": True},
+            )
+        self.assertEqual(legacy.article_count, 3)
+        self.assertEqual(strict.article_count, 1)
+        self.assertEqual(
+            sentiment_signal._strict_publish_timestamp("2026-01-09"),
+            pd.Timestamp("2026-01-09 15:00:00"),
+        )
+        self.assertEqual(
+            sentiment_signal._strict_publish_timestamp(
+                "2026-01-09T07:00:00+00:00"
+            ),
+            pd.Timestamp("2026-01-09 15:00:00"),
+        )
+
+    def test_strict_candidate_lags_close_articles_to_next_session(self):
+        stored = pd.DataFrame({
+            "publish_time": [
+                "2026-01-09 14:59:00",
+                "2026-01-09 15:00:00",
+                "2026-01-09 15:01:00",
+                "2026-01-09",
+                "2026-01-10 10:00:00",
+            ],
+            "sentiment": [1.0, -1.0, -1.0, -1.0, -1.0],
+            "category": ["news"] * 5,
+        })
+        articles = stored.copy()
+        articles["publish_dt"] = pd.to_datetime(
+            articles["publish_time"], format="mixed",
+        )
+        articles["strict_publish_dt"] = articles["publish_time"].map(
+            sentiment_signal._strict_publish_timestamp
+        )
+        articles["llm_score"] = np.nan
+        prices = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-09", "2026-01-12", "2026-01-13"]),
+            "ret_1d": [0.01, 0.02, np.nan],
+            "ret_3d": [0.03, np.nan, np.nan],
+        })
+        calendar = pd.DatetimeIndex(pd.to_datetime([
+            "2026-01-09", "2026-01-12", "2026-01-13",
+        ]))
+        with mock.patch.object(sentiment_signal, "_articles", return_value=articles), \
+                mock.patch.object(sentiment_signal, "_price_forward_returns", return_value=prices), \
+                mock.patch.object(sentiment_signal, "_authoritative_calendar", return_value=calendar):
+            legacy = sentiment_signal._candidate_daily(
+                "600001", 1.0, {"news": 1.0},
+                pd.Timestamp("2026-01-09"), pd.Timestamp("2026-01-13"),
+            )
+            strict = sentiment_signal._candidate_daily(
+                "600001", 1.0, {"news": 1.0},
+                pd.Timestamp("2026-01-09"), pd.Timestamp("2026-01-13"),
+                strict_announcement_lag=True,
+            )
+        legacy_friday = legacy.loc[legacy["date"] == pd.Timestamp("2026-01-09"), "sentiment_score"].iloc[0]
+        strict_friday = strict.loc[strict["date"] == pd.Timestamp("2026-01-09"), "sentiment_score"].iloc[0]
+        strict_monday = strict.loc[strict["date"] == pd.Timestamp("2026-01-12"), "sentiment_score"].iloc[0]
+        self.assertGreater(strict_friday, legacy_friday)
+        self.assertGreater(strict_friday, 0.0)
+        self.assertLess(strict_monday, strict_friday)
+
+    def test_strict_runtime_uses_exchange_session_decay(self):
+        stored = pd.DataFrame({
+            "publish_time": [
+                "2026-01-09 14:00:00",
+                "2026-01-12 14:00:00",
+            ],
+            "sentiment": [1.0, -1.0],
+            "category": ["news", "news"],
+        })
+        model = {
+            "name": "strict-session-decay",
+            "half_life_days": 1.0,
+            "lookback_days": 30,
+            "category_weights": {"news": 1.0},
+            "signal_source": "lexicon",
+            "strict_announcement_lag": True,
+            "enabled": False,
+        }
+        calendar = pd.DatetimeIndex(pd.to_datetime([
+            "2026-01-09", "2026-01-12", "2026-01-13",
+        ]))
+        with mock.patch.object(sentiment_signal.news_store, "read_store", return_value=stored), \
+                mock.patch.object(sentiment_signal, "_authoritative_calendar", return_value=calendar):
+            signal = sentiment_signal.score_at(
+                "600001", pd.Timestamp("2026-01-12"), model,
+            )
+            invalid = sentiment_signal.score_at("600001", "not-a-date", model)
+        self.assertEqual(signal.article_count, 2)
+        self.assertAlmostEqual(signal.raw_score, -1.0 / 3.0, places=3)
+        self.assertEqual(invalid.note, "无效 asof")
+        self.assertFalse(invalid.available)
+
+    def test_strict_runtime_matches_candidate_session_aggregation(self):
+        stored = pd.DataFrame({
+            "publish_time": [
+                "2026-01-09 14:00:00",
+                "2026-01-12 14:00:00",
+            ],
+            "sentiment": [1.0, -1.0],
+            "category": ["news", "news"],
+        })
+        calendar = pd.DatetimeIndex(pd.to_datetime([
+            "2026-01-09", "2026-01-12", "2026-01-13",
+        ]))
+        prices = pd.DataFrame({
+            "date": calendar,
+            "ret_1d": [0.01, 0.02, np.nan],
+            "ret_3d": [0.03, np.nan, np.nan],
+        })
+        model = {
+            "name": "strict-session-parity",
+            "half_life_days": 1.0,
+            "lookback_days": 30,
+            "category_weights": {"news": 1.0},
+            "signal_source": "lexicon",
+            "strict_announcement_lag": True,
+            "enabled": False,
+        }
+        with mock.patch.object(sentiment_signal.news_store, "read_store", return_value=stored), \
+                mock.patch.object(sentiment_signal, "_authoritative_calendar", return_value=calendar):
+            articles = sentiment_signal._articles("600001")
+            runtime = sentiment_signal.score_at(
+                "600001", pd.Timestamp("2026-01-12"), model,
+            )
+        with mock.patch.object(sentiment_signal, "_articles", return_value=articles), \
+                mock.patch.object(sentiment_signal, "_price_forward_returns", return_value=prices), \
+                mock.patch.object(sentiment_signal, "_authoritative_calendar", return_value=calendar):
+            candidate = sentiment_signal._candidate_daily(
+                "600001", 1.0, {"news": 1.0},
+                pd.Timestamp("2026-01-09"), pd.Timestamp("2026-01-13"),
+                strict_announcement_lag=True,
+            )
+        monday = candidate.loc[
+            candidate["date"] == pd.Timestamp("2026-01-12"),
+            "sentiment_score",
+        ].iloc[0]
+        self.assertAlmostEqual(runtime.score, monday, places=3)
+
+    def test_strict_sentiment_purges_three_sessions_before_holdout(self):
+        calendar = pd.bdate_range("2026-01-01", periods=20)
+        frame = pd.DataFrame({
+            "date": calendar,
+            "sentiment_score": np.linspace(-1.0, 1.0, len(calendar)),
+            "ret_1d": np.linspace(0.01, 0.02, len(calendar)),
+            "ret_3d": np.linspace(0.02, 0.03, len(calendar)),
+            "code": ["600001"] * len(calendar),
+        })
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(sentiment_signal, "_authoritative_calendar", return_value=calendar), \
+                mock.patch.object(sentiment_signal, "_articles", return_value=pd.DataFrame()) as article_load, \
+                mock.patch.object(sentiment_signal, "_price_forward_returns", return_value=pd.DataFrame()) as price_load, \
+                mock.patch.object(sentiment_signal, "_candidate_daily", return_value=frame):
+            model = sentiment_signal.train(
+                ["600001"], calendar[0], calendar[-1],
+                str(Path(temporary) / "strict_sentiment.json"),
+                strict_announcement_lag=True,
+                strict_label_purge=True,
+            )
+        raw_split = calendar[0] + (calendar[-1] - calendar[0]) * 0.75
+        split_position = int(calendar.searchsorted(raw_split, side="left"))
+        self.assertEqual(model["holdout_start"], str(calendar[split_position].date()))
+        self.assertEqual(model["fit_end_exclusive"], str(calendar[split_position - 3].date()))
+        self.assertEqual(model["purge_sessions"], 3)
+        self.assertTrue(model["strict_label_purge"])
+        article_load.assert_called_once_with("600001")
+        price_load.assert_called_once_with("600001")
 
     def test_candidate_daily_requires_authoritative_calendar(self):
         articles = pd.DataFrame({
@@ -144,8 +343,38 @@ class IntradaySourcePriorityTest(unittest.TestCase):
         self.assertEqual(result["rows"], 2)
         self.assertEqual(result["st_rows"], 1)
         self.assertEqual(result["suspended_rows"], 1)
+        self.assertEqual(result["withdrawal_rows"], 0)
+        self.assertEqual(result["batches"], 1)
+        self.assertEqual(result["batch_size"], 0)
+
+    def test_refresh_trading_status_reference_supports_explicit_batches(self):
+        def status_batch(codes):
+            return pd.DataFrame({
+                "code": codes,
+                "date": pd.to_datetime(["2026-07-21"] * len(codes)),
+                "is_st": [False] * len(codes),
+                "is_suspended": [False] * len(codes),
+                "is_withdrawal": [False] * len(codes),
+            })
+
+        with mock.patch.object(daily_update.datafeed, "broker_available", return_value=True), mock.patch.object(
+            daily_update.datafeed, "broker_history_stock_status", side_effect=status_batch,
+        ) as fetch, mock.patch.object(daily_update.warehouse, "save") as save:
+            result = daily_update.refresh_trading_status_reference(
+                ["600003", "600001", "600002"], batch_size=2,
+            )
+
+        self.assertEqual(
+            [call.args[0] for call in fetch.call_args_list],
+            [["600001", "600002"], ["600003"]],
+        )
+        saved = save.call_args.args[1]
+        self.assertEqual(saved["code"].tolist(), ["600001", "600002", "600003"])
+        self.assertEqual(result["batches"], 2)
+        self.assertEqual(result["batch_size"], 2)
 
     def test_intraday_prefers_amazingdata(self):
+
         frames = {
             "600001": pd.DataFrame({
                 "date": pd.to_datetime(["2026-07-21"]),
@@ -431,6 +660,33 @@ class PublishAccelerationTest(unittest.TestCase):
         self.assertEqual(recovery_env["AMAZINGDATA_AUTO_LOGIN"], "0")
         self.assertIn("--skip-events", recovery_command)
 
+    def test_recovery_codes_round_trip_through_daily_update(self):
+        path = scheduled_workflow._write_recovery_codes(["600001", "000001"])
+        try:
+            self.assertEqual(path.read_text(encoding="utf-8"), "600001\n000001\n")
+            with mock.patch.object(daily_update.config, "ensure_dirs"), \
+                    mock.patch.object(daily_update, "refresh_trading_calendar", return_value={}):
+                result = daily_update.run(
+                    codes_file=str(path),
+                    skip_price=True,
+                    skip_valuation=True,
+                    skip_events=True,
+                    skip_fundamentals=True,
+                    skip_snapshots=True,
+                )
+            self.assertEqual(result["n_codes"], 2)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_recovery_codes_reject_empty_valid_pool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "codes.txt"
+            path.write_text("invalid\n", encoding="utf-8")
+            with mock.patch.object(daily_update.config, "ensure_dirs"), \
+                    mock.patch.object(daily_update, "refresh_trading_calendar", return_value={}), \
+                    self.assertRaisesRegex(ValueError, "no valid six-digit codes"):
+                daily_update.run(codes_file=str(path))
+
     def test_parquet_max_date_uses_footer_statistics(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "price.parquet"
@@ -564,6 +820,24 @@ class PublishAccelerationTest(unittest.TestCase):
 
 
 class DailyPanelAccelerationTest(unittest.TestCase):
+    def test_pit_price_row_gate_uses_nth_historical_observation(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(engineering.config, "PRICE_DIR", temporary):
+            pd.DataFrame({
+                "date": pd.to_datetime([
+                    "2020-01-02", "2020-01-03", "2020-01-06", "2026-08-10",
+                ]),
+            }).to_parquet(Path(temporary) / "600001.parquet", index=False)
+            pd.DataFrame({
+                "date": pd.to_datetime(["2020-01-02", "2026-08-10"]),
+            }).to_parquet(Path(temporary) / "600002.parquet", index=False)
+
+            eligible = engineering._price_row_eligibility_dates(
+                ["600001", "600002"], min_price_rows=3,
+            )
+
+        self.assertEqual(eligible, {"600001": pd.Timestamp("2020-01-06")})
+
     def test_strict_announcement_lag_maps_to_next_exchange_session(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1081,6 +1355,319 @@ class ModelExpansionExperimentTest(unittest.TestCase):
         selected = backtest._apply_rebalance_stride(pred, 2)
         self.assertEqual(selected["date"].tolist(), list(dates[::2]))
         self.assertEqual(backtest._apply_rebalance_stride(pred, 1).shape, pred.shape)
+
+    def test_authoritative_stride_phase_survives_missing_prediction_date(self):
+        dates = pd.bdate_range("2026-01-05", periods=6)
+        calendar = pd.DataFrame({"date": dates})
+        pred_dates = dates.delete(2)
+        pred = pd.DataFrame({
+            "date": pred_dates,
+            "code": ["600001"] * len(pred_dates),
+            "pred": np.arange(len(pred_dates), dtype=float),
+        })
+
+        selected = backtest._apply_rebalance_stride(
+            pred, 2, trading_calendar=calendar,
+        )
+
+        self.assertEqual(selected["date"].tolist(), [dates[0], dates[4]])
+
+    def test_watchlist_stride_defaults_daily_and_uses_authoritative_calendar(self):
+        dates = pd.bdate_range("2026-01-05", periods=5)
+        pred = pd.DataFrame({
+            "date": dates,
+            "code": ["600001"] * len(dates),
+            "pred": np.arange(len(dates), dtype=float),
+        })
+        calendar = pd.DataFrame({"date": dates})
+
+        with mock.patch.object(watchlist_grid.warehouse, "load") as load:
+            daily = watchlist_grid._stride_predictions(
+                pred, {"rebalance_stride": 1},
+            )
+            load.assert_not_called()
+        with mock.patch.object(
+            watchlist_grid.warehouse, "load", return_value=calendar,
+        ) as load:
+            strided = watchlist_grid._stride_predictions(
+                pred, {"rebalance_stride": 2},
+            )
+            load.assert_called_once_with("trading_calendar")
+
+        self.assertEqual(daily["date"].tolist(), dates.tolist())
+        self.assertEqual(
+            strided["date"].tolist(), [dates[0], dates[2], dates[4]],
+        )
+
+    def test_grid_selection_keeps_rebalance_stride_in_parameter_identity(self):
+        grid = pd.DataFrame({
+            "param_id": [0, 1],
+            "source": ["template", "template"],
+            "rebalance_stride": [1, 2],
+            "horizon": [1, 1],
+            "sharpe": [0.1, 0.2],
+            "annual_return": [0.01, 0.02],
+            "max_drawdown": [-0.1, -0.1],
+            "win_rate": [0.5, 0.5],
+            "direction_win_rate": [0.5, 0.5],
+            "avg_turnover": [0.2, 0.2],
+        })
+
+        summary = watchlist_grid._selection_summary(grid)
+
+        self.assertEqual(set(summary["rebalance_stride"]), {1, 2})
+        self.assertEqual(len(summary), 2)
+
+    def test_grid_selection_keeps_hold_buffer_in_parameter_identity(self):
+        grid = pd.DataFrame({
+            "param_id": [0, 0],
+            "source": ["template", "template"],
+            "hold_rank_buffer": [0, 1],
+            "horizon": [1, 1],
+            "sharpe": [0.1, 0.2],
+            "annual_return": [0.01, 0.02],
+            "max_drawdown": [-0.1, -0.1],
+            "win_rate": [0.5, 0.5],
+            "direction_win_rate": [0.5, 0.5],
+            "avg_turnover": [0.2, 0.1],
+        })
+        summary = watchlist_grid._selection_summary(grid)
+        self.assertEqual(len(summary), 2)
+        self.assertEqual(set(summary["hold_rank_buffer"]), {0, 1})
+
+    def test_weight_turnover_uses_stock_and_cash_weights(self):
+        self.assertAlmostEqual(
+            backtest._weight_turnover(
+                np.zeros(2), np.asarray([0.15, 0.15]),
+            ),
+            0.30,
+        )
+        self.assertAlmostEqual(
+            backtest._weight_turnover(
+                np.asarray([0.15, 0.15, 0.0]),
+                np.asarray([0.15, 0.0, 0.15]),
+            ),
+            0.15,
+        )
+        self.assertAlmostEqual(
+            backtest._weight_turnover(
+                np.asarray([0.20, 0.10]),
+                np.asarray([0.10, 0.0]),
+            ),
+            0.20,
+        )
+        self.assertAlmostEqual(
+            backtest._weight_turnover(
+                np.asarray([0.15, 0.15]), np.zeros(2),
+            ),
+            0.30,
+        )
+
+    def test_portfolio_cost_tracks_partial_exposure_and_liquidation(self):
+        dates = pd.bdate_range("2026-01-05", periods=3)
+        rows = []
+        scores = ((3.0, 2.0, 1.0), (3.0, 1.0, 2.0), (3.0, 2.0, 1.0))
+        buyable = ((True, True, True), (True, True, True), (False, False, False))
+        for date_index, date in enumerate(dates):
+            for code_index, code in enumerate(("600001", "600002", "600003")):
+                rows.append({
+                    "date": date,
+                    "code": code,
+                    "pred": scores[date_index][code_index],
+                    "target_ret_1d": 0.0,
+                    "buyable_close": buyable[date_index][code_index],
+                })
+        returns, _ = backtest.portfolio_from_predictions(
+            pd.DataFrame(rows),
+            horizon=1,
+            top_n=2,
+            max_weight=0.15,
+            filter_untradable=True,
+            cost_roundtrip=0.002,
+            no_refill=True,
+        )
+
+        np.testing.assert_allclose(returns["turnover"], [0.30, 0.15, 0.30])
+        np.testing.assert_allclose(returns["cost"], [0.0006, 0.0003, 0.0006])
+        np.testing.assert_allclose(returns["ret"], -returns["cost"])
+
+    def test_portfolio_rank_hysteresis_retains_then_replaces_incumbents(self):
+        dates = pd.date_range("2026-01-05", periods=3, freq="B")
+        daily_scores = [
+            {"600001": 4.0, "600002": 3.0, "600003": 2.0, "600004": 1.0},
+            {"600003": 4.0, "600001": 3.0, "600002": 2.0, "600004": 1.0},
+            {"600003": 4.0, "600001": 3.0, "600004": 2.0, "600002": 1.0},
+        ]
+        rows = [
+            {
+                "date": date,
+                "code": code,
+                "pred": score,
+                "target_ret_1d": 0.0,
+            }
+            for date, scores in zip(dates, daily_scores)
+            for code, score in scores.items()
+        ]
+        pred = pd.DataFrame(rows)
+        implicit = backtest.portfolio_from_predictions(
+            pred, horizon=1, top_n=2, max_weight=0.5,
+            filter_untradable=False, cost_roundtrip=0.0,
+        )
+        explicit = backtest.portfolio_from_predictions(
+            pred, horizon=1, top_n=2, max_weight=0.5,
+            filter_untradable=False, cost_roundtrip=0.0,
+            hold_rank_buffer=0,
+        )
+        pd.testing.assert_frame_equal(implicit[0], explicit[0])
+        pd.testing.assert_frame_equal(implicit[1], explicit[1])
+
+        _, holdings = backtest.portfolio_from_predictions(
+            pred, horizon=1, top_n=2, max_weight=0.5,
+            filter_untradable=False, cost_roundtrip=0.0,
+            hold_rank_buffer=1,
+        )
+        held = {
+            date: set(frame["code"])
+            for date, frame in holdings.groupby("date")
+        }
+        self.assertEqual(held[dates[0]], {"600001", "600002"})
+        self.assertEqual(held[dates[1]], {"600001", "600002"})
+        self.assertEqual(held[dates[2]], {"600001", "600003"})
+
+    def test_fast_and_formal_grid_share_rank_hysteresis(self):
+        dates = pd.date_range("2026-01-05", periods=3, freq="B")
+        daily_scores = [
+            {"600001": 4.0, "600002": 3.0, "600003": 2.0, "600004": 1.0},
+            {"600003": 4.0, "600001": 3.0, "600002": 2.0, "600004": 1.0},
+            {"600003": 4.0, "600001": 3.0, "600004": 2.0, "600002": 1.0},
+        ]
+        pred = pd.DataFrame([
+            {
+                "date": date,
+                "code": code,
+                "pred": score,
+                "base_pred": score,
+                "ridge_pred": score,
+                "lgbm_pred": score,
+                "target_ret_1d": score / 100.0,
+            }
+            for date, scores in zip(dates, daily_scores)
+            for code, score in scores.items()
+        ])
+        params = pd.Series({
+            "top_n": 2,
+            "gross_exposure": 0.3,
+            "slot_weight": 0.15,
+            "hold_rank_buffer": 1,
+            "rebalance_stride": 1,
+        })
+        with mock.patch.object(backtest, "bt_filter_untradable", return_value=False), \
+                mock.patch.object(backtest, "bt_use_open_fill", return_value=False), \
+                mock.patch.object(backtest, "bt_cost_roundtrip", return_value=0.0):
+            prepared = watchlist_grid._prepare_fast_grid(pred, [1])
+            fast = watchlist_grid._fast_combo_metrics(
+                prepared, params, "short", 1, positive_only=True,
+            )
+            slow = watchlist_grid._run_combo(
+                pred, params, "short", 1, positive_only=True,
+            )
+        self.assertIsNotNone(fast)
+        self.assertIsNotNone(slow)
+        for key in ("avg_turnover", "sharpe", "total_return"):
+            self.assertAlmostEqual(fast[key], slow[key])
+
+    def test_fast_grid_cost_uses_weight_turnover(self):
+        prepared = {
+            "base": np.asarray([[3.0, 2.0, 1.0], [3.0, 1.0, 2.0]]),
+            "lgbm_z": np.zeros((2, 3)),
+            "ridge_z": np.zeros((2, 3)),
+            "elastic_z": None,
+            "catboost_z": None,
+            "extra_trees_z": None,
+            "ic": np.zeros((2, 3)),
+            "ridge": np.full((2, 3), np.nan),
+            "rule_z": None,
+            "targets": {1: np.zeros((2, 3))},
+            "buyable": np.ones((2, 3), dtype=bool),
+        }
+        params = pd.Series({
+            "top_n": 2,
+            "slot_weight": 0.15,
+            "pred_quantile": None,
+            "ridge_quantile": None,
+        })
+        with mock.patch.object(backtest, "bt_cost_roundtrip", return_value=0.002):
+            metrics = watchlist_grid._fast_combo_metrics(
+                prepared, params, "short", 1, positive_only=False,
+            )
+
+        self.assertIsNotNone(metrics)
+        self.assertAlmostEqual(metrics["avg_turnover"], 0.225)
+        expected_total = (1.0 - 0.0006) * (1.0 - 0.0003) - 1.0
+        self.assertAlmostEqual(metrics["total_return"], expected_total)
+
+    def test_workflow_quant_data_dir_rebinds_parent_and_child_paths(self):
+        previous_dir = scheduled_workflow.config.QUANT_DIR
+        previous_env = os.environ.get("QUANT_DATA_DIR")
+        child_env: dict[str, str] = {}
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                requested = str(Path(temporary) / "data" / ".." / "data")
+                resolved = scheduled_workflow._configure_quant_data_dir(
+                    requested, child_env,
+                )
+                expected = str((Path(temporary) / "data").resolve())
+                self.assertEqual(resolved, expected)
+                self.assertEqual(child_env["QUANT_DATA_DIR"], expected)
+                self.assertEqual(str(scheduled_workflow._quant_dir()), expected)
+                self.assertEqual(
+                    scheduled_workflow.config.PRICE_DIR,
+                    str(Path(expected) / "price"),
+                )
+        finally:
+            scheduled_workflow.config.configure_quant_dir(previous_dir)
+            if previous_env is None:
+                os.environ.pop("QUANT_DATA_DIR", None)
+            else:
+                os.environ["QUANT_DATA_DIR"] = previous_env
+
+    def test_daily_health_sample_is_deterministic_and_exchange_stratified(self):
+        codes = ["600001", "600002", "000001", "300001", "830001"]
+        first = check_daily_update._stratified_hash_sample(codes, 3, "seed")
+        second = check_daily_update._stratified_hash_sample(codes, 3, "seed")
+        self.assertEqual(first, second)
+        self.assertEqual(
+            {check_daily_update._market_bucket(code) for code in first},
+            {"beijing", "shanghai", "shenzhen"},
+        )
+
+    def test_daily_health_stale_gate_exits_nonzero_when_enabled(self):
+        calendar = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-05", "2026-01-06"]),
+        })
+        stale_price = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-05"]),
+        })
+
+        def load_table(name):
+            return calendar if name == "trading_calendar" else pd.DataFrame()
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(check_daily_update.datafeed, "universe", return_value=["600001"]), \
+                mock.patch.object(check_daily_update.warehouse, "load_price", return_value=stale_price), \
+                mock.patch.object(check_daily_update.warehouse, "load_valuation", return_value=pd.DataFrame()), \
+                mock.patch.object(check_daily_update.warehouse, "load", side_effect=load_table), \
+                mock.patch("builtins.print"), \
+                mock.patch("sys.argv", [
+                    "check_daily_update",
+                    "--sample", "1",
+                    "--snapshot-dir", temporary,
+                    "--fail-on-stale-price",
+                    "--as-of-date", "2026-01-06",
+                ]), \
+                self.assertRaises(SystemExit) as raised:
+            check_daily_update.main()
+        self.assertIn("stale sampled price data", str(raised.exception))
 
     def test_pipeline_selection_manifest_freezes_label_windows_and_hashes(self):
         manifest = quant_pipeline._selection_manifest(
@@ -1897,6 +2484,30 @@ class FutureLabelFeatureSafetyTest(unittest.TestCase):
         self.assertFalse(bool(result.iloc[0]["buyable_next"]))
         self.assertFalse(bool(result.iloc[0]["buyable_close"]))
 
+    def test_strict_tradability_rejects_missing_volume(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            price_dir = root / "price"
+            price_dir.mkdir()
+            pd.DataFrame({
+                "code": ["600001"],
+                "date": pd.to_datetime(["2026-01-01"]),
+                "close": [10.0],
+            }).to_parquet(price_dir / "600001.parquet", index=False)
+            with self.assertRaisesRegex(ValueError, "requires volume"):
+                tradability.price_tradability(
+                    ["600001"], [1], quant_dir=root, require_calendar=True,
+                )
+
+    def test_adv_gate_requires_strict_calendar_labels(self):
+        with self.assertRaisesRegex(ValueError, "authoritative calendar"):
+            full_train_batched._validate_execution_gate_params(
+                "open-label", strict_execution_labels=False, min_adv20=1.0,
+            )
+        full_train_batched._validate_execution_gate_params(
+            "open-label", strict_execution_labels=True, min_adv20=1.0,
+        )
+
     def test_zero_volume_daily_bar_is_never_buyable_and_sell_rolls_forward(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2159,6 +2770,8 @@ class FutureLabelFeatureSafetyTest(unittest.TestCase):
             full_train_batched.tradability, "price_tradability", return_value=frame,
         ) as loader, mock.patch.object(
             full_train_batched, "_price_source_signature", return_value="price-hash",
+        ), mock.patch.object(
+            full_train_batched, "_trading_status_source_signature", return_value="status-hash",
         ):
             full_train_batched._cached_price_tradability(["600001"], 1)
             full_train_batched._cached_price_tradability(
@@ -2174,12 +2787,105 @@ class FutureLabelFeatureSafetyTest(unittest.TestCase):
         self.assertEqual(loader.call_args_list[1].kwargs["require_status"], True)
         self.assertEqual(loader.call_args_list[1].kwargs["require_calendar"], True)
         self.assertNotIn("strict_execution_labels", legacy)
+        self.assertNotIn("trading_status_source_signature", legacy)
         self.assertTrue(strict["strict_execution_labels"])
+        self.assertEqual(strict["trading_status_source_signature"], "status-hash")
         self.assertNotEqual(
             full_train_batched._recipe_signature(**legacy),
             full_train_batched._recipe_signature(**strict),
         )
         full_train_batched._TRAD_CACHE.clear()
+
+    def test_strict_label_recipe_tracks_status_artifact_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prepared = root / "prepared"
+            prepared.mkdir()
+            status_path = root / "trading_status_history.parquet"
+            status_path.write_bytes(b"status-a")
+            with mock.patch.object(full_train_batched.config, "QUANT_DIR", root), mock.patch.object(
+                full_train_batched, "_price_source_signature", return_value="price-hash",
+            ):
+                first = full_train_batched._label_recipe_params(
+                    "tradable-label", strict_execution_labels=True,
+                )
+                status_path.write_bytes(b"status-b")
+                second = full_train_batched._label_recipe_params(
+                    "tradable-label", strict_execution_labels=True,
+                )
+                legacy = full_train_batched._label_recipe_params("tradable-label")
+                first_recipe = full_train_batched._recipe_signature(**first)
+                second_recipe = full_train_batched._recipe_signature(**second)
+                dates = [pd.Timestamp(value) for value in (
+                    "2025-01-01", "2025-07-01", "2025-08-01", "2025-09-01",
+                )]
+                first_window_key = full_train_batched._window_cache_key(
+                    prepared, first_recipe, *dates,
+                )
+                second_window_key = full_train_batched._window_cache_key(
+                    prepared, second_recipe, *dates,
+                )
+
+        self.assertNotEqual(
+            first["trading_status_source_signature"],
+            second["trading_status_source_signature"],
+        )
+        self.assertNotEqual(first_recipe, second_recipe)
+        self.assertNotEqual(first_window_key, second_window_key)
+        self.assertNotIn("trading_status_source_signature", legacy)
+
+    def test_strict_window_cache_never_uses_legacy_fallback(self):
+        self.assertTrue(full_train_batched._legacy_window_cache_allowed(False, ""))
+        self.assertFalse(full_train_batched._legacy_window_cache_allowed(True, ""))
+        self.assertFalse(
+            full_train_batched._legacy_window_cache_allowed(False, "000852.SH")
+        )
+
+    def test_strict_tradability_cache_reloads_after_status_change(self):
+        frame = pd.DataFrame({
+            "code": ["600001"], "date": pd.to_datetime(["2026-01-05"]),
+            "tradable_ret_1d": [0.01], "buyable_close": [True],
+        })
+        full_train_batched._TRAD_CACHE.clear()
+        current_signature = ["status-a"]
+        with mock.patch.object(
+            full_train_batched.tradability, "price_tradability", return_value=frame,
+        ) as loader, mock.patch.object(
+            full_train_batched, "_trading_status_source_signature",
+            side_effect=lambda: current_signature[0],
+        ):
+            full_train_batched._cached_price_tradability(
+                ["600001"], 1, strict_execution_labels=True,
+            )
+            full_train_batched._cached_price_tradability(
+                ["600001"], 1, strict_execution_labels=True,
+            )
+            current_signature[0] = "status-b"
+            full_train_batched._cached_price_tradability(
+                ["600001"], 1, strict_execution_labels=True,
+            )
+
+        self.assertEqual(loader.call_count, 2)
+        full_train_batched._TRAD_CACHE.clear()
+
+    def test_strict_tradability_cache_rejects_status_change_during_load(self):
+        frame = pd.DataFrame({
+            "code": ["600001"], "date": pd.to_datetime(["2026-01-05"]),
+            "tradable_ret_1d": [0.01], "buyable_close": [True],
+        })
+        full_train_batched._TRAD_CACHE.clear()
+        with mock.patch.object(
+            full_train_batched.tradability, "price_tradability", return_value=frame,
+        ), mock.patch.object(
+            full_train_batched, "_trading_status_source_signature",
+            side_effect=["status-a", "status-b"],
+        ), self.assertRaisesRegex(RuntimeError, "changed during label loading"):
+            full_train_batched._cached_price_tradability(
+                ["600001"], 1, strict_execution_labels=True,
+                expected_status_signature="status-a",
+            )
+
+        self.assertFalse(full_train_batched._TRAD_CACHE)
 
     def test_listing_gate_enters_training_recipe(self):
         with mock.patch.object(
@@ -2271,11 +2977,233 @@ class FutureLabelFeatureSafetyTest(unittest.TestCase):
                         scheduled_workflow.watchlist_grid,
                         "run_grid",
                         side_effect=RuntimeError("grid unavailable"),
-                    ):
+                    ) as run_grid:
                 result = scheduled_workflow.run_short_grid(
                     {"short_1_3": "prefix"}, args, {"top_n": 2},
                 )
         self.assertIsNone(result)
+        self.assertEqual(
+            run_grid.call_args.kwargs["fixed_params"],
+            {"rebalance_stride": 1, "hold_rank_buffer": 0},
+        )
+
+    def test_ridge_only_keeps_ridge_cohort_without_lightgbm_join(self):
+        dates = pd.to_datetime(["2026-01-05", "2026-01-05"])
+        ridge = types.SimpleNamespace(
+            ok=True,
+            predictions=pd.DataFrame({
+                "code": ["600001", "600002"],
+                "date": dates,
+                "pred": [0.2, 0.1],
+                "target_ret_1d": [0.01, 0.02],
+            }),
+        )
+        lgbm = types.SimpleNamespace(
+            ok=True,
+            predictions=pd.DataFrame({
+                "code": ["600001"],
+                "date": dates[:1],
+                "pred": [0.3],
+                "target_ret_1d": [0.01],
+            }),
+        )
+        current = pd.Timestamp("2026-01-05")
+        test_end = pd.Timestamp("2026-01-06")
+        ensemble = full_train_batched._primary_window_predictions(
+            ridge, lgbm, current, test_end, ridge_only=False,
+        )
+        ridge_only = full_train_batched._primary_window_predictions(
+            ridge, None, current, test_end, ridge_only=True,
+        )
+        self.assertEqual(list(ensemble["code"]), ["600001"])
+        self.assertEqual(set(ridge_only["code"]), {"600001", "600002"})
+        self.assertTrue(ridge_only["lgbm_pred"].isna().all())
+        self.assertEqual(
+            ridge_only.set_index("code")["ridge_pred"].to_dict(),
+            {"600001": 0.2, "600002": 0.1},
+        )
+
+    def test_ridge_only_changes_window_recipe_identity(self):
+        base = {
+            "factors": ["factor_a", "factor_b"],
+            "horizon": 1,
+            "lgbm_weight": 0.0,
+        }
+        ensemble = full_train_batched._recipe_signature(
+            **base, ridge_only=False,
+        )
+        ridge_only = full_train_batched._recipe_signature(
+            **base, ridge_only=True,
+        )
+        self.assertNotEqual(ensemble, ridge_only)
+        self.assertIn(
+            "ridge_only",
+            inspect.signature(full_train_batched.train_batched).parameters,
+        )
+        with mock.patch.object(
+            full_train_batched.qmodel, "train_lightgbm_ranker",
+        ) as train_lightgbm:
+            result = full_train_batched._train_lightgbm_window(True)
+        self.assertIsNone(result)
+        train_lightgbm.assert_not_called()
+
+    def test_strict_execution_label_join_fails_closed_on_sparse_status(self):
+        dates = pd.date_range("2026-01-05", periods=5, freq="B")
+        window = pd.DataFrame({
+            "code": ["600001"] * len(dates),
+            "date": dates,
+        })
+        sparse = pd.DataFrame({
+            "code": ["600001"],
+            "date": [dates[0]],
+            "tradable_ret_1d": [0.01],
+            "buyable_close": [True],
+        })
+        with mock.patch.object(
+            full_train_batched, "_cached_price_tradability",
+            return_value=sparse,
+        ):
+            legacy = full_train_batched._join_tradability(
+                window, 1, strict_execution_labels=False,
+            )
+            with self.assertRaisesRegex(RuntimeError, "tradable_ret NaN rate"):
+                full_train_batched._join_tradability(
+                    window, 1, strict_execution_labels=True,
+                )
+        self.assertEqual(legacy["tradable_ret_1d"].notna().sum(), 1)
+
+    def test_join_tradability_forwards_expected_status_signature(self):
+        window = pd.DataFrame({
+            "code": ["600001"], "date": pd.to_datetime(["2026-01-05"]),
+        })
+        tradability_frame = window.assign(
+            tradable_ret_1d=0.01, buyable_close=True,
+        )
+        with mock.patch.object(
+            full_train_batched, "_cached_price_tradability",
+            return_value=tradability_frame,
+        ) as cached:
+            full_train_batched._join_tradability(
+                window, 1, strict_execution_labels=True,
+                expected_status_signature="status-hash",
+            )
+
+        self.assertEqual(
+            cached.call_args.kwargs["expected_status_signature"], "status-hash"
+        )
+
+    def test_selection_provenance_validates_target_and_factor_hash(self):
+        selected = ["factor_a", "factor_b"]
+        manifest = quant_pipeline._selection_manifest(
+            "selection_demo", "tradable_ret_1d", ["factor_a", "factor_b", "factor_c"],
+            selected, pd.Timestamp("2025-01-01"), pd.Timestamp("2025-04-01"),
+            pd.Timestamp("2025-07-01"),
+        )
+        with mock.patch.object(
+            full_train_batched.warehouse, "load", return_value=manifest,
+        ):
+            signature = full_train_batched._validate_selection_provenance(
+                "selection_demo", selected, "tradable_ret_1d",
+            )
+        self.assertEqual(len(signature), 64)
+        with mock.patch.object(
+            full_train_batched.warehouse, "load", return_value=manifest,
+        ), self.assertRaisesRegex(RuntimeError, "label mismatch"):
+            full_train_batched._validate_selection_provenance(
+                "selection_demo", selected, "target_ret_1d",
+            )
+
+    def test_rolling_selection_uses_prepared_features_not_fixed_selection(self):
+        sample = pd.DataFrame({
+            "code": ["600001"], "date": pd.to_datetime(["2025-01-02"]),
+            "factor_from_panel": [1.0], "target_ret_1d": [0.01],
+        })
+        with mock.patch.object(
+            full_train_batched, "_prepared_files", return_value=[Path("2025-01.parquet")],
+        ), mock.patch.object(pd, "read_parquet", return_value=sample), mock.patch.object(
+            full_train_batched.warehouse, "load",
+        ) as load:
+            factors = full_train_batched._selected_factors(
+                "legacy_selection", Path("prepared"), 1,
+                require_selection_provenance=True, rolling_factor_select=True,
+            )
+        load.assert_not_called()
+        self.assertIn("factor_from_panel", factors)
+
+    def test_rolling_selection_manifest_binds_purged_window_and_factor_hashes(self):
+        row = full_train_batched._rolling_selection_manifest_row(
+            3,
+            pd.Timestamp("2025-01-01"), pd.Timestamp("2025-06-25"),
+            pd.Timestamp("2025-07-01"), pd.Timestamp("2025-07-25"),
+            pd.Timestamp("2025-08-01"), pd.Timestamp("2025-09-01"),
+            "tradable_ret_1d", ["factor_b", "factor_a"], ["factor_a"], 5,
+        )
+        self.assertEqual(row["train_end"], "2025-06-25")
+        self.assertEqual(row["label_col"], "tradable_ret_1d")
+        self.assertEqual(row["purge_span"], 5)
+        self.assertEqual(row["candidate_count"], 2)
+        self.assertEqual(row["selected_count"], 1)
+        self.assertEqual(len(row["candidate_pool_sha256"]), 64)
+        self.assertEqual(len(row["selected_sha256"]), 64)
+        self.assertEqual(len(row["generator_code_sha256"]), 64)
+        self.assertEqual(len(row["manifest_hash"]), 64)
+
+    def test_strict_rolling_provenance_disables_window_cache(self):
+        self.assertTrue(
+            full_train_batched._rolling_cache_allowed(
+                require_selection_provenance=True, rolling_factor_select=True,
+            ) is False
+        )
+        self.assertTrue(
+            full_train_batched._rolling_cache_allowed(
+                require_selection_provenance=False, rolling_factor_select=True,
+            ) is True
+        )
+
+    def test_selection_provenance_is_required_only_when_enabled(self):
+        empty = pd.DataFrame()
+        with mock.patch.object(full_train_batched.warehouse, "load", return_value=empty), \
+                self.assertRaisesRegex(RuntimeError, "provenance unavailable"):
+            full_train_batched._validate_selection_provenance(
+                "missing_selection", ["factor_a"], "target_ret_1d",
+            )
+
+    def test_strict_panel_options_are_reachable_from_training_entry(self):
+        parameters = inspect.signature(full_train_batched.build_monthly_panel).parameters
+        self.assertIn("include_trading_gap_risk", parameters)
+        self.assertIn("strict_calendar_factors", parameters)
+        self.assertIn("strict_announcement_lag", parameters)
+
+        command = ["python", "-m", "quant.full_train_batched"]
+        args = types.SimpleNamespace(
+            include_trading_gap_risk=True,
+            strict_calendar_factors=True,
+            strict_announcement_lag=True,
+            strict_pit_min_price_rows=True,
+            strict_execution_labels=True,
+            require_selection_provenance=True,
+            enforce_c30_gates=True,
+            train_target_mode="tradable-label",
+            min_adv20=50_000_000.0,
+            min_listing_sessions=60,
+        )
+        scheduled_workflow._append_research_training_args(command, args)
+        self.assertIn("--include-trading-gap-risk", command)
+        self.assertIn("--strict-calendar-factors", command)
+        self.assertIn("--strict-announcement-lag", command)
+        self.assertIn("--strict-pit-min-price-rows", command)
+        self.assertIn("--strict-execution-labels", command)
+        self.assertIn("--require-selection-provenance", command)
+        self.assertIn("--enforce-c30-gates", command)
+        self.assertEqual(command[command.index("--train-target-mode") + 1], "tradable-label")
+        self.assertEqual(command[command.index("--min-listing-sessions") + 1], "60")
+
+    def test_research_training_options_remain_default_off(self):
+        command = ["python", "-m", "quant.full_train_batched"]
+        scheduled_workflow._append_research_training_args(
+            command, types.SimpleNamespace(),
+        )
+        self.assertEqual(command, ["python", "-m", "quant.full_train_batched"])
 
     def test_derived_style_reports_actual_source_prediction_horizon(self):
         requested = {"short_1_3": 1, "swing_7_15": 10}

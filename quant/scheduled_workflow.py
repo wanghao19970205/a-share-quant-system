@@ -161,6 +161,14 @@ def run_short_grid(output_prefixes: dict[str, str], args: argparse.Namespace,
             watchlist=watchlist,
             positive_only=True,
             neighborhood=champion_params,
+            fixed_params={
+                "rebalance_stride": max(
+                    int(getattr(args, "short_rebalance_stride", 1)), 1
+                ),
+                "hold_rank_buffer": max(
+                    int(getattr(args, "short_hold_rank_buffer", 0)), 0
+                )
+            },
         )
 
     except Exception as e:  # noqa: BLE001
@@ -171,7 +179,8 @@ def run_short_grid(output_prefixes: dict[str, str], args: argparse.Namespace,
     row = best.iloc[0]
     params: dict = {}
     for k in ("ic_weight", "top_n", "gross_exposure", "slot_weight",
-              "ridge_quantile", "pred_quantile", "naive_weight"):
+              "ridge_quantile", "pred_quantile", "naive_weight", "rebalance_stride",
+              "hold_rank_buffer"):
         if k not in best.columns:
             continue
         v = watchlist_grid._empty_to_none(row.get(k))  # noqa: SLF001
@@ -195,6 +204,13 @@ def _run(cmd: list[str], env: dict[str, str], dry_run: bool = False) -> None:
 
 def _quant_dir() -> Path:
     return Path(config.QUANT_DIR)
+
+
+def _configure_quant_data_dir(path: str, env: dict[str, str]) -> str:
+    resolved = config.configure_quant_dir(path)
+    env["QUANT_DATA_DIR"] = resolved
+    os.environ["QUANT_DATA_DIR"] = resolved
+    return resolved
 
 
 def _atomic_copy(src: Path, dst: Path) -> None:
@@ -360,7 +376,7 @@ def _write_recovery_codes(codes: list[str]) -> Path:
     fd, name = tempfile.mkstemp(prefix="daily-update-recovery-", suffix=".txt")
     os.close(fd)
     path = Path(name)
-    path.write_text("".join(f"{code}\\n" for code in codes), encoding="utf-8")
+    path.write_text("".join(f"{code}\n" for code in codes), encoding="utf-8")
     return path
 
 
@@ -470,6 +486,8 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
                                      or ([1, 2] if style == "short_1_3" else [7, 10, 15]))]
         kind = "short" if style == "short_1_3" else "swing"
         incumbent_params = dict(cfg.get("champion_score_params") or cfg.get("score_params") or {})
+        incumbent_params.setdefault("rebalance_stride", int(cfg.get("rebalance_stride", 1)))
+        incumbent_params.setdefault("hold_rank_buffer", int(cfg.get("hold_rank_buffer", 0)))
 
         # Select candidate parameters strictly before the untouched holdout period.
         selection_file = quant_dir / f"{output_prefixes[source_style]}_{style}_selection.parquet"
@@ -481,6 +499,14 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
                 for key in ("lgbm_weight", "elastic_weight", "catboost_weight", "extra_trees_weight")
                 if incumbent_params.get(key) is not None
             }
+            fixed_model_params["rebalance_stride"] = max(int(
+                args.short_rebalance_stride if style == "short_1_3"
+                else args.swing_rebalance_stride
+            ), 1)
+            fixed_model_params["hold_rank_buffer"] = max(int(
+                getattr(args, "short_hold_rank_buffer", 0) if style == "short_1_3"
+                else getattr(args, "swing_hold_rank_buffer", 0)
+            ), 0)
             _selection_grid, selection_best = watchlist_grid.run_grid(
                 predictions=candidate_path,
                 template=template,
@@ -501,7 +527,8 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
             reports[style] = {"promote": False, "reason": "parameter_selection_empty"}
             continue
         param_keys = ("lgbm_weight", "ic_weight", "elastic_weight", "catboost_weight", "extra_trees_weight", "top_n", "gross_exposure",
-                      "slot_weight", "max_weight", "ridge_quantile", "pred_quantile", "naive_weight")
+                      "slot_weight", "max_weight", "ridge_quantile", "pred_quantile", "naive_weight",
+                      "rebalance_stride", "hold_rank_buffer")
 
         candidate_pred, candidate_prepared = watchlist_grid.prepare_fixed_context(
             candidate_path, horizons, watchlist, holdout_start, common_end)
@@ -521,7 +548,7 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
                 value = watchlist_grid._empty_to_none(candidate_row.get(key))  # noqa: SLF001
                 if value is None:
                     candidate_params[key] = None
-                elif key == "top_n":
+                elif key in ("top_n", "rebalance_stride", "hold_rank_buffer"):
                     candidate_params[key] = int(value)
                 else:
                     candidate_params[key] = float(value)
@@ -629,12 +656,20 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
     )
     short_cfg["predictions_file"] = short_active.name
     short_cfg["prediction_horizon"] = int(training_params.get("short_horizon", 1))
+    short_cfg["rebalance_stride"] = int(
+        training_params.get("short_rebalance_stride", 1)
+    )
+    short_cfg["hold_rank_buffer"] = int(
+        training_params.get("short_hold_rank_buffer", 0)
+    )
     short_cfg["horizons"] = list(FINAL_TRADE_STYLES["short_1_3"]["horizons"])
     styles["short_1_3"] = short_cfg
     artifacts = deepcopy(manifest.get("style_artifacts") or {})
     short_artifact = deepcopy(artifacts.get("short_1_3") or {})
     short_artifact.update({
         "horizon": int(training_params.get("short_horizon", 1)),
+        "rebalance_stride": int(training_params.get("short_rebalance_stride", 1)),
+        "hold_rank_buffer": int(training_params.get("short_hold_rank_buffer", 0)),
         "predictions_file": short_active.name,
         "source_predictions_file": source_predictions.name,
         "summary_file": f"{source_prefix}_bt_{MODEL_NAME}_summary.parquet",
@@ -662,10 +697,18 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
         swing_cfg = deepcopy(styles.get("swing_7_15") or FINAL_TRADE_STYLES["swing_7_15"])
         swing_cfg["predictions_file"] = swing_active.name
         swing_cfg["prediction_horizon"] = short_artifact["horizon"]
+        swing_cfg["rebalance_stride"] = int(
+            training_params.get("swing_rebalance_stride", 1)
+        )
+        swing_cfg["hold_rank_buffer"] = int(
+            training_params.get("swing_hold_rank_buffer", 0)
+        )
         styles["swing_7_15"] = swing_cfg
         swing_artifact = deepcopy(artifacts.get("swing_7_15") or {})
         swing_artifact.update({
             "horizon": short_artifact["horizon"],
+            "rebalance_stride": int(training_params.get("swing_rebalance_stride", 1)),
+            "hold_rank_buffer": int(training_params.get("swing_hold_rank_buffer", 0)),
             "predictions_file": swing_active.name,
             "source_predictions_file": source_predictions.name,
             "summary_file": short_artifact["summary_file"],
@@ -945,6 +988,14 @@ def _apply_incumbent_training_config(args: argparse.Namespace) -> None:
             args.model_threads = int(params["model_threads"])
     except Exception:  # noqa: BLE001
         return
+    if params.get("short_rebalance_stride") is not None:
+        args.short_rebalance_stride = max(int(params["short_rebalance_stride"]), 1)
+    if params.get("swing_rebalance_stride") is not None:
+        args.swing_rebalance_stride = max(int(params["swing_rebalance_stride"]), 1)
+    if params.get("short_hold_rank_buffer") is not None:
+        args.short_hold_rank_buffer = max(int(params["short_hold_rank_buffer"]), 0)
+    if params.get("swing_hold_rank_buffer") is not None:
+        args.swing_hold_rank_buffer = max(int(params["swing_hold_rank_buffer"]), 0)
     if bool(params.get("elastic_net")):
         args.incumbent_elastic_net = True
         args.elastic_alpha = float(params.get("elastic_alpha") or args.elastic_alpha)
@@ -969,6 +1020,31 @@ def _apply_incumbent_training_config(args: argparse.Namespace) -> None:
               f"top_factors={args.rolling_top_factors} max_ic_corr={args.max_factor_ic_corr}", flush=True)
 
 
+def _append_research_training_args(cmd: list[str], args: argparse.Namespace) -> None:
+    flag_options = {
+        "include_trading_gap_risk": "--include-trading-gap-risk",
+        "strict_calendar_factors": "--strict-calendar-factors",
+        "strict_announcement_lag": "--strict-announcement-lag",
+        "strict_pit_min_price_rows": "--strict-pit-min-price-rows",
+        "strict_execution_labels": "--strict-execution-labels",
+        "require_selection_provenance": "--require-selection-provenance",
+        "enforce_c30_gates": "--enforce-c30-gates",
+    }
+    for attribute, option in flag_options.items():
+        if bool(getattr(args, attribute, False)):
+            cmd.append(option)
+    train_target_mode = str(getattr(args, "train_target_mode", "baseline"))
+    if train_target_mode != "baseline":
+        cmd.extend(["--train-target-mode", train_target_mode])
+    for attribute, option in (
+        ("min_adv20", "--min-adv20"),
+        ("min_listing_sessions", "--min-listing-sessions"),
+    ):
+        value = getattr(args, attribute, None)
+        if value is not None:
+            cmd.extend([option, str(value)])
+
+
 def run_training(args: argparse.Namespace, env: dict[str, str]) -> None:
     if args.skip_train:
         print("[train] skipped", flush=True)
@@ -977,6 +1053,14 @@ def run_training(args: argparse.Namespace, env: dict[str, str]) -> None:
     horizons = _horizons(args)
     for style in TRAIN_STYLE_ORDER:
         horizon = horizons[style]
+        rebalance_stride = (
+            args.short_rebalance_stride if style == "short_1_3"
+            else args.swing_rebalance_stride
+        )
+        hold_rank_buffer = (
+            getattr(args, "short_hold_rank_buffer", 0) if style == "short_1_3"
+            else getattr(args, "swing_hold_rank_buffer", 0)
+        )
         prefix = output_prefixes[style]
         panel_name = _training_panel_name(horizon)
         score_params = FINAL_TRADE_STYLES[style].get("score_params", {})
@@ -1013,6 +1097,8 @@ def run_training(args: argparse.Namespace, env: dict[str, str]) -> None:
             "--name", panel_name,
             "--output-prefix", prefix,
             "--horizon", str(horizon),
+            "--rebalance-stride", str(max(int(rebalance_stride), 1)),
+            "--hold-rank-buffer", str(max(int(hold_rank_buffer), 0)),
             "--refresh-months", str(args.refresh_months),
             "--universe-file", config.MAINBOARD_UNIVERSE_FILE,
             "--top-n", str(top_n),
@@ -1049,6 +1135,7 @@ def run_training(args: argparse.Namespace, env: dict[str, str]) -> None:
             ])
         if _uses_purge_training(args):
             cmd.append("--purge-horizon")
+        _append_research_training_args(cmd, args)
         if _uses_elastic_training(args):
             cmd.extend([
                 "--elastic-net",
@@ -1078,6 +1165,10 @@ def build_params(args: argparse.Namespace) -> dict:
     return {
         "short_horizon": args.short_horizon,
         "swing_horizon": args.swing_horizon,
+        "short_rebalance_stride": max(int(args.short_rebalance_stride), 1),
+        "swing_rebalance_stride": max(int(args.swing_rebalance_stride), 1),
+        "short_hold_rank_buffer": max(int(getattr(args, "short_hold_rank_buffer", 0)), 0),
+        "swing_hold_rank_buffer": max(int(getattr(args, "swing_hold_rank_buffer", 0)), 0),
         "horizons": _horizons(args),
         "refresh_months": args.refresh_months,
         "n_estimators": args.n_estimators,
@@ -1100,6 +1191,14 @@ def build_params(args: argparse.Namespace) -> dict:
         "validation_months": int(getattr(args, "validation_months", 1)),
         "rolling_factor_select": _uses_rolling_training(args),
         "purge_horizon": _uses_purge_training(args),
+        "include_trading_gap_risk": bool(getattr(args, "include_trading_gap_risk", False)),
+        "strict_calendar_factors": bool(getattr(args, "strict_calendar_factors", False)),
+        "strict_announcement_lag": bool(getattr(args, "strict_announcement_lag", False)),
+        "strict_execution_labels": bool(getattr(args, "strict_execution_labels", False)),
+        "enforce_c30_gates": bool(getattr(args, "enforce_c30_gates", False)),
+        "train_target_mode": str(getattr(args, "train_target_mode", "baseline")),
+        "min_adv20": getattr(args, "min_adv20", None),
+        "min_listing_sessions": getattr(args, "min_listing_sessions", None),
         "rolling_top_factors": args.rolling_top_factors,
         "max_factor_ic_corr": args.max_factor_ic_corr,
         "elastic_net": _uses_elastic_training(args),
@@ -1163,6 +1262,22 @@ def main() -> None:
     ap.add_argument("--horizon", type=int, default=1, help="legacy alias for --short-horizon")
     ap.add_argument("--short-horizon", type=int, default=None, help="短线训练目标天数；默认沿用 --horizon")
     ap.add_argument("--swing-horizon", type=int, default=10, help="波段训练目标天数")
+    ap.add_argument(
+        "--short-rebalance-stride", type=int, default=1,
+        help="短线评估每 N 个权威交易会话调仓；1 保持每日评估",
+    )
+    ap.add_argument(
+        "--swing-rebalance-stride", type=int, default=1,
+        help="波段评估每 N 个权威交易会话调仓；1 保持每日评估",
+    )
+    ap.add_argument(
+        "--short-hold-rank-buffer", type=int, default=0,
+        help="短线持仓保留至 Top-N + buffer；0 关闭组合滞回",
+    )
+    ap.add_argument(
+        "--swing-hold-rank-buffer", type=int, default=0,
+        help="波段持仓保留至 Top-N + buffer；0 关闭组合滞回",
+    )
     ap.add_argument("--refresh-months", type=int, default=1)
     ap.add_argument("--n-estimators", type=int, default=200)
     ap.add_argument("--learning-rate", type=float, default=0.015)
@@ -1185,6 +1300,19 @@ def main() -> None:
                     help="validation window months; horizons >=3 require 2 and horizons >=10 require 3")
     ap.add_argument("--purge-horizon", action="store_true",
                     help="enable label-horizon purge independently of rolling factor selection")
+    ap.add_argument("--include-trading-gap-risk", action="store_true")
+    ap.add_argument("--strict-calendar-factors", action="store_true")
+    ap.add_argument("--strict-announcement-lag", action="store_true")
+    ap.add_argument("--strict-pit-min-price-rows", action="store_true")
+    ap.add_argument("--strict-execution-labels", action="store_true")
+    ap.add_argument("--require-selection-provenance", action="store_true")
+    ap.add_argument("--enforce-c30-gates", action="store_true")
+    ap.add_argument(
+        "--train-target-mode", default="baseline",
+        choices=["baseline", "buyin-mask", "tradable-label", "open-label", "open-buyin-mask"],
+    )
+    ap.add_argument("--min-adv20", type=float, default=None)
+    ap.add_argument("--min-listing-sessions", type=int, default=None)
     ap.add_argument("--skip-windows", type=int, default=0)
     ap.add_argument("--max-windows", type=int, default=0)
     ap.add_argument("--recent-windows", type=int, default=0,
@@ -1201,8 +1329,8 @@ def main() -> None:
         args.short_horizon = args.horizon
 
     env = os.environ.copy()
+    args.quant_data_dir = _configure_quant_data_dir(args.quant_data_dir, env)
     env["PYTHONPATH"] = str(PROJECT_ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-    env["QUANT_DATA_DIR"] = args.quant_data_dir
     env["SNAPSHOT_DIR"] = args.snapshot_dir
     os.environ["PYTHONPATH"] = env["PYTHONPATH"]
     os.environ["QUANT_DATA_DIR"] = args.quant_data_dir

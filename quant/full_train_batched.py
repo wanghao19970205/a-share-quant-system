@@ -201,6 +201,26 @@ def _price_source_signature() -> str:
     return hashlib.sha1(json.dumps(payload, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def _trading_status_source_signature() -> str:
+    """Content identity for the status artifact required by strict labels."""
+    path = Path(config.QUANT_DIR) / "trading_status_history.parquet"
+    return _file_sha256(path) if path.is_file() else "missing"
+
+
+def _legacy_window_cache_allowed(
+    strict_execution_labels: bool,
+    pit_index_code: str,
+) -> bool:
+    return not strict_execution_labels and not bool(pit_index_code)
+
+
+def _rolling_cache_allowed(
+    require_selection_provenance: bool,
+    rolling_factor_select: bool,
+) -> bool:
+    return not (require_selection_provenance and rolling_factor_select)
+
+
 def _window_cache_key(prepared_dir: Path, recipe_sig: str, train_start: pd.Timestamp,
                       valid_start: pd.Timestamp, current: pd.Timestamp,
                       test_end: pd.Timestamp) -> str:
@@ -228,6 +248,46 @@ def _daily_zscore(s: pd.Series) -> pd.Series:
     if not std or not pd.notna(std):
         return pd.Series(0.0, index=s.index)
     return (s - s.mean()) / std
+
+
+def _train_lightgbm_window(ridge_only: bool, *args, **kwargs):
+    if ridge_only:
+        return None
+    return qmodel.train_lightgbm_ranker(*args, **kwargs)
+
+
+def _primary_window_predictions(
+    ridge_res,
+    lgbm_res,
+    current: pd.Timestamp,
+    test_end: pd.Timestamp,
+    ridge_only: bool,
+) -> pd.DataFrame:
+    if not ridge_res.ok or ridge_res.predictions.empty:
+        return pd.DataFrame()
+    ridge = ridge_res.predictions[
+        (ridge_res.predictions["date"] >= current)
+        & (ridge_res.predictions["date"] < test_end)
+    ].copy()
+    if ridge.empty:
+        return pd.DataFrame()
+    if ridge_only:
+        out = ridge.rename(columns={"pred": "ridge_pred"})
+        out["lgbm_pred"] = np.nan
+        return out
+    if lgbm_res is None or not lgbm_res.ok or lgbm_res.predictions.empty:
+        return pd.DataFrame()
+    lgbm = lgbm_res.predictions[
+        (lgbm_res.predictions["date"] >= current)
+        & (lgbm_res.predictions["date"] < test_end)
+    ].copy()
+    if lgbm.empty:
+        return pd.DataFrame()
+    return lgbm.rename(columns={"pred": "lgbm_pred"}).merge(
+        ridge[["code", "date", "pred"]].rename(columns={"pred": "ridge_pred"}),
+        on=["code", "date"],
+        how="inner",
+    )
 
 
 def _panel_dirs(name: str) -> tuple[Path, Path, Path]:
@@ -348,6 +408,17 @@ def _purge_span(train_target_mode: str, horizon: int) -> int:
     return int(horizon)
 
 
+def _validate_execution_gate_params(
+    train_target_mode: str,
+    strict_execution_labels: bool,
+    min_adv20: float | None,
+) -> None:
+    if strict_execution_labels and train_target_mode == "baseline":
+        raise ValueError("strict execution labels require a non-baseline target mode")
+    if min_adv20 is not None and not strict_execution_labels:
+        raise ValueError("min_adv20 requires strict execution labels and authoritative calendar")
+
+
 def _label_recipe_params(
     train_target_mode: str,
     strict_execution_labels: bool = False,
@@ -365,6 +436,7 @@ def _label_recipe_params(
         params["sell_roll_max_days"] = backtest.bt_sell_roll_max_days()
     if strict_execution_labels:
         params["strict_execution_labels"] = True
+        params["trading_status_source_signature"] = _trading_status_source_signature()
     if enforce_c30_gates:
         params["c30_gates"] = True
     if min_adv20 is not None:
@@ -581,10 +653,53 @@ def _rolling_factor_selection(
     return selected, audit
 
 
+def _rolling_selection_manifest_row(
+    window: int,
+    train_start: pd.Timestamp,
+    train_end: pd.Timestamp,
+    valid_start: pd.Timestamp,
+    valid_end: pd.Timestamp,
+    test_start: pd.Timestamp,
+    test_end: pd.Timestamp,
+    label_col: str,
+    candidate_factors: list[str],
+    selected_factors: list[str],
+    purge_span: int,
+) -> dict:
+    candidates = list(map(str, candidate_factors))
+    selected = list(map(str, selected_factors))
+    row = {
+        "window": int(window),
+        "train_start": str(pd.Timestamp(train_start).date()),
+        "train_end": str(pd.Timestamp(train_end).date()),
+        "valid_start": str(pd.Timestamp(valid_start).date()),
+        "valid_end": str(pd.Timestamp(valid_end).date()),
+        "test_start": str(pd.Timestamp(test_start).date()),
+        "test_end": str(pd.Timestamp(test_end).date()),
+        "label_col": str(label_col),
+        "purge_span": int(purge_span),
+        "candidate_count": len(candidates),
+        "selected_count": len(selected),
+        "candidate_pool_sha256": hashlib.sha256(
+            "\n".join(sorted(candidates)).encode("utf-8")
+        ).hexdigest(),
+        "selected_sha256": hashlib.sha256(
+            "\n".join(selected).encode("utf-8")
+        ).hexdigest(),
+        "generator_code_sha256": _file_sha256(Path(__file__)),
+    }
+    row["manifest_hash"] = _canonical_sha256(row)
+    return row
+
+
 def build_monthly_panel(name: str, horizon: int, batch_size: int,
                         min_price_rows: int, rebuild: bool = False,
                         limit_codes: int = 0, refresh_months: int = 0,
-                        universe_file: str | None = None) -> Path:
+                        universe_file: str | None = None,
+                        include_trading_gap_risk: bool = False,
+                        strict_calendar_factors: bool = False,
+                        strict_announcement_lag: bool = False,
+                        strict_pit_min_price_rows: bool = False) -> Path:
     root, raw_dir, prepared_dir = _panel_dirs(name)
     if rebuild and root.exists():
         shutil.rmtree(root)
@@ -598,11 +713,37 @@ def build_monthly_panel(name: str, horizon: int, batch_size: int,
             raise RuntimeError(f"training universe file is empty: {universe_file}")
     else:
         codes = engineering._read_codes(0)  # noqa: SLF001
-    codes = engineering._filter_codes_by_price_rows(codes, min_price_rows)  # noqa: SLF001
+    price_eligibility: dict[str, pd.Timestamp] = {}
+    if strict_pit_min_price_rows:
+        price_eligibility = engineering._price_row_eligibility_dates(  # noqa: SLF001
+            codes, min_price_rows,
+        )
+        codes = sorted(price_eligibility)
+    else:
+        codes = engineering._filter_codes_by_price_rows(codes, min_price_rows)  # noqa: SLF001
     if limit_codes:
         codes = codes[:limit_codes]
 
     existing_prepared = _prepared_files(prepared_dir)
+    panel_recipe = {
+        "include_trading_gap_risk": bool(include_trading_gap_risk),
+        "strict_calendar_factors": bool(strict_calendar_factors),
+        "strict_announcement_lag": bool(strict_announcement_lag),
+        "strict_pit_min_price_rows": bool(strict_pit_min_price_rows),
+        "min_price_rows": int(min_price_rows) if strict_pit_min_price_rows else None,
+    }
+    panel_recipe_path = root / "panel_recipe.json"
+    strict_panel = any(panel_recipe.values())
+    if strict_panel and existing_prepared and not rebuild:
+        existing_recipe = (
+            json.loads(panel_recipe_path.read_text(encoding="utf-8"))
+            if panel_recipe_path.exists()
+            else None
+        )
+        if existing_recipe != panel_recipe:
+            raise RuntimeError(
+                "strict panel recipe does not match cached monthly panel; use --rebuild"
+            )
     has_trainable_history = _prepared_date_count(existing_prepared) >= 30
     refresh_keys = (
         _refresh_month_keys(codes, refresh_months, existing_prepared)
@@ -648,11 +789,25 @@ def build_monthly_panel(name: str, horizon: int, batch_size: int,
     shared_started = time.perf_counter()
     all_codes = set(codes)
     shared_factors = {
-        "financial_yjbb": engineering._asof_report_factor("financial_yjbb", "yjbb", all_codes),  # noqa: SLF001
-        "income": engineering._asof_report_factor("income", "income", all_codes),  # noqa: SLF001
-        "cashflow": engineering._asof_report_factor("cashflow", "cashflow", all_codes),  # noqa: SLF001
-        "balance": engineering._asof_report_factor("balance", "balance", all_codes),  # noqa: SLF001
-        "performance_forecast": engineering._forecast_events(all_codes),  # noqa: SLF001
+        "financial_yjbb": engineering._asof_report_factor(  # noqa: SLF001
+            "financial_yjbb", "yjbb", all_codes,
+            strict_announcement_lag=strict_announcement_lag,
+        ),
+        "income": engineering._asof_report_factor(  # noqa: SLF001
+            "income", "income", all_codes,
+            strict_announcement_lag=strict_announcement_lag,
+        ),
+        "cashflow": engineering._asof_report_factor(  # noqa: SLF001
+            "cashflow", "cashflow", all_codes,
+            strict_announcement_lag=strict_announcement_lag,
+        ),
+        "balance": engineering._asof_report_factor(  # noqa: SLF001
+            "balance", "balance", all_codes,
+            strict_announcement_lag=strict_announcement_lag,
+        ),
+        "performance_forecast": engineering._forecast_events(  # noqa: SLF001
+            all_codes, strict_announcement_lag=strict_announcement_lag,
+        ),
         "margin_underlying_szse": engineering._margin_underlying(all_codes),  # noqa: SLF001
         "block_trades": engineering._event_counts("block_trades", all_codes, "block_trade"),  # noqa: SLF001
         "lhb": engineering._event_counts("lhb", all_codes, "lhb"),  # noqa: SLF001
@@ -670,12 +825,18 @@ def build_monthly_panel(name: str, horizon: int, batch_size: int,
             output_start=refresh_start,
             warmup_rows=260,
             shared_factors=shared_factors,
+            include_trading_gap_risk=include_trading_gap_risk,
+            strict_calendar_factors=strict_calendar_factors,
+            strict_announcement_lag=strict_announcement_lag,
         )
         if raw.empty:
             print(f"[panel:raw] batch={bi} empty", flush=True)
             continue
         raw["date"] = pd.to_datetime(raw["date"], errors="coerce")
         raw = raw.dropna(subset=["date"])
+        if strict_pit_min_price_rows:
+            eligibility = raw["code"].astype(str).map(price_eligibility)
+            raw = raw[eligibility.notna() & (raw["date"] >= eligibility)].copy()
         for month, part in raw.groupby(_month_key(raw["date"]), sort=True):
             if not month or month == "NaT":
                 continue
@@ -723,6 +884,12 @@ def build_monthly_panel(name: str, horizon: int, batch_size: int,
                 feature_summary_saved = True
             print(f"[panel:prepared] month={month} rows={rows} cols={cols}", flush=True)
 
+    if strict_panel:
+        tmp_recipe_path = panel_recipe_path.with_suffix(".tmp")
+        tmp_recipe_path.write_text(
+            json.dumps(panel_recipe, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.replace(tmp_recipe_path, panel_recipe_path)
     return prepared_dir
 
 
@@ -773,7 +940,7 @@ def _load_window(prepared_dir: Path, start: pd.Timestamp, end: pd.Timestamp,
 # 全部计入 factor_select 计时段 → 变体腿虚高 ~188s）。这里按 code 记忆化：
 # 首窗为缺失 code 调一次 price_tradability，其后各窗只从内存切片，命中即零 IO。
 # 仅进程内、仅非 baseline 腿会用到；键含 horizon 以隔离不同 h 的口径。
-_TRAD_CACHE: "dict[tuple[str, int, bool, float | None, int | None], pd.DataFrame]" = {}
+_TRAD_CACHE: "dict[tuple[str, int, bool, float | None, int | None, str | None], pd.DataFrame]" = {}
 
 
 def _cached_price_tradability(
@@ -782,16 +949,39 @@ def _cached_price_tradability(
     strict_execution_labels: bool = False,
     min_adv20: float | None = None,
     min_listing_sessions: int | None = None,
+    expected_status_signature: str | None = None,
 ) -> pd.DataFrame:
     """返回 codes 的可交易口径，仅对未缓存的 code 调用 price_tradability。
 
     与直接 tradability.price_tradability(codes, [horizon]) 等价（同一批 code 的并集），
     差别仅是把 per-code 结果记忆化，跨窗口复用。空结果的 code 也缓存（存空帧），
     避免对不存在 price 文件的 code 反复触发磁盘 stat。"""
-    missing = [
-        c for c in codes
-        if (c, horizon, strict_execution_labels, min_adv20, min_listing_sessions) not in _TRAD_CACHE
-    ]
+    status_signature = (
+        _trading_status_source_signature() if strict_execution_labels else None
+    )
+    if (
+        strict_execution_labels
+        and expected_status_signature is not None
+        and status_signature != expected_status_signature
+    ):
+        raise RuntimeError("trading status artifact changed after recipe signature capture")
+    if expected_status_signature is not None:
+        status_signature = expected_status_signature
+
+    def cache_key(code: str) -> tuple:
+        return (
+            code, horizon, strict_execution_labels, min_adv20,
+            min_listing_sessions, status_signature,
+        )
+
+    def ensure_status_unchanged() -> None:
+        if (
+            strict_execution_labels
+            and _trading_status_source_signature() != status_signature
+        ):
+            raise RuntimeError("trading status artifact changed during label loading")
+
+    missing = [c for c in codes if cache_key(c) not in _TRAD_CACHE]
     if missing:
         fresh = tradability.price_tradability(
             missing,
@@ -801,40 +991,45 @@ def _cached_price_tradability(
             min_adv20=min_adv20,
             min_listing_sessions=min_listing_sessions,
         )
+        ensure_status_unchanged()
         if not fresh.empty:
-            fresh["code"] = fresh["code"].astype(str).str.zfill(6)
             for code, grp in fresh.groupby("code", sort=False):
-                _TRAD_CACHE[(code, horizon, strict_execution_labels, min_adv20, min_listing_sessions)] = grp.reset_index(drop=True)
+                _TRAD_CACHE[cache_key(code)] = grp.reset_index(drop=True)
+
         # 没产出行的 code 也落一个空帧占位，防下窗重复读盘。
         for code in missing:
-            _TRAD_CACHE.setdefault(
-                (code, horizon, strict_execution_labels, min_adv20, min_listing_sessions), pd.DataFrame(),
-            )
+            _TRAD_CACHE.setdefault(cache_key(code), pd.DataFrame())
+    ensure_status_unchanged()
     parts = [
-        _TRAD_CACHE[(c, horizon, strict_execution_labels, min_adv20, min_listing_sessions)] for c in codes
-        if not _TRAD_CACHE[(c, horizon, strict_execution_labels, min_adv20, min_listing_sessions)].empty
+        _TRAD_CACHE[cache_key(c)] for c in codes
+        if not _TRAD_CACHE[cache_key(c)].empty
     ]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
 def _join_tradability(
-    window: pd.DataFrame,
+    df: pd.DataFrame,
     horizon: int,
     strict_execution_labels: bool = False,
     min_adv20: float | None = None,
     min_listing_sessions: int | None = None,
+    expected_status_signature: str | None = None,
 ) -> pd.DataFrame:
+
     """为窗口 join 可交易口径列（tradable_ret_{h}d / buyable_close），供 A/B 变体使用。
 
     仅新增标签/掩码列，不新增特征列（buyable_close 只用当日 OHLC、因果安全；
     tradable_ret 含 shift(-h) 未来价，是标签本就该含未来，非泄漏）。
     join 键：code(str, zfill6) + date(datetime64[ns])，与 tradability.price_tradability 输出一致。
     join 后断言 tradable_ret 命中率，防 code/date 规范化不一致导致静默丢样本。"""
-    codes = sorted(window["code"].astype(str).str.zfill(6).unique())
+    if df.empty:
+        return df
+    codes = sorted(df["code"].astype(str).str.zfill(6).unique())
     trad = _cached_price_tradability(
         codes, horizon, strict_execution_labels=strict_execution_labels,
         min_adv20=min_adv20,
         min_listing_sessions=min_listing_sessions,
+        expected_status_signature=expected_status_signature,
     )
     keep = [
         "code",
@@ -850,7 +1045,7 @@ def _join_tradability(
             f"tradability join produced no usable columns for horizon={horizon}; "
             f"cannot run A/B variant without buyable_close/tradable_ret"
         )
-    out = window.copy()
+    out = df.copy()
     out["code"] = out["code"].astype(str).str.zfill(6)
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     trad = trad[keep].drop_duplicates(["code", "date"])
@@ -861,7 +1056,12 @@ def _join_tradability(
         na_rate = float(out[tret].isna().mean())
         # 尾部 horizon 天 + 停牌等正常缺失，给到 20% 冗余；超过即视为键不匹配。
         if na_rate > 0.20:
-            print(f"[train:ab] WARN tradable_ret NaN rate={na_rate:.3f} (>0.20) — 检查 code/date join 键", flush=True)
+            message = (
+                f"tradable_ret NaN rate={na_rate:.3f} (>0.20) — 检查 code/date join 键"
+            )
+            if strict_execution_labels:
+                raise RuntimeError(message)
+            print(f"[train:ab] WARN {message}", flush=True)
     return out
 
 
@@ -871,9 +1071,17 @@ def _reject_unsafe_factors(factors: list[str], context: str) -> None:
         raise RuntimeError(f"unsafe future-label factors in {context}: {unsafe}")
 
 
-def _selected_factors(selection_name: str, prepared_dir: Path, horizon: int) -> list[str]:
-    sel = warehouse.load(selection_name)
+def _selected_factors(
+    selection_name: str,
+    prepared_dir: Path,
+    horizon: int,
+    require_selection_provenance: bool = False,
+    rolling_factor_select: bool = False,
+) -> list[str]:
+    sel = warehouse.load(selection_name) if not rolling_factor_select else pd.DataFrame()
     selected = sel["factor"].astype(str).tolist() if not sel.empty and "factor" in sel.columns else []
+    if require_selection_provenance and not rolling_factor_select and not selected:
+        raise RuntimeError(f"selection {selection_name!r} is empty or missing factor column")
     _reject_unsafe_factors(selected, "selected factor manifest")
     files = _prepared_files(prepared_dir)
     if not files:
@@ -885,6 +1093,46 @@ def _selected_factors(selection_name: str, prepared_dir: Path, horizon: int) -> 
         factors = [f for f in engineering.feature_columns(sample, horizon) if f in available]
     _reject_unsafe_factors(factors, "selected factor manifest")
     return factors
+
+
+def _validate_selection_provenance(
+    selection_name: str,
+    selected: list[str],
+    expected_label_col: str,
+) -> str:
+    manifest = warehouse.load(f"{selection_name}_manifest")
+    required = {
+        "selection_name", "label_col", "train_end", "valid_end", "predict_start",
+        "candidate_count", "selected_count", "candidate_pool_sha256",
+        "selected_sha256", "generator_code_sha256",
+    }
+    missing = sorted(required - set(manifest.columns))
+    if manifest.empty or missing:
+        raise RuntimeError(
+            f"selection provenance unavailable for {selection_name!r}: "
+            f"missing={missing or ['manifest row']}"
+        )
+    if len(manifest) != 1:
+        raise RuntimeError(f"selection provenance must have one row: {selection_name!r}")
+    row = manifest.iloc[0]
+    if str(row["selection_name"]) != selection_name:
+        raise RuntimeError("selection provenance name mismatch")
+    if str(row["label_col"]) != expected_label_col:
+        raise RuntimeError(
+            f"selection label mismatch: expected={expected_label_col!r} "
+            f"actual={row['label_col']!r}"
+        )
+    if int(row["selected_count"]) != len(selected):
+        raise RuntimeError("selection provenance selected_count mismatch")
+    selected_sha = hashlib.sha256(
+        "\n".join(map(str, selected)).encode("utf-8")
+    ).hexdigest()
+    if str(row["selected_sha256"]) != selected_sha:
+        raise RuntimeError("selection provenance selected factor hash mismatch")
+    boundaries = [pd.Timestamp(row[col]) for col in ("train_end", "valid_end", "predict_start")]
+    if not boundaries[0] < boundaries[1] < boundaries[2]:
+        raise RuntimeError("selection provenance boundaries are not strictly ordered")
+    return _canonical_sha256(row.to_dict())
 
 
 def train_batched(name: str, output_prefix: str, selection_name: str, horizon: int,
@@ -918,10 +1166,28 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                   extra_trees_weight: float = 0.0,
                   random_forest: bool = False, random_forest_estimators: int = 120,
                   random_forest_max_train_rows: int = 300_000,
-                  random_forest_weight: float = 0.0) -> pd.DataFrame:
+                  random_forest_weight: float = 0.0,
+                  rebalance_stride: int = 1,
+                  hold_rank_buffer: int = 0,
+                  ridge_only: bool = False,
+                  require_selection_provenance: bool = False) -> pd.DataFrame:
     _, _, prepared_dir = _panel_dirs(name)
-    if strict_execution_labels and train_target_mode == "baseline":
-        raise ValueError("strict execution labels require a non-baseline target mode")
+    _validate_execution_gate_params(
+        train_target_mode, strict_execution_labels, min_adv20,
+    )
+    if ridge_only:
+        lgbm_weight = 0.0
+    if ridge_only and (
+        float(ic_weight) != 0.0
+        or float(rank_vote_weight) != 0.0
+        or elastic_net
+        or catboost_ranker
+        or extra_trees
+        or random_forest
+    ):
+        raise ValueError(
+            "ridge_only requires all non-Ridge model legs and weights to be disabled"
+        )
     if train_target_mode not in (
         "baseline",
         "buyin-mask",
@@ -952,9 +1218,18 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             universe_codes = {token for token in f.read().split() if len(token) == 6 and token.isdigit()}
         if not universe_codes:
             raise RuntimeError(f"training universe file is empty: {universe_file}")
-    factors = _selected_factors(selection_name, prepared_dir, horizon)
+    factors = _selected_factors(
+        selection_name, prepared_dir, horizon,
+        require_selection_provenance=require_selection_provenance,
+        rolling_factor_select=rolling_factor_select,
+    )
     if not factors:
         raise RuntimeError("no usable factors for full-A batched training")
+    selection_provenance_signature = None
+    if require_selection_provenance and not rolling_factor_select:
+        selection_provenance_signature = _validate_selection_provenance(
+            selection_name, factors, ab_label_col or f"target_ret_{horizon}d",
+        )
     dates = _read_dates(prepared_dir)
     if len(dates) < 30:
         raise RuntimeError("prepared panel has too few dates")
@@ -973,6 +1248,7 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
     target = f"target_ret_{horizon}d"
     pred_parts = []
     audit_parts: list[pd.DataFrame] = []
+    rolling_selection_manifest_rows: list[dict] = []
     pit_manifest_rows: list[dict] = []
     selected_counts: list[int] = []
     side_cols = ["volatility_10", "turnover", "rule_score"]
@@ -989,14 +1265,27 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
     cache_hits = 0
     cache_misses = 0
     recipe_params = None
-    if window_cache_dir:
+    label_recipe_params = _label_recipe_params(
+        train_target_mode,
+        strict_execution_labels=strict_execution_labels,
+        enforce_c30_gates=enforce_c30_gates,
+        min_adv20=min_adv20,
+        min_listing_sessions=min_listing_sessions,
+    )
+    expected_status_signature = label_recipe_params.get(
+        "trading_status_source_signature"
+    )
+    if window_cache_dir and _rolling_cache_allowed(
+        require_selection_provenance, rolling_factor_select,
+    ):
         recipe_params = dict(
             factors=factors, horizon=horizon, train_months=train_months,
             validation_months=validation_months, test_months=test_months,
             decay_half_life_days=decay_half_life_days, min_weight=min_weight,
             n_estimators=n_estimators, learning_rate=learning_rate,
             early_stopping_rounds=early_stopping_rounds, lgbm_weight=lgbm_weight,
-            model_threads=model_threads, ic_weight=ic_weight, rank_vote_weight=rank_vote_weight,
+            ridge_only=bool(ridge_only), model_threads=model_threads,
+            ic_weight=ic_weight, rank_vote_weight=rank_vote_weight,
             elastic_net=elastic_net, elastic_alpha=elastic_alpha, elastic_l1_ratio=elastic_l1_ratio,
             catboost_ranker=catboost_ranker, catboost_estimators=catboost_estimators,
             catboost_learning_rate=catboost_learning_rate,
@@ -1012,14 +1301,10 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             max_factor_ic_corr=max_factor_ic_corr,
             universe_codes=sorted(universe_codes) if universe_codes is not None else [],
         )
+        if selection_provenance_signature is not None:
+            recipe_params["selection_provenance_signature"] = selection_provenance_signature
         # 仅当非 baseline 时才注入标签字段，保证 baseline 腿哈希与现役兼容。
-        recipe_params.update(_label_recipe_params(
-            train_target_mode,
-            strict_execution_labels=strict_execution_labels,
-            enforce_c30_gates=enforce_c30_gates,
-            min_adv20=min_adv20,
-            min_listing_sessions=min_listing_sessions,
-        ))
+        recipe_params.update(label_recipe_params)
         recipe_sig = _recipe_signature(**recipe_params)
         legacy_recipe_sig = _legacy_recipe_signature(**recipe_params)
         cache_dir = Path(window_cache_dir)
@@ -1080,7 +1365,11 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                 prepared_dir, window_recipe_sig, train_start, valid_start, current, test_end)
             cache_path = cache_dir / f"{window_cache_key}.parquet"
             legacy_cache_path = None
-            if not pit_index_code and legacy_recipe_sig and legacy_recipe_sig != recipe_sig:
+            if (
+                _legacy_window_cache_allowed(strict_execution_labels, pit_index_code)
+                and legacy_recipe_sig
+                and legacy_recipe_sig != recipe_sig
+            ):
                 legacy_key = _window_cache_key(
                     prepared_dir, legacy_recipe_sig, train_start, valid_start, current, test_end)
                 legacy_cache_path = cache_dir / f"{legacy_key}.parquet"
@@ -1133,6 +1422,7 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                 strict_execution_labels=strict_execution_labels,
                 min_adv20=min_adv20,
                 min_listing_sessions=min_listing_sessions,
+                expected_status_signature=expected_status_signature,
             )
         factors_in_window = [f for f in factors if f in window.columns]
         _reject_unsafe_factors(factors_in_window, f"training window {windows}")
@@ -1165,6 +1455,13 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
             if picked:
                 factors_in_window = picked
             _reject_unsafe_factors(factors_in_window, f"rolling selection window {windows}")
+            rolling_selection_manifest_rows.append(
+                _rolling_selection_manifest_row(
+                    windows, train_start, train_end_ts, valid_start, valid_end_ts,
+                    current, test_end, ab_label_col or f"target_ret_{horizon}d",
+                    factors_in_window, picked, purge_span,
+                )
+            )
             if not audit.empty:
                 audit = audit.copy()
                 audit.insert(0, "window", windows)
@@ -1201,24 +1498,29 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         print(f"[train:timing] window={windows} stage=ridge "
               f"seconds={time.perf_counter() - stage_started:.2f} ok={ridge_res.ok}", flush=True)
         stage_started = time.perf_counter()
-        lgbm_res = qmodel.train_lightgbm_ranker(
-            model_window,
-            factors_in_window,
-            horizon=horizon,
-            train_end=train_end,
-            valid_end=valid_end,
-            predict_start=current.strftime("%Y-%m-%d"),
-            decay_half_life_days=decay_half_life_days,
-            min_weight=min_weight,
-            n_estimators=n_estimators,
-            learning_rate=learning_rate,
-            early_stopping_rounds=early_stopping_rounds,
-            n_jobs=model_threads or None,
-            label_col=ab_label_col,
-            train_mask_col=ab_mask_col,
-        )
-        print(f"[train:timing] window={windows} stage=lightgbm_ranker "
-              f"seconds={time.perf_counter() - stage_started:.2f} ok={lgbm_res.ok}", flush=True)
+        lgbm_res = None
+        if ridge_only:
+            print(f"[train:timing] window={windows} stage=lightgbm_ranker skipped=ridge_only", flush=True)
+        else:
+            lgbm_res = _train_lightgbm_window(
+                ridge_only,
+                model_window,
+                factors_in_window,
+                horizon=horizon,
+                train_end=train_end,
+                valid_end=valid_end,
+                predict_start=current.strftime("%Y-%m-%d"),
+                decay_half_life_days=decay_half_life_days,
+                min_weight=min_weight,
+                n_estimators=n_estimators,
+                learning_rate=learning_rate,
+                early_stopping_rounds=early_stopping_rounds,
+                model_threads=model_threads,
+                label_col=ab_label_col,
+                train_mask_col=ab_mask_col,
+            )
+            print(f"[train:timing] window={windows} stage=lightgbm_ranker "
+                  f"seconds={time.perf_counter() - stage_started:.2f} ok={lgbm_res.ok}", flush=True)
         stage_started = time.perf_counter()
         ic_res = None
         elastic_res = None
@@ -1365,15 +1667,10 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                   f"seconds={time.perf_counter() - stage_started:.2f} ok={rank_vote_res.ok}", flush=True)
             stage_started = time.perf_counter()
         merge_started = time.perf_counter()
-        if ridge_res.ok and lgbm_res.ok and not ridge_res.predictions.empty and not lgbm_res.predictions.empty:
-            rp = ridge_res.predictions[(ridge_res.predictions["date"] >= current) & (ridge_res.predictions["date"] < test_end)].copy()
-            lp = lgbm_res.predictions[(lgbm_res.predictions["date"] >= current) & (lgbm_res.predictions["date"] < test_end)].copy()
-            p = lp.rename(columns={"pred": "lgbm_pred"}).merge(
-                rp[["code", "date", "pred"]].rename(columns={"pred": "ridge_pred"}),
-                on=["code", "date"],
-                how="inner",
-            )
-            if not p.empty:
+        p = _primary_window_predictions(
+            ridge_res, lgbm_res, current, test_end, ridge_only,
+        )
+        if not p.empty:
                 if ic_weight and ic_res and ic_res.ok and not ic_res.predictions.empty:
                     ip = ic_res.predictions[(ic_res.predictions["date"] >= current) & (ic_res.predictions["date"] < test_end)].copy()
                     p = p.merge(
@@ -1415,9 +1712,13 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                         on=["code", "date"],
                         how="left",
                     )
-                p["lgbm_z"] = p.groupby("date")["lgbm_pred"].transform(_daily_zscore)
                 p["ridge_z"] = p.groupby("date")["ridge_pred"].transform(_daily_zscore)
-                p["base_pred"] = float(lgbm_weight) * p["lgbm_z"] + (1 - float(lgbm_weight)) * p["ridge_z"]
+                if ridge_only:
+                    p["lgbm_z"] = np.nan
+                    p["base_pred"] = p["ridge_z"]
+                else:
+                    p["lgbm_z"] = p.groupby("date")["lgbm_pred"].transform(_daily_zscore)
+                    p["base_pred"] = float(lgbm_weight) * p["lgbm_z"] + (1 - float(lgbm_weight)) * p["ridge_z"]
                 p["pred"] = p["base_pred"]
                 if ic_weight and "ic_pred" in p.columns and p["ic_pred"].notna().any():
                     p["ic_z"] = p.groupby("date")["ic_pred"].transform(_daily_zscore)
@@ -1482,7 +1783,12 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                 print(f"[train] window={windows} predictions={len(p)} "
                       f"total_seconds={time.perf_counter() - window_started:.2f}", flush=True)
         else:
-            print(f"[train] window={windows} skipped ridge={ridge_res.message} lgbm={lgbm_res.message}", flush=True)
+            lgbm_message = "skipped:ridge_only" if ridge_only else lgbm_res.message
+            print(
+                f"[train] window={windows} skipped "
+                f"ridge={ridge_res.message} lgbm={lgbm_message}",
+                flush=True,
+            )
         windows += 1
         if month_cache.max_months > 0 and windows % 10 == 0:
             print(f"[train:cache] {month_cache.stats()}", flush=True)
@@ -1495,19 +1801,30 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
     if cache_dir is not None:
         print(f"[train:cache] window cache hits={cache_hits} misses={cache_misses}", flush=True)
     pred = pd.concat(pred_parts, ignore_index=True) if pred_parts else pd.DataFrame()
+    stride = max(int(rebalance_stride), 1)
+    trading_calendar = warehouse.load("trading_calendar") if stride > 1 else None
+    evaluated_pred = backtest._apply_rebalance_stride(
+        pred, stride, trading_calendar=trading_calendar,
+    )
     returns, holdings = backtest.portfolio_from_predictions(
-        pred,
+        evaluated_pred,
         horizon=horizon,
         top_n=top_n,
         max_weight=max_weight if max_weight is not None else 1.0 / max(int(top_n), 1),
         positive_only=positive_only,
         ridge_quantile=ridge_quantile,
+        hold_rank_buffer=max(int(hold_rank_buffer), 0),
     )
-    summary = backtest.evaluate_returns(returns["ret"] if not returns.empty else pd.Series(dtype=float), periods_per_year=max(1, 252 // horizon))
+    periods_per_year = max(1, int(round(252 / max(horizon, stride))))
+    summary = backtest.evaluate_returns(
+        returns["ret"] if not returns.empty else pd.Series(dtype=float),
+        periods_per_year=periods_per_year,
+    )
     if not returns.empty:
         summary["avg_turnover"] = float(returns["turnover"].mean())
         summary["avg_holdings"] = float(returns["n_holdings"].mean())
     summary["ridge_quantile"] = ridge_quantile
+    summary["ridge_only"] = bool(ridge_only)
     summary["lgbm_weight"] = lgbm_weight
     summary["ic_weight"] = ic_weight
     summary["rank_vote_weight"] = rank_vote_weight
@@ -1536,10 +1853,25 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
     summary["random_forest_estimators"] = int(random_forest_estimators) if random_forest else None
     summary["random_forest_max_train_rows"] = int(random_forest_max_train_rows) if random_forest else None
     summary["random_forest_weight"] = float(random_forest_weight) if random_forest else 0.0
+    summary["rebalance_stride"] = stride
+    summary["hold_rank_buffer"] = max(int(hold_rank_buffer), 0)
+    summary["authoritative_rebalance_calendar"] = trading_calendar is not None
     summary["n_predictions"] = len(pred)
+    summary["n_evaluation_predictions"] = len(evaluated_pred)
     summary_df = pd.DataFrame([{"model": MODEL_NAME, **summary}])
 
     name_prefix = f"{output_prefix}_" if output_prefix else ""
+    if require_selection_provenance and rolling_factor_select:
+        if len(rolling_selection_manifest_rows) != len(selected_counts):
+            raise RuntimeError(
+                "rolling selection provenance is incomplete: "
+                f"rows={len(rolling_selection_manifest_rows)} "
+                f"completed_windows={len(selected_counts)}"
+            )
+        warehouse.save(
+            f"{name_prefix}factor_selection_manifest",
+            pd.DataFrame(rolling_selection_manifest_rows),
+        )
     if audit_parts:
         warehouse.save(f"{name_prefix}factor_audit", pd.concat(audit_parts, ignore_index=True))
     if pit_manifest_rows:
@@ -1559,13 +1891,29 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Memory-conscious full-A batched training")
     ap.add_argument("--name", default="factor_panel_full_a_cont")
     ap.add_argument("--selection", default="factor_selection_lh1000_cont")
+    ap.add_argument(
+        "--require-selection-provenance", action="store_true",
+        help="fail closed unless <selection>_manifest matches the selected factors and target label",
+    )
     ap.add_argument("--output-prefix", default="full_a_batched_rq04_default_ne200")
     ap.add_argument("--horizon", type=int, default=5)
+    ap.add_argument(
+        "--rebalance-stride", type=int, default=1,
+        help="evaluate every N authoritative exchange sessions; 1 keeps daily evaluation",
+    )
+    ap.add_argument(
+        "--hold-rank-buffer", type=int, default=0,
+        help="retain held names through top_n + buffer rank; 0 disables hysteresis",
+    )
     ap.add_argument("--batch-size", type=int, default=200)
     ap.add_argument("--min-price-rows", type=int, default=1000)
     ap.add_argument("--limit-codes", type=int, default=0, help="debug only; 0 means all eligible codes")
     ap.add_argument("--universe-file", default="", help="optional six-digit code list restricting panel construction")
     ap.add_argument("--pit-index-code", default="", help="optional PIT index code resolved at each train_start")
+    ap.add_argument("--include-trading-gap-risk", action="store_true")
+    ap.add_argument("--strict-calendar-factors", action="store_true")
+    ap.add_argument("--strict-announcement-lag", action="store_true")
+    ap.add_argument("--strict-pit-min-price-rows", action="store_true")
     ap.add_argument("--rebuild", action="store_true")
     ap.add_argument("--refresh-months", type=int, default=0, help="rebuild only the latest N monthly raw/prepared partitions; 0 reuses existing panel unless --rebuild")
     ap.add_argument("--build-only", action="store_true")
@@ -1575,6 +1923,10 @@ def main() -> None:
     ap.add_argument("--top-n", type=int, default=3)
     ap.add_argument("--ridge-quantile", type=float, default=0.4)
     ap.add_argument("--lgbm-weight", type=float, default=1.0)
+    ap.add_argument(
+        "--ridge-only", action="store_true",
+        help="skip LightGBM and all non-Ridge legs; emit the Ridge cohort directly",
+    )
     ap.add_argument("--ic-weight", type=float, default=0.0, help="add an IC-weighted naive factor score to the Ridge+LightGBM z-score ensemble")
     ap.add_argument("--rank-vote-weight", type=float, default=0.0, help="add a cross-sectional rank-vote naive factor score to the ensemble")
     ap.add_argument("--max-weight", type=float, default=0.1)
@@ -1653,6 +2005,10 @@ def main() -> None:
         limit_codes=args.limit_codes,
         refresh_months=args.refresh_months,
         universe_file=args.universe_file or None,
+        include_trading_gap_risk=args.include_trading_gap_risk,
+        strict_calendar_factors=args.strict_calendar_factors,
+        strict_announcement_lag=args.strict_announcement_lag,
+        strict_pit_min_price_rows=args.strict_pit_min_price_rows,
     )
     if args.build_only:
         return
@@ -1661,6 +2017,7 @@ def main() -> None:
         name=args.name,
         output_prefix=args.output_prefix,
         selection_name=args.selection,
+        require_selection_provenance=args.require_selection_provenance,
         horizon=args.horizon,
         train_months=args.train_months,
         validation_months=args.validation_months,
@@ -1668,6 +2025,7 @@ def main() -> None:
         top_n=args.top_n,
         ridge_quantile=args.ridge_quantile,
         lgbm_weight=args.lgbm_weight,
+        ridge_only=args.ridge_only,
         ic_weight=args.ic_weight,
         rank_vote_weight=args.rank_vote_weight,
         max_weight=args.max_weight,
@@ -1710,6 +2068,8 @@ def main() -> None:
         enforce_c30_gates=args.enforce_c30_gates,
         min_adv20=args.min_adv20,
         min_listing_sessions=args.min_listing_sessions,
+        rebalance_stride=args.rebalance_stride,
+        hold_rank_buffer=args.hold_rank_buffer,
     )
 
 

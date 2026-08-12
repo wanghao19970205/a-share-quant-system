@@ -44,6 +44,7 @@ _login_lock = threading.Lock()
 _SDK_TIMEOUT = float(os.environ.get("AMAZINGDATA_TIMEOUT", "15") or 15)
 # 券商基本面一次批量调用（多个 InfoData 接口串行）的整体超时。
 _BROKER_TIMEOUT = float(os.environ.get("AMAZINGDATA_BROKER_TIMEOUT", "90") or 90)
+_STATUS_TIMEOUT = float(os.environ.get("AMAZINGDATA_STATUS_TIMEOUT", "180") or 180)
 # 复权因子接口（get_backward_factor）从网络拉取后会用 HDF5 落地本地再读取。
 # local_path 必须是容器内可写目录；默认放到缓存目录下，避免每次都重新联网拉因子。
 _FACTOR_TIMEOUT = float(os.environ.get("AMAZINGDATA_FACTOR_TIMEOUT", "120") or 120)
@@ -351,7 +352,7 @@ def fetch_history_stock_status(symbols: list[str]) -> pd.DataFrame:
             broker_codes,
             local_path=cache,
             is_local=False,
-            timeout=max(_BROKER_TIMEOUT, 180.0),
+            timeout=max(_BROKER_TIMEOUT, _STATUS_TIMEOUT),
         ))
     required = {
         "MARKET_CODE", "TRADE_DATE", "PRECLOSE", "HIGH_LIMITED", "LOW_LIMITED",

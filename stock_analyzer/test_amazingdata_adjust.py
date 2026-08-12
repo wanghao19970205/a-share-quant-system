@@ -134,9 +134,11 @@ class TradingCalendarTest(unittest.TestCase):
         ad.InfoData.return_value = mock.Mock()
         with mock.patch.object(a, "_ensure_login", return_value=True), \
                 mock.patch.object(a, "_ad", ad), \
-                mock.patch.object(a, "sdk_call", return_value=raw):
+                mock.patch.object(a, "_STATUS_TIMEOUT", 321.0), \
+                mock.patch.object(a, "sdk_call", return_value=raw) as sdk:
             result = a.fetch_history_stock_status(["600000"])
 
+        self.assertEqual(sdk.call_args.kwargs["timeout"], 321.0)
         self.assertEqual(str(result["date"].dtype), "datetime64[ns]")
         self.assertEqual(result["code"].tolist(), ["600000", "600000"])
         self.assertEqual(result["is_st"].tolist(), [False, True])
