@@ -165,9 +165,11 @@ def run_short_grid(output_prefixes: dict[str, str], args: argparse.Namespace,
                 "rebalance_stride": max(
                     int(getattr(args, "short_rebalance_stride", 1)), 1
                 ),
-                "hold_rank_buffer": max(
-                    int(getattr(args, "short_hold_rank_buffer", 0)), 0
-                )
+                **(
+                    {"hold_rank_buffer": max(int(args.short_hold_rank_buffer), 0)}
+                    if bool(getattr(args, "short_hold_rank_buffer_explicit", False))
+                    else {}
+                ),
             },
         )
 
@@ -503,10 +505,18 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
                 args.short_rebalance_stride if style == "short_1_3"
                 else args.swing_rebalance_stride
             ), 1)
-            fixed_model_params["hold_rank_buffer"] = max(int(
-                getattr(args, "short_hold_rank_buffer", 0) if style == "short_1_3"
+            requested_buffer = (
+                getattr(args, "short_hold_rank_buffer", 0)
+                if style == "short_1_3"
                 else getattr(args, "swing_hold_rank_buffer", 0)
-            ), 0)
+            )
+            buffer_explicit = (
+                bool(getattr(args, "short_hold_rank_buffer_explicit", False))
+                if style == "short_1_3"
+                else bool(getattr(args, "swing_hold_rank_buffer_explicit", False))
+            )
+            if buffer_explicit:
+                fixed_model_params["hold_rank_buffer"] = max(int(requested_buffer), 0)
             _selection_grid, selection_best = watchlist_grid.run_grid(
                 predictions=candidate_path,
                 template=template,
@@ -969,6 +979,24 @@ def _uses_extra_trees_training(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "extra_trees", False) or getattr(args, "incumbent_extra_trees", False))
 
 
+def _restore_explicit_portfolio_params(
+    args: argparse.Namespace,
+    cli_values: dict[str, int],
+    argv: list[str],
+) -> None:
+    options = {
+        "short_rebalance_stride": "--short-rebalance-stride",
+        "swing_rebalance_stride": "--swing-rebalance-stride",
+        "short_hold_rank_buffer": "--short-hold-rank-buffer",
+        "swing_hold_rank_buffer": "--swing-hold-rank-buffer",
+    }
+    for attribute, option in options.items():
+        if option not in argv:
+            continue
+        lower = 1 if attribute.endswith("rebalance_stride") else 0
+        setattr(args, attribute, max(int(cli_values[attribute]), lower))
+
+
 def _apply_incumbent_training_config(args: argparse.Namespace) -> None:
     """Keep daily refresh on the last approved training method without invoking the promotion gate."""
     args.incumbent_rolling_factor_select = False
@@ -1278,11 +1306,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--short-hold-rank-buffer", type=int, default=0,
-        help="短线持仓保留至 Top-N + buffer；0 关闭组合滞回",
+        help="固定短线 Top-N + buffer；省略时训练使用 0、网格搜索已注册维度",
     )
     ap.add_argument(
         "--swing-hold-rank-buffer", type=int, default=0,
-        help="波段持仓保留至 Top-N + buffer；0 关闭组合滞回",
+        help="固定波段 Top-N + buffer；省略时训练使用 0、网格搜索已注册维度",
     )
     ap.add_argument("--refresh-months", type=int, default=1)
     ap.add_argument("--n-estimators", type=int, default=200)
@@ -1333,6 +1361,8 @@ def main() -> None:
     ap.set_defaults(window_cache=True)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    args.short_hold_rank_buffer_explicit = "--short-hold-rank-buffer" in sys.argv[1:]
+    args.swing_hold_rank_buffer_explicit = "--swing-hold-rank-buffer" in sys.argv[1:]
     if args.short_horizon is None:
         args.short_horizon = args.horizon
 
@@ -1346,7 +1376,14 @@ def main() -> None:
     print(f"[workflow] quant_data_dir={args.quant_data_dir}", flush=True)
     print(f"[workflow] snapshot_dir={args.snapshot_dir}", flush=True)
     cli_recent_windows = int(args.recent_windows or 0)  # explicit CLI intent, captured before manifest override
+    cli_portfolio_params = {
+        "short_rebalance_stride": int(args.short_rebalance_stride),
+        "swing_rebalance_stride": int(args.swing_rebalance_stride),
+        "short_hold_rank_buffer": int(args.short_hold_rank_buffer),
+        "swing_hold_rank_buffer": int(args.swing_hold_rank_buffer),
+    }
     _apply_incumbent_training_config(args)
+    _restore_explicit_portfolio_params(args, cli_portfolio_params, sys.argv[1:])
     if args.strategy_mode == "incumbent-refresh":
         # Daily/weekly refresh: rolling walk-forward. Default is the latest 24 windows (each a
         # 24-month train slice); peak memory is bounded by ONE window, so this is memory-safe on

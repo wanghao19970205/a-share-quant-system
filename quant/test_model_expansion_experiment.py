@@ -1431,7 +1431,7 @@ class ModelExpansionExperimentTest(unittest.TestCase):
         grid = pd.DataFrame({
             "param_id": [0, 1], "source": ["template", "template"],
             "gross_exposure": [0.2, 0.4], "horizon": [1, 1],
-            "sharpe": [1.0, 1.0], "annual_return": [0.1, 0.1],
+            "sharpe": [1.0, 1.0], "annual_return": [0.05, 0.1],
             "max_drawdown": [-0.1, -0.2], "win_rate": [0.5, 0.5],
             "direction_win_rate": [0.5, 0.5], "avg_turnover": [0.2, 0.4],
         })
@@ -2451,6 +2451,55 @@ class ModelExpansionExperimentTest(unittest.TestCase):
 
 
 class FutureLabelFeatureSafetyTest(unittest.TestCase):
+    def test_grid_worker_accepts_tradable_label_targets(self):
+        dates = pd.date_range("2026-01-05", periods=3, freq="D")
+        panel = pd.DataFrame({
+            "code": ["600001"] * 3,
+            "date": dates,
+            "base_pred": [0.3, 0.2, 0.1],
+            "ridge_pred": [0.3, 0.2, 0.1],
+            "tradable_ret_1d": [0.01, 0.02, 0.03],
+            "buyable_close": [True, True, True],
+        })
+        prepared = watchlist_grid._prepare_fast_grid(panel, [1])
+        item = (1, pd.Series({
+            "top_n": 1,
+            "gross_exposure": 0.3,
+            "slot_weight": 0.3,
+            "ridge_quantile": None,
+            "pred_quantile": None,
+            "naive_weight": 0.0,
+            "rebalance_stride": 1,
+            "hold_rank_buffer": 0,
+        }))
+        original_state = (
+            watchlist_grid._GRID_PRED,
+            watchlist_grid._GRID_PREPARED,
+            watchlist_grid._GRID_HORIZONS,
+            watchlist_grid._GRID_KIND,
+            watchlist_grid._GRID_POSITIVE_ONLY,
+            watchlist_grid._GRID_SOURCE,
+        )
+        watchlist_grid._GRID_PRED = panel
+        watchlist_grid._GRID_PREPARED = prepared
+        watchlist_grid._GRID_HORIZONS = [1]
+        watchlist_grid._GRID_KIND = "short"
+        watchlist_grid._GRID_POSITIVE_ONLY = False
+        watchlist_grid._GRID_SOURCE = "strict.parquet"
+        try:
+            rows = watchlist_grid._evaluate_combo_process(item)
+        finally:
+            (
+                watchlist_grid._GRID_PRED,
+                watchlist_grid._GRID_PREPARED,
+                watchlist_grid._GRID_HORIZONS,
+                watchlist_grid._GRID_KIND,
+                watchlist_grid._GRID_POSITIVE_ONLY,
+                watchlist_grid._GRID_SOURCE,
+            ) = original_state
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["horizon"], 1)
+
     def test_feature_columns_exclude_all_horizon_targets_and_execution_labels(self):
         panel = pd.DataFrame({
             "code": ["600001"],
@@ -3033,8 +3082,45 @@ class FutureLabelFeatureSafetyTest(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(
             run_grid.call_args.kwargs["fixed_params"],
-            {"rebalance_stride": 1, "hold_rank_buffer": 0},
+            {"rebalance_stride": 1},
         )
+
+    def test_explicit_portfolio_cli_params_win_over_manifest_values(self):
+        args = types.SimpleNamespace(
+            short_rebalance_stride=1,
+            swing_rebalance_stride=1,
+            short_hold_rank_buffer=0,
+            swing_hold_rank_buffer=0,
+        )
+        scheduled_workflow._restore_explicit_portfolio_params(
+            args,
+            {
+                "short_rebalance_stride": 2,
+                "swing_rebalance_stride": 3,
+                "short_hold_rank_buffer": 4,
+                "swing_hold_rank_buffer": 5,
+            },
+            ["--short-rebalance-stride", "--short-hold-rank-buffer"],
+        )
+        self.assertEqual(args.short_rebalance_stride, 2)
+        self.assertEqual(args.short_hold_rank_buffer, 4)
+        self.assertEqual(args.swing_rebalance_stride, 1)
+        self.assertEqual(args.swing_hold_rank_buffer, 0)
+
+    def test_short_grid_omits_default_buffer_override(self):
+        args = types.SimpleNamespace(
+            short_hold_rank_buffer=0,
+            short_hold_rank_buffer_explicit=False,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "prefix_bt_ridge_lightgbm_ranker_ensemble_predictions.parquet"
+            source.write_bytes(b"prediction-artifact")
+            with mock.patch.object(scheduled_workflow, "_quant_dir", return_value=root), \
+                    mock.patch.object(scheduled_workflow, "_optimization_universe", return_value=["600001"]), \
+                    mock.patch.object(scheduled_workflow.watchlist_grid, "run_grid", side_effect=RuntimeError("grid unavailable")) as run_grid:
+                scheduled_workflow.run_short_grid({"short_1_3": "prefix"}, args, {"top_n": 2})
+        self.assertEqual(run_grid.call_args.kwargs["fixed_params"], {"rebalance_stride": 1})
 
     def test_ridge_only_keeps_ridge_cohort_without_lightgbm_join(self):
         dates = pd.to_datetime(["2026-01-05", "2026-01-05"])

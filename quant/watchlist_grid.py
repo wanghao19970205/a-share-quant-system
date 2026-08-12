@@ -552,13 +552,14 @@ def _selection_summary(grid: pd.DataFrame) -> pd.DataFrame:
             top_n = pd.Series(3.0, index=out.index)
         gross = gross.fillna(max_weight * top_n)
     gross = gross.where(gross > 0)
+    normalized_annual_return = out["avg_annual_return"] / gross
     normalized_drawdown = out["worst_drawdown"] / gross
     normalized_turnover = out["avg_turnover"] / gross
     out["selection_score"] = (
         out["avg_sharpe"].fillna(0.0)
         + (out["avg_win_rate"].fillna(0.5) - 0.5) * 2.0
         + (out["avg_direction_win_rate"].fillna(0.5) - 0.5)
-        + out["avg_annual_return"].fillna(0.0) * 0.15
+        + normalized_annual_return.fillna(0.0) * 0.15
         + normalized_drawdown.fillna(-1.0) * 0.25
         - normalized_turnover.fillna(1.0) * 0.05
     )
@@ -800,7 +801,7 @@ def _evaluate_combo_process(item: tuple[int, pd.Series]) -> list[dict]:
     combo_rows: list[dict] = []
     with threadpool_limits(limits=1, user_api="blas"):
         for horizon in _GRID_HORIZONS:
-            if f"target_ret_{horizon}d" not in _GRID_PRED.columns:
+            if horizon not in _GRID_PREPARED["targets"]:
                 continue
             metrics = _fast_combo_metrics(
                 _GRID_PREPARED, combo, _GRID_KIND, horizon, _GRID_POSITIVE_ONLY
@@ -828,7 +829,8 @@ def run_grid(predictions: Path, template: Path, output: Path, best_output: Path,
              end_date: str | pd.Timestamp | None = None,
              fixed_params: dict | None = None,
              catboost_weights: list[float] | None = None,
-             neighborhood: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+             neighborhood: dict | None = None,
+             workers: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     predictions, template, output, best_output = (
         Path(predictions), Path(template), Path(output), Path(best_output))
     pred = _load_predictions(predictions, watchlist)
@@ -880,16 +882,21 @@ def run_grid(predictions: Path, template: Path, output: Path, best_output: Path,
     _GRID_POSITIVE_ONLY = positive_only
     _GRID_SOURCE = source
 
+    worker_count = max(int(workers or min(8, os.cpu_count() or 1)), 1)
+    if worker_count > (os.cpu_count() or worker_count):
+        raise ValueError(
+            f"workers={worker_count} exceeds available CPUs={os.cpu_count()}"
+        )
     use_processes = os.name == "posix" and "fork" in mp.get_all_start_methods()
     if use_processes:
         context = mp.get_context("fork")
         executor_cls = ProcessPoolExecutor
-        executor_kwargs = {"max_workers": min(12, os.cpu_count() or 1), "mp_context": context}
+        executor_kwargs = {"max_workers": worker_count, "mp_context": context}
     else:
         executor_cls = ThreadPoolExecutor
-        executor_kwargs = {"max_workers": 12}
+        executor_kwargs = {"max_workers": worker_count}
     with executor_cls(**executor_kwargs) as executor:
-        chunksize = max(1, min(16, len(items) // max((os.cpu_count() or 1) * 8, 1)))
+        chunksize = max(1, min(16, len(items) // max(worker_count * 8, 1)))
         for position, combo_rows in enumerate(
             executor.map(_evaluate_combo_process, items, chunksize=chunksize), start=1
         ):
@@ -922,14 +929,18 @@ def main() -> None:
         help="evaluate every N authoritative exchange sessions; 1 keeps daily evaluation",
     )
     ap.add_argument(
-        "--hold-rank-buffer", type=int, default=0,
-        help="retain held names through top_n + buffer rank; 0 disables hysteresis",
+        "--hold-rank-buffer", type=int, default=None,
+        help="fix held-name rank buffer; omit to search the registered grid dimension",
     )
     ap.add_argument("--kind", choices=["short", "swing"], required=True)
     ap.add_argument("--watchlist", default=config.MAINBOARD_UNIVERSE_FILE)
     ap.add_argument("--start-date", default="", help="inclusive evaluation start date")
     ap.add_argument("--end-date", default="", help="exclusive evaluation end date")
     ap.add_argument("--no-positive-only", action="store_true")
+    ap.add_argument(
+        "--workers", type=int, default=8,
+        help="parallel grid workers; capped by available CPUs (default: 8)",
+    )
     args = ap.parse_args()
 
     predictions = _resolve(args.predictions)
@@ -951,8 +962,12 @@ def main() -> None:
         end_date=args.end_date or None,
         fixed_params={
             "rebalance_stride": max(int(args.rebalance_stride), 1),
-            "hold_rank_buffer": max(int(args.hold_rank_buffer), 0),
+            **(
+                {"hold_rank_buffer": max(int(args.hold_rank_buffer), 0)}
+                if args.hold_rank_buffer is not None else {}
+            ),
         },
+        workers=args.workers,
     )
     print(f"[grid] rows={len(grid)} horizons={sorted(grid['horizon'].dropna().astype(int).unique())} -> {output}", flush=True)
     if not best.empty:
