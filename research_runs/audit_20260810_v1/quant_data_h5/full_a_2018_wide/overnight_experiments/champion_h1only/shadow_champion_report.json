@@ -1,0 +1,1224 @@
+{
+  "promote": true,
+  "candidates_evaluated": 20,
+  "candidates_passed": 2,
+  "selection_range": [
+    "2024-02-02",
+    "2026-01-27"
+  ],
+  "holdout_range": [
+    "2026-01-28",
+    "2026-07-27"
+  ],
+  "incumbent_params": {
+    "lgbm_weight": 0.85,
+    "ic_weight": 0.15,
+    "elastic_weight": 0.2,
+    "extra_trees_weight": 0.1,
+    "top_n": 2,
+    "gross_exposure": 0.3,
+    "slot_weight": 0.15,
+    "ridge_quantile": 0.7,
+    "pred_quantile": 0.55,
+    "naive_weight": 0.1
+  },
+  "best_trial": {
+    "promote": true,
+    "reason": "passed",
+    "avg_sharpe_gain": 0.5627524066148784,
+    "improved_horizons": 1,
+    "common_horizons": 1,
+    "worst_drawdown_change": -0.019730423748690384,
+    "details": [
+      {
+        "horizon": 1,
+        "sharpe_candidate": 4.717028436915264,
+        "sharpe_baseline": 4.154276030300386,
+        "sharpe_gain": 0.5627524066148784,
+        "max_drawdown_candidate": -0.10996823608586703,
+        "max_drawdown_baseline": -0.09023781233717665,
+        "drawdown_change": -0.019730423748690384
+      }
+    ],
+    "daily_gate_passed": true,
+    "stability_gate": {
+      "passed": true,
+      "nonoverlap_improved_horizons": 1,
+      "significant_improved_horizons": 1,
+      "acceptable_horizons": 1,
+      "min_significant_sharpe_gain": 0.5,
+      "max_other_sharpe_decline": 0.5,
+      "common_horizons": 1,
+      "monthly_win_rate": 0.7142857142857143,
+      "monthly_wins": 5,
+      "months": 7,
+      "details": [
+        {
+          "horizon": 1,
+          "nonoverlap_candidate_sharpe": 4.717028436915264,
+          "nonoverlap_baseline_sharpe": 4.154276030300385,
+          "nonoverlap_sharpe_gain": 0.5627524066148792,
+          "significant_improvement": true,
+          "within_allowed_decline": true,
+          "monthly_wins": 5,
+          "months": 7
+        }
+      ]
+    },
+    "selection_rank": 15,
+    "candidate_params": {
+      "lgbm_weight": 0.85,
+      "ic_weight": 0.15,
+      "elastic_weight": 0.2,
+      "extra_trees_weight": 0.1,
+      "top_n": 1,
+      "gross_exposure": 0.3,
+      "slot_weight": 0.3,
+      "ridge_quantile": 0.6,
+      "pred_quantile": 0.65,
+      "naive_weight": 0.2
+    }
+  },
+  "trials": [
+    {
+      "promote": false,
+      "reason": "gain_or_stability_threshold_not_met",
+      "avg_sharpe_gain": -0.04104682684307104,
+      "improved_horizons": 0,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.03177368409818815,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 4.113229203457315,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": -0.04104682684307104,
+          "max_drawdown_candidate": -0.1220114964353648,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.03177368409818815
+        }
+      ],
+      "daily_gate_passed": false,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 0,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.7142857142857143,
+        "monthly_wins": 5,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 4.113229203457315,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": -0.04104682684307015,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 5,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 1,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.7,
+        "pred_quantile": 0.7,
+        "naive_weight": 0.1
+      }
+    },
+    {
+      "promote": false,
+      "reason": "gain_or_stability_threshold_not_met",
+      "avg_sharpe_gain": -0.7199669684085785,
+      "improved_horizons": 0,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.03434942910120775,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 3.434309061891807,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": -0.7199669684085785,
+          "max_drawdown_candidate": -0.1245872414383844,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.03434942910120775
+        }
+      ],
+      "daily_gate_passed": false,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 0,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 0,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.7142857142857143,
+        "monthly_wins": 5,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 3.434309061891807,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": -0.7199669684085777,
+            "significant_improvement": false,
+            "within_allowed_decline": false,
+            "monthly_wins": 5,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 2,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.7,
+        "pred_quantile": 0.7,
+        "naive_weight": 0.0
+      }
+    },
+    {
+      "promote": false,
+      "reason": "gain_or_stability_threshold_not_met",
+      "avg_sharpe_gain": -0.3156871720009704,
+      "improved_horizons": 0,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.046650580848670575,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 3.838588858299415,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": -0.3156871720009704,
+          "max_drawdown_candidate": -0.13688839318584722,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.046650580848670575
+        }
+      ],
+      "daily_gate_passed": false,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 0,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 3.838588858299415,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": -0.3156871720009695,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 3,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.7,
+        "pred_quantile": 0.7,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": false,
+      "reason": "gain_or_stability_threshold_not_met",
+      "avg_sharpe_gain": -0.3159356531431259,
+      "improved_horizons": 0,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.046650580848670575,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 3.8383403771572597,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": -0.3159356531431259,
+          "max_drawdown_candidate": -0.13688839318584722,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.046650580848670575
+        }
+      ],
+      "daily_gate_passed": false,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 0,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 3.8383403771572597,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": -0.315935653143125,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 4,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.7,
+        "pred_quantile": 0.5,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": false,
+      "reason": "gain_or_stability_threshold_not_met",
+      "avg_sharpe_gain": -0.24899780351258682,
+      "improved_horizons": 0,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.046650580848670575,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 3.905278226787799,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": -0.24899780351258682,
+          "max_drawdown_candidate": -0.13688839318584722,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.046650580848670575
+        }
+      ],
+      "daily_gate_passed": false,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 0,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 3.905278226787799,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": -0.24899780351258594,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 5,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.7,
+        "pred_quantile": 0.55,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": false,
+      "reason": "gain_or_stability_threshold_not_met",
+      "avg_sharpe_gain": -0.22075266555147,
+      "improved_horizons": 0,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.029286634365564113,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 3.9335233647489156,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": -0.22075266555147,
+          "max_drawdown_candidate": -0.11952444670274076,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.029286634365564113
+        }
+      ],
+      "daily_gate_passed": false,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 0,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.7142857142857143,
+        "monthly_wins": 5,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 3.9335233647489156,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": -0.2207526655514691,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 5,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 6,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.65,
+        "pred_quantile": null,
+        "naive_weight": 0.0
+      }
+    },
+    {
+      "promote": false,
+      "reason": "gain_or_stability_threshold_not_met",
+      "avg_sharpe_gain": -0.24899780351258682,
+      "improved_horizons": 0,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.046650580848670575,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 3.905278226787799,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": -0.24899780351258682,
+          "max_drawdown_candidate": -0.13688839318584722,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.046650580848670575
+        }
+      ],
+      "daily_gate_passed": false,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 0,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 3.905278226787799,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": -0.24899780351258594,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 7,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.7,
+        "pred_quantile": 0.6,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": false,
+      "reason": "gain_or_stability_threshold_not_met",
+      "avg_sharpe_gain": -0.584841028990335,
+      "improved_horizons": 0,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.019730423748690495,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 3.5694350013100506,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": -0.584841028990335,
+          "max_drawdown_candidate": -0.10996823608586714,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.019730423748690495
+        }
+      ],
+      "daily_gate_passed": false,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 0,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 0,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 3.5694350013100506,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": -0.5848410289903341,
+            "significant_improvement": false,
+            "within_allowed_decline": false,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 8,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.1,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.5,
+        "pred_quantile": 0.7,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": false,
+      "reason": "gain_or_stability_threshold_not_met",
+      "avg_sharpe_gain": -0.584841028990335,
+      "improved_horizons": 0,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.019730423748690495,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 3.5694350013100506,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": -0.584841028990335,
+          "max_drawdown_candidate": -0.10996823608586714,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.019730423748690495
+        }
+      ],
+      "daily_gate_passed": false,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 0,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 0,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 3.5694350013100506,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": -0.5848410289903341,
+            "significant_improvement": false,
+            "within_allowed_decline": false,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 9,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.1,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.5,
+        "pred_quantile": 0.65,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": false,
+      "reason": "stability_threshold_not_met",
+      "avg_sharpe_gain": 0.3445247587895519,
+      "improved_horizons": 1,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.0018249016877435187,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 4.4988007890899375,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": 0.3445247587895519,
+          "max_drawdown_candidate": -0.09206271402492017,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.0018249016877435187
+        }
+      ],
+      "daily_gate_passed": true,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 1,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.7142857142857143,
+        "monthly_wins": 5,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 4.4988007890899375,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": 0.3445247587895528,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 5,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 10,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.6,
+        "pred_quantile": null,
+        "naive_weight": 0.0
+      }
+    },
+    {
+      "promote": false,
+      "reason": "gain_or_stability_threshold_not_met",
+      "avg_sharpe_gain": -0.007696593203117885,
+      "improved_horizons": 0,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.03177368409818815,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 4.146579437097268,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": -0.007696593203117885,
+          "max_drawdown_candidate": -0.1220114964353648,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.03177368409818815
+        }
+      ],
+      "daily_gate_passed": false,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 0,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.7142857142857143,
+        "monthly_wins": 5,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 4.146579437097268,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": -0.007696593203116997,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 5,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 11,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.7,
+        "pred_quantile": 0.65,
+        "naive_weight": 0.1
+      }
+    },
+    {
+      "promote": false,
+      "reason": "stability_threshold_not_met",
+      "avg_sharpe_gain": 0.35619883934516494,
+      "improved_horizons": 1,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.019730423748690384,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 4.5104748696455506,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": 0.35619883934516494,
+          "max_drawdown_candidate": -0.10996823608586703,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.019730423748690384
+        }
+      ],
+      "daily_gate_passed": true,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 1,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 4.5104748696455506,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": 0.35619883934516583,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 12,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.7,
+        "pred_quantile": null,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": false,
+      "reason": "gain_or_stability_threshold_not_met",
+      "avg_sharpe_gain": -0.24571458932844648,
+      "improved_horizons": 0,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.046650580848670575,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 3.908561440971939,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": -0.24571458932844648,
+          "max_drawdown_candidate": -0.13688839318584722,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.046650580848670575
+        }
+      ],
+      "daily_gate_passed": false,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 0,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 3.908561440971939,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": -0.2457145893284456,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 13,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.7,
+        "pred_quantile": 0.65,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": false,
+      "reason": "stability_threshold_not_met",
+      "avg_sharpe_gain": 0.31974126529018143,
+      "improved_horizons": 1,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.019730423748690384,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 4.474017295590567,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": 0.31974126529018143,
+          "max_drawdown_candidate": -0.10996823608586703,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.019730423748690384
+        }
+      ],
+      "daily_gate_passed": true,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 1,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 4.474017295590567,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": 0.3197412652901823,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 14,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.65,
+        "pred_quantile": 0.7,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": true,
+      "reason": "passed",
+      "avg_sharpe_gain": 0.5627524066148784,
+      "improved_horizons": 1,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.019730423748690384,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 4.717028436915264,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": 0.5627524066148784,
+          "max_drawdown_candidate": -0.10996823608586703,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.019730423748690384
+        }
+      ],
+      "daily_gate_passed": true,
+      "stability_gate": {
+        "passed": true,
+        "nonoverlap_improved_horizons": 1,
+        "significant_improved_horizons": 1,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.7142857142857143,
+        "monthly_wins": 5,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 4.717028436915264,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": 0.5627524066148792,
+            "significant_improvement": true,
+            "within_allowed_decline": true,
+            "monthly_wins": 5,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 15,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.6,
+        "pred_quantile": 0.65,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": false,
+      "reason": "stability_threshold_not_met",
+      "avg_sharpe_gain": 0.3542586753107031,
+      "improved_horizons": 1,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.019730423748690384,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 4.508534705611089,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": 0.3542586753107031,
+          "max_drawdown_candidate": -0.10996823608586703,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.019730423748690384
+        }
+      ],
+      "daily_gate_passed": true,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 1,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 4.508534705611089,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": 0.354258675310704,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 16,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.6,
+        "pred_quantile": 0.7,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": true,
+      "reason": "passed",
+      "avg_sharpe_gain": 0.8394866908336365,
+      "improved_horizons": 1,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.004389521654610151,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 4.993762721134022,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": 0.8394866908336365,
+          "max_drawdown_candidate": -0.0946273339917868,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.004389521654610151
+        }
+      ],
+      "daily_gate_passed": true,
+      "stability_gate": {
+        "passed": true,
+        "nonoverlap_improved_horizons": 1,
+        "significant_improved_horizons": 1,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.7142857142857143,
+        "monthly_wins": 5,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 4.993762721134022,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": 0.8394866908336374,
+            "significant_improvement": true,
+            "within_allowed_decline": true,
+            "monthly_wins": 5,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 17,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.6,
+        "pred_quantile": 0.6,
+        "naive_weight": 0.1
+      }
+    },
+    {
+      "promote": false,
+      "reason": "stability_threshold_not_met",
+      "avg_sharpe_gain": 0.4784992248232367,
+      "improved_horizons": 1,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.019730423748690384,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 4.632775255123622,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": 0.4784992248232367,
+          "max_drawdown_candidate": -0.10996823608586703,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.019730423748690384
+        }
+      ],
+      "daily_gate_passed": true,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 1,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 4.632775255123622,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": 0.4784992248232376,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 18,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.65,
+        "pred_quantile": 0.55,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": false,
+      "reason": "stability_threshold_not_met",
+      "avg_sharpe_gain": 0.4784992248232367,
+      "improved_horizons": 1,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.019730423748690384,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 4.632775255123622,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": 0.4784992248232367,
+          "max_drawdown_candidate": -0.10996823608586703,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.019730423748690384
+        }
+      ],
+      "daily_gate_passed": true,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 1,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 4.632775255123622,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": 0.4784992248232376,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 19,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.65,
+        "pred_quantile": 0.5,
+        "naive_weight": 0.2
+      }
+    },
+    {
+      "promote": false,
+      "reason": "stability_threshold_not_met",
+      "avg_sharpe_gain": 0.4784992248232367,
+      "improved_horizons": 1,
+      "common_horizons": 1,
+      "worst_drawdown_change": -0.019730423748690384,
+      "details": [
+        {
+          "horizon": 1,
+          "sharpe_candidate": 4.632775255123622,
+          "sharpe_baseline": 4.154276030300386,
+          "sharpe_gain": 0.4784992248232367,
+          "max_drawdown_candidate": -0.10996823608586703,
+          "max_drawdown_baseline": -0.09023781233717665,
+          "drawdown_change": -0.019730423748690384
+        }
+      ],
+      "daily_gate_passed": true,
+      "stability_gate": {
+        "passed": false,
+        "nonoverlap_improved_horizons": 1,
+        "significant_improved_horizons": 0,
+        "acceptable_horizons": 1,
+        "min_significant_sharpe_gain": 0.5,
+        "max_other_sharpe_decline": 0.5,
+        "common_horizons": 1,
+        "monthly_win_rate": 0.5714285714285714,
+        "monthly_wins": 4,
+        "months": 7,
+        "details": [
+          {
+            "horizon": 1,
+            "nonoverlap_candidate_sharpe": 4.632775255123622,
+            "nonoverlap_baseline_sharpe": 4.154276030300385,
+            "nonoverlap_sharpe_gain": 0.4784992248232376,
+            "significant_improvement": false,
+            "within_allowed_decline": true,
+            "monthly_wins": 4,
+            "months": 7
+          }
+        ]
+      },
+      "selection_rank": 20,
+      "candidate_params": {
+        "lgbm_weight": 0.85,
+        "ic_weight": 0.15,
+        "elastic_weight": 0.2,
+        "extra_trees_weight": 0.1,
+        "top_n": 1,
+        "gross_exposure": 0.3,
+        "slot_weight": 0.3,
+        "ridge_quantile": 0.65,
+        "pred_quantile": 0.6,
+        "naive_weight": 0.2
+      }
+    }
+  ]
+}

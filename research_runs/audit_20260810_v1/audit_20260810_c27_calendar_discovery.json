@@ -1,0 +1,227 @@
+{
+  "data_calendar_candidates": [],
+  "data_calendar_candidate_count": 0,
+  "code_calendar_hits": [
+    [
+      "intraday_1400/structural_combo_experiment.py",
+      10,
+      "from intraday_1400.adaptive_exit_replay import load_trading_calendar"
+    ],
+    [
+      "intraday_1400/structural_combo_experiment.py",
+      192,
+      "calendar = load_trading_calendar(intraday_dir)"
+    ],
+    [
+      "intraday_1400/daily_h1_buyability_enhancement.py",
+      24,
+      "from intraday_1400.adaptive_exit_replay import load_trading_calendar"
+    ],
+    [
+      "intraday_1400/daily_h1_buyability_enhancement.py",
+      238,
+      "dates = validate_historical_dates(labels, load_trading_calendar(intraday_dir))"
+    ],
+    [
+      "intraday_1400/daily_h1_executable_payoff.py",
+      12,
+      "from intraday_1400.adaptive_exit_replay import load_trading_calendar"
+    ],
+    [
+      "intraday_1400/daily_h1_executable_payoff.py",
+      200,
+      "labels = combine_historical_labels(label_paths); dates = validate_historical_dates(labels, load_trading_calendar(intraday_dir)); folds = registered_folds(dates)"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      14,
+      "from intraday_1400.adaptive_exit_replay import load_trading_calendar"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      164,
+      "trading_calendar: pd.DatetimeIndex,"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      187,
+      "trading_calendar, DEVELOPMENT_START, DEVELOPMENT_END, DEVELOPMENT_DAYS"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      190,
+      "trading_calendar, CALIBRATION_START, CALIBRATION_END, CALIBRATION_DAYS"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      203,
+      "trading_calendar: pd.DatetimeIndex,"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      210,
+      "expected = _registered_dates(trading_calendar, HOLDOUT_START, HOLDOUT_END, HOLDOUT_DAYS)"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      239,
+      "calendar = load_trading_calendar(Path(prepared_dir or config.PREPARED_DIR))"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      465,
+      "trading_calendar = load_trading_calendar(intraday_dir)"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      466,
+      "split = validate_selection_labels(base_labels, selection_labels, trading_calendar)"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      719,
+      "trading_calendar = load_trading_calendar(intraday_dir)"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      720,
+      "holdout_dates = validate_holdout_labels(holdout_labels, trading_calendar)"
+    ],
+    [
+      "intraday_1400/direct_return_experiment.py",
+      736,
+      "validate_selection_labels(base_labels, selection_labels, trading_calendar)"
+    ],
+    [
+      "intraday_1400/target_redesign_backfill.py",
+      17,
+      "from intraday_1400.adaptive_exit_replay import load_trading_calendar"
+    ],
+    [
+      "intraday_1400/target_redesign_backfill.py",
+      171,
+      "trading_calendar: pd.DatetimeIndex,"
+    ],
+    [
+      "intraday_1400/target_redesign_backfill.py",
+      174,
+      "calendar = pd.DatetimeIndex(trading_calendar).normalize().drop_duplicates().sort_values()"
+    ],
+    [
+      "intraday_1400/target_redesign_backfill.py",
+      530,
+      "trading_calendar = load_trading_calendar(intraday_dir)"
+    ],
+    [
+      "intraday_1400/target_redesign_backfill.py",
+      531,
+      "dates = validate_historical_dates(labels, trading_calendar)"
+    ],
+    [
+      "intraday_1400/minute_feature_residualization.py",
+      26,
+      "from intraday_1400.adaptive_exit_replay import load_trading_calendar"
+    ],
+    [
+      "intraday_1400/minute_feature_residualization.py",
+      326,
+      "dates = validate_historical_dates(labels, load_trading_calendar(intraday_dir))"
+    ],
+    [
+      "intraday_1400/target_redesign.py",
+      12,
+      "from intraday_1400.adaptive_exit_replay import load_trading_calendar"
+    ],
+    [
+      "intraday_1400/target_redesign.py",
+      178,
+      "trading_calendar: pd.DatetimeIndex,"
+    ],
+    [
+      "intraday_1400/target_redesign.py",
+      182,
+      "calendar = pd.DatetimeIndex(trading_calendar).normalize().drop_duplicates().sort_values()"
+    ],
+    [
+      "intraday_1400/target_redesign.py",
+      242,
+      "def split_manifest(split: dict, trading_calendar: pd.DatetimeIndex) -> dict:"
+    ],
+    [
+      "intraday_1400/target_redesign.py",
+      248,
+      "calendar = pd.DatetimeIndex(trading_calendar).normalize().drop_duplicates().sort_values()"
+    ],
+    [
+      "intraday_1400/target_redesign.py",
+      262,
+      "\"trading_calendar_evidence\": {"
+    ],
+    [
+      "intraday_1400/target_redesign.py",
+      403,
+      "calendar_evidence = manifest.get(\"trading_calendar_evidence\", {})"
+    ],
+    [
+      "intraday_1400/target_redesign.py",
+      465,
+      "calendar = load_trading_calendar(prepared_path)"
+    ],
+    [
+      "intraday_1400/adaptive_label_pipeline.py",
+      16,
+      "load_trading_calendar,"
+    ],
+    [
+      "intraday_1400/adaptive_label_pipeline.py",
+      144,
+      "calendar = load_trading_calendar(prepared_dir)"
+    ],
+    [
+      "intraday_1400/adaptive_exit_replay.py",
+      41,
+      "def load_trading_calendar(prepared_dir: Path) -> pd.DatetimeIndex:"
+    ],
+    [
+      "intraday_1400/adaptive_exit_replay.py",
+      304,
+      "calendar = load_trading_calendar(prepared_dir)"
+    ],
+    [
+      "intraday_1400/structural_combo_holdout.py",
+      10,
+      "from intraday_1400.adaptive_exit_replay import load_trading_calendar"
+    ],
+    [
+      "intraday_1400/structural_combo_holdout.py",
+      249,
+      "calendar = load_trading_calendar(intraday_dir)"
+    ],
+    [
+      "intraday_1400/structural_combo.py",
+      134,
+      "trading_calendar: pd.DatetimeIndex,"
+    ],
+    [
+      "intraday_1400/structural_combo.py",
+      137,
+      "dates = pd.DatetimeIndex(trading_calendar).normalize().drop_duplicates().sort_values()"
+    ],
+    [
+      "intraday_1400/daily_minute_enhancement.py",
+      39,
+      "from intraday_1400.adaptive_exit_replay import load_trading_calendar"
+    ],
+    [
+      "intraday_1400/daily_minute_enhancement.py",
+      568,
+      "dates = validate_historical_dates(labels, load_trading_calendar(intraday_dir))"
+    ],
+    [
+      "realtime/reference.py",
+      353,
+      "Path(_qc.QUANT_DIR) / \"trading_calendar.parquet\"))"
+    ]
+  ],
+  "code_calendar_hit_count": 44
+}

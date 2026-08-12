@@ -1,0 +1,23 @@
+[
+  {
+    "threads": 1,
+    "seconds": 4.0533011659863405,
+    "ok": false,
+    "message": "\u8bad\u7ec3\u3001\u9a8c\u8bc1\u6216\u9884\u6d4b\u6837\u672c\u4e0d\u8db3",
+    "metrics": {}
+  },
+  {
+    "threads": 4,
+    "seconds": 3.78876314900117,
+    "ok": false,
+    "message": "\u8bad\u7ec3\u3001\u9a8c\u8bc1\u6216\u9884\u6d4b\u6837\u672c\u4e0d\u8db3",
+    "metrics": {}
+  },
+  {
+    "threads": 8,
+    "seconds": 3.570952357025817,
+    "ok": false,
+    "message": "\u8bad\u7ec3\u3001\u9a8c\u8bc1\u6216\u9884\u6d4b\u6837\u672c\u4e0d\u8db3",
+    "metrics": {}
+  }
+]

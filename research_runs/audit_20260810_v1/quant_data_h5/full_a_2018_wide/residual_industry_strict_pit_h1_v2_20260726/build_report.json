@@ -1,0 +1,542 @@
+{
+  "mode": "strict_pit_industry",
+  "publishable": true,
+  "industry_meta": null,
+  "industry_history": "/app/snapshots/sw_industry_history_pit.parquet",
+  "industry_updated_at": "2026-07-17T00:00:00",
+  "source": "scheduled_dual_short_swing_ne200_es40_short_h1_bt_ridge_lightgbm_ranker_ensemble_predictions.parquet",
+  "rows": 1435269,
+  "date_min": "2024-08-02",
+  "date_max": "2026-07-24",
+  "coverage": 1.0,
+  "windows": [
+    {
+      "test_start": "2024-08-02",
+      "test_end": "2024-09-01",
+      "train_end": "2024-06-28",
+      "valid_end": "2024-07-31",
+      "factors": 16,
+      "rows": 63135,
+      "metrics": {
+        "n": 63135,
+        "rank_ic": -0.05619052736894864,
+        "mse": 0.006798989108502344,
+        "top_mean_return": -0.002795702204866676,
+        "all_mean_return": -0.0017547317991229697,
+        "best_iteration": 6,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2024-09-02",
+      "test_end": "2024-10-01",
+      "train_end": "2024-07-31",
+      "valid_end": "2024-08-29",
+      "factors": 16,
+      "rows": 57083,
+      "metrics": {
+        "n": 57083,
+        "rank_ic": 0.016616546962790697,
+        "mse": 0.042552376527792875,
+        "top_mean_return": 0.016046825269642323,
+        "all_mean_return": 0.013447255222322334,
+        "best_iteration": 12,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2024-10-02",
+      "test_end": "2024-11-01",
+      "train_end": "2024-08-29",
+      "valid_end": "2024-09-27",
+      "factors": 16,
+      "rows": 57047,
+      "metrics": {
+        "n": 57047,
+        "rank_ic": -0.01898560563873933,
+        "mse": 0.232000151475746,
+        "top_mean_return": 0.0013966934577013981,
+        "all_mean_return": 0.000572316221713768,
+        "best_iteration": 38,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2024-11-02",
+      "test_end": "2024-12-01",
+      "train_end": "2024-09-27",
+      "valid_end": "2024-10-31",
+      "factors": 16,
+      "rows": 60004,
+      "metrics": {
+        "n": 60004,
+        "rank_ic": -0.06455361575885946,
+        "mse": 0.17636988707398335,
+        "top_mean_return": 0.001784687154578026,
+        "all_mean_return": 0.0038177818134904934,
+        "best_iteration": 27,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2024-12-02",
+      "test_end": "2025-01-01",
+      "train_end": "2024-10-31",
+      "valid_end": "2024-11-28",
+      "factors": 16,
+      "rows": 65974,
+      "metrics": {
+        "n": 65974,
+        "rank_ic": -0.061392008442290924,
+        "mse": 0.37828006619860466,
+        "top_mean_return": -0.00476584216121927,
+        "all_mean_return": -0.003020227043643765,
+        "best_iteration": 48,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-01-02",
+      "test_end": "2025-02-01",
+      "train_end": "2024-11-28",
+      "valid_end": "2024-12-30",
+      "factors": 16,
+      "rows": 54028,
+      "metrics": {
+        "n": 54028,
+        "rank_ic": -0.0436494621746476,
+        "mse": 0.21836020641175846,
+        "top_mean_return": -0.0010165035646098259,
+        "all_mean_return": 0.0001817965106098516,
+        "best_iteration": 27,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-02-02",
+      "test_end": "2025-03-01",
+      "train_end": "2024-12-30",
+      "valid_end": "2025-01-24",
+      "factors": 16,
+      "rows": 54096,
+      "metrics": {
+        "n": 54096,
+        "rank_ic": 0.021677739364888437,
+        "mse": 0.0022357799172880084,
+        "top_mean_return": 0.004558328193513108,
+        "all_mean_return": 0.0029757117520232525,
+        "best_iteration": 3,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-03-02",
+      "test_end": "2025-04-01",
+      "train_end": "2025-01-24",
+      "valid_end": "2025-02-27",
+      "factors": 17,
+      "rows": 66077,
+      "metrics": {
+        "n": 66077,
+        "rank_ic": -0.04966894326181374,
+        "mse": 0.4362860893364715,
+        "top_mean_return": -0.0003045270152996693,
+        "all_mean_return": 0.0007480667178704435,
+        "best_iteration": 54,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-04-02",
+      "test_end": "2025-05-01",
+      "train_end": "2025-02-27",
+      "valid_end": "2025-03-31",
+      "factors": 17,
+      "rows": 60043,
+      "metrics": {
+        "n": 60043,
+        "rank_ic": -0.02193708232287196,
+        "mse": 0.49071425274063185,
+        "top_mean_return": -0.0009382525452443546,
+        "all_mean_return": 4.5980972085972715e-05,
+        "best_iteration": 60,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-05-02",
+      "test_end": "2025-06-01",
+      "train_end": "2025-03-31",
+      "valid_end": "2025-04-29",
+      "factors": 17,
+      "rows": 57037,
+      "metrics": {
+        "n": 57037,
+        "rank_ic": -0.019303773894910812,
+        "mse": 0.003129853063957628,
+        "top_mean_return": 0.0030446998002081676,
+        "all_mean_return": 0.0018168677815947804,
+        "best_iteration": 4,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-06-02",
+      "test_end": "2025-07-01",
+      "train_end": "2025-04-29",
+      "valid_end": "2025-05-29",
+      "factors": 16,
+      "rows": 63035,
+      "metrics": {
+        "n": 63035,
+        "rank_ic": -0.05397064290554107,
+        "mse": 0.024658083953115462,
+        "top_mean_return": 0.00125615706196474,
+        "all_mean_return": 0.0019671358085100537,
+        "best_iteration": 8,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-07-02",
+      "test_end": "2025-08-01",
+      "train_end": "2025-05-29",
+      "valid_end": "2025-06-30",
+      "factors": 17,
+      "rows": 69050,
+      "metrics": {
+        "n": 69050,
+        "rank_ic": -0.04534336116197227,
+        "mse": 0.008776041269616916,
+        "top_mean_return": 0.0023514684598564535,
+        "all_mean_return": 0.002215659248143572,
+        "best_iteration": 5,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-08-02",
+      "test_end": "2025-09-01",
+      "train_end": "2025-06-30",
+      "valid_end": "2025-07-31",
+      "factors": 17,
+      "rows": 63073,
+      "metrics": {
+        "n": 63073,
+        "rank_ic": -0.02523674606005318,
+        "mse": 0.05594797234606531,
+        "top_mean_return": 0.004056249056531814,
+        "all_mean_return": 0.0026734468771205267,
+        "best_iteration": 13,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-09-02",
+      "test_end": "2025-10-01",
+      "train_end": "2025-07-31",
+      "valid_end": "2025-08-29",
+      "factors": 16,
+      "rows": 63104,
+      "metrics": {
+        "n": 63104,
+        "rank_ic": -0.021110387451925398,
+        "mse": 0.046160905999251704,
+        "top_mean_return": 0.0016893323376837126,
+        "all_mean_return": 0.0010310629518263607,
+        "best_iteration": 12,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-10-02",
+      "test_end": "2025-11-01",
+      "train_end": "2025-08-29",
+      "valid_end": "2025-09-29",
+      "factors": 17,
+      "rows": 51047,
+      "metrics": {
+        "n": 51047,
+        "rank_ic": -0.04112952063305364,
+        "mse": 0.33434791684132126,
+        "top_mean_return": 0.0006958947510342318,
+        "all_mean_return": 0.0015699079925679657,
+        "best_iteration": 37,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-11-02",
+      "test_end": "2025-12-01",
+      "train_end": "2025-09-29",
+      "valid_end": "2025-10-30",
+      "factors": 17,
+      "rows": 63049,
+      "metrics": {
+        "n": 63049,
+        "rank_ic": -0.030633003496883734,
+        "mse": 0.022513571576969107,
+        "top_mean_return": 2.552210852089745e-05,
+        "all_mean_return": -3.889412647789661e-06,
+        "best_iteration": 8,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2025-12-02",
+      "test_end": "2026-01-01",
+      "train_end": "2025-10-30",
+      "valid_end": "2025-11-28",
+      "factors": 17,
+      "rows": 66020,
+      "metrics": {
+        "n": 66020,
+        "rank_ic": -0.03204329150340603,
+        "mse": 0.3098783941808603,
+        "top_mean_return": 0.0012484398665979768,
+        "all_mean_return": 0.001034174818029262,
+        "best_iteration": 38,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2026-01-02",
+      "test_end": "2026-02-01",
+      "train_end": "2025-11-28",
+      "valid_end": "2025-12-30",
+      "factors": 17,
+      "rows": 60024,
+      "metrics": {
+        "n": 60024,
+        "rank_ic": -0.018485984248695703,
+        "mse": 0.02118560032125691,
+        "top_mean_return": 0.0013908663460044778,
+        "all_mean_return": 0.0015544550292024759,
+        "best_iteration": 7,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2026-02-02",
+      "test_end": "2026-03-01",
+      "train_end": "2025-12-30",
+      "valid_end": "2026-01-29",
+      "factors": 18,
+      "rows": 42055,
+      "metrics": {
+        "n": 42055,
+        "rank_ic": 0.004221719432468253,
+        "mse": 0.3195297848598292,
+        "top_mean_return": 0.005161807174820388,
+        "all_mean_return": 0.0035500036925763794,
+        "best_iteration": 42,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2026-03-02",
+      "test_end": "2026-04-01",
+      "train_end": "2026-01-29",
+      "valid_end": "2026-02-26",
+      "factors": 18,
+      "rows": 69057,
+      "metrics": {
+        "n": 69057,
+        "rank_ic": -0.039884454652441025,
+        "mse": 0.012011626403763184,
+        "top_mean_return": -0.003950576488321577,
+        "all_mean_return": -0.002972256179837595,
+        "best_iteration": 6,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2026-04-02",
+      "test_end": "2026-05-01",
+      "train_end": "2026-02-26",
+      "valid_end": "2026-03-31",
+      "factors": 18,
+      "rows": 59990,
+      "metrics": {
+        "n": 59990,
+        "rank_ic": -0.006361296457905989,
+        "mse": 0.07831242629148728,
+        "top_mean_return": 0.004111409348770252,
+        "all_mean_return": 0.0028192939710183678,
+        "best_iteration": 14,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2026-05-02",
+      "test_end": "2026-06-01",
+      "train_end": "2026-03-31",
+      "valid_end": "2026-04-29",
+      "factors": 18,
+      "rows": 57098,
+      "metrics": {
+        "n": 57098,
+        "rank_ic": -0.0020899438886502414,
+        "mse": 0.11599817739068755,
+        "top_mean_return": -0.0004988383093929396,
+        "all_mean_return": -0.002665189609803588,
+        "best_iteration": 18,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2026-06-02",
+      "test_end": "2026-07-01",
+      "train_end": "2026-04-29",
+      "valid_end": "2026-05-29",
+      "factors": 18,
+      "rows": 63056,
+      "metrics": {
+        "n": 63056,
+        "rank_ic": 0.002987357602924239,
+        "mse": 0.05958222385820714,
+        "top_mean_return": -0.00016454769561997655,
+        "all_mean_return": -0.0030543686585084956,
+        "best_iteration": 12,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    },
+    {
+      "test_start": "2026-07-02",
+      "test_end": "2026-07-24",
+      "train_end": "2026-05-29",
+      "valid_end": "2026-06-30",
+      "factors": 18,
+      "rows": 51087,
+      "metrics": {
+        "n": 48079,
+        "rank_ic": -0.12028954954163183,
+        "mse": 0.005264300182296909,
+        "top_mean_return": -0.012058933488750135,
+        "all_mean_return": -0.0057297476245655,
+        "best_iteration": 4,
+        "decay_half_life_days": 60.0,
+        "min_weight": 0.03,
+        "rank_bins": 5,
+        "eval_at": [
+          1
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "audit": "github_snapshot_vs_isolated_source",
+  "date": "2026-08-11",
+  "git": {
+    "root": "/www/A",
+    "head": "feb2208ed63375d629757e70a3b75dabc1dce044",
+    "origin_main": "feb2208ed63375d629757e70a3b75dabc1dce044",
+    "isolated_source": "/www/A/research_runs/audit_20260810_v1/source"
+  },
+  "symbol_counts": {
+    "require_calendar": {"git_root": 0, "isolated": 7},
+    "strict_execution_labels": {"git_root": 0, "isolated": 5},
+    "min_adv20": {"git_root": 0, "isolated": 7},
+    "pit_index_code": {"git_root": 0, "isolated": 2},
+    "refresh_pit_reference_data": {"git_root": 0, "isolated": 5},
+    "resolve_pit_window_universe": {"git_root": 0, "isolated": 5},
+    "strict_announcement_lag": {"git_root": 0, "isolated": 5},
+    "require_adjustment_factor": {"git_root": 0, "isolated": 8},
+    "require_status": {"git_root": 0, "isolated": 7},
+    "include_trading_gap_risk": {"git_root": 0, "isolated": 5},
+    "min_listing_sessions": {"git_root": 0, "isolated": 7},
+    "strict_calendar_factors": {"git_root": 0, "isolated": 5},
+    "get_index_constituent": {"git_root": 0, "isolated": 3},
+    "get_history_stock_status": {"git_root": 0, "isolated": 3},
+    "trading_status_history": {"git_root": 0, "isolated": 9}
+  },
+  "file_sha256": {
+    "intraday_1400/fair_race_pipeline.py": {"git_root": "85b08c49d3accbdd51970acc537d3db6edb31272aa504ddada810c6a9bfefd24", "isolated": "534554cdc5dd8150a74b4a94de0ebf92a42e45141d8610ce0a792efc96ed0a57"},
+    "quant/full_train_batched.py": {"git_root": "6ef049ba03f270fa663cfa33c192b157636be18ec8f181386e896e3c130c8ed6", "isolated": "2e3b9317263fa7303b1d4961001c1e4370ee337e1b40f1e0e6b9fdde0c36e02e"},
+    "quant/tradability.py": {"git_root": "751e974c5ca4eb524c560bca911e3720bc02412264292f7d4a1884913dcf9140", "isolated": "c2169c502de90305b2d4ea3e6c1981d82f36e5d3b81d61f177333f4680455a45"},
+    "quant/datafeed.py": {"git_root": "014e56c8ff790914724087cfabf96e2868ba1b45e75a3736d310cc027e1f790a", "isolated": "f23cdf0f3c42b062a863153489ee38486c2fda6af197221c319a8b24c63e6196"},
+    "intraday_1400/collector.py": {"git_root": "9b454b592cf679cd897076807b3f2bcd658443a9f9aa43aee02d60d13ab4af11", "isolated": "9d2fe73fc8996dd96e875766c86d2445570a59006b6e1b1e8cfb24c5df0e212b"},
+    "stock_analyzer/amazingdata_source.py": {"git_root": "34f1fec813c8916e024be03b01cc1ff66fa215c46b61c384c1f0836352f3a746", "isolated": "e9becf2dc18d71a82ba878399ccabb806b0d12f6afa4da324db48e79d7583cf6"},
+    "stock_analyzer/sentiment_signal.py": {"git_root": "d7edc8b22ae1ef34c7eb1d236f66549989a6fc3436a799272edb321944c725f0", "isolated": "73da47fae641b05f5d78200fc3b6759c76ecfea14d2aea0db4b740f34d582309"},
+    "quant/factors/engineering.py": {"git_root": "adeb71c475c76822b2a8b42e9b87ee519a369a8a35c831dd82c5dbb86f6dff26", "isolated": "de4c3e74d5986f444dd70eea271acf5d6f5e23bdc8dbc9a1b10b238f0ad91fdd"}
+  },
+  "conclusion": "The GitHub snapshot contains reports and checklists but not the matching isolated framework source. It is valid for report-data review only, not code-status review."
+}

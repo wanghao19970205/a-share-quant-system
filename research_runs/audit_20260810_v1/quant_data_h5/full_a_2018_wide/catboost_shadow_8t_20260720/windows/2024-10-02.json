@@ -1,0 +1,21 @@
+{
+  "test_start": "2024-10-02",
+  "test_end": "2024-11-01",
+  "train_end": "2024-08-27",
+  "valid_end": "2024-09-25",
+  "factors": 17,
+  "rows": 57028,
+  "metrics": {
+    "n": 57028,
+    "rank_ic": 0.05239890248438718,
+    "mse": 0.004537102533487703,
+    "top_mean_return": 0.017002561642596906,
+    "all_mean_return": 0.012817577592061759,
+    "best_iteration": 5,
+    "n_train_rows": 297496,
+    "max_train_rows": 300000,
+    "n_jobs": 8,
+    "decay_half_life_days": 60.0,
+    "min_weight": 0.03
+  }
+}

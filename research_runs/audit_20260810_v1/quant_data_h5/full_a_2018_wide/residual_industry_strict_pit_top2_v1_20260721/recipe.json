@@ -1,0 +1,25 @@
+{
+  "mode": "strict_pit_industry",
+  "source": "/app/data/scheduled_dual_short_swing_ne200_es40_short_h3_bt_ridge_lightgbm_ranker_ensemble_predictions.parquet",
+  "audit": "/app/data/factor_audit_recent24_h3_factor_audit.parquet",
+  "prepared_dir": "/app/data/factor_panel_full_a_cont_h3_parts/prepared_monthly",
+  "model": "lightgbm_ranker",
+  "target": "target_ret_3d",
+  "exposure_columns": [
+    "log_mv_total",
+    "volatility_20",
+    "ret_20d"
+  ],
+  "threads": 8,
+  "n_estimators": 200,
+  "learning_rate": 0.03,
+  "early_stopping_rounds": 40,
+  "industry_meta": null,
+  "industry_history": "/app/snapshots/sw_industry_history_pit.parquet",
+  "industry_shrinkage": 20.0,
+  "rank_bins": 10,
+  "eval_at": [
+    2
+  ],
+  "publishable": true
+}

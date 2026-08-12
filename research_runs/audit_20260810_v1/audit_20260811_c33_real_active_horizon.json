@@ -1,0 +1,97 @@
+{
+  "audit": "c33_real_active_prediction_horizon",
+  "manifest": "/app/quant_data/full_a_2018_wide/active_quant_model.json",
+  "requested_horizons": {
+    "short_1_3": 1,
+    "swing_7_15": 10
+  },
+  "corrected_prediction_horizons": {
+    "short_1_3": 1,
+    "swing_7_15": 1
+  },
+  "short": {
+    "path": "/app/quant_data/full_a_2018_wide/active_quant_short_predictions.parquet",
+    "shape": [
+      1819978,
+      18
+    ],
+    "columns": [
+      "code",
+      "date",
+      "target_ret_3d",
+      "pred",
+      "model",
+      "ridge_pred",
+      "lgbm_pred",
+      "ic_pred",
+      "base_pred",
+      "ic_z",
+      "elastic_pred",
+      "elastic_z",
+      "extra_trees_pred",
+      "extra_trees_z",
+      "volatility_10",
+      "turnover",
+      "rule_score",
+      "target_ret_1d"
+    ],
+    "date_min": "2024-02-02 00:00:00",
+    "date_max": "2026-08-07 00:00:00",
+    "sha256": "ff34ba8f47311f0956617150263edf2f296f8e2020b49a690d403df70a9e5e7d"
+  },
+  "swing": {
+    "path": "/app/quant_data/full_a_2018_wide/active_quant_swing_predictions.parquet",
+    "shape": [
+      6983002,
+      18
+    ],
+    "columns": [
+      "code",
+      "date",
+      "target_ret_3d",
+      "pred",
+      "model",
+      "ridge_pred",
+      "lgbm_pred",
+      "ic_pred",
+      "base_pred",
+      "ic_z",
+      "volatility_10",
+      "turnover",
+      "rule_score",
+      "elastic_pred",
+      "elastic_z",
+      "extra_trees_pred",
+      "extra_trees_z",
+      "target_ret_1d"
+    ],
+    "date_min": "2020-02-03 00:00:00",
+    "date_max": "2026-08-07 00:00:00",
+    "sha256": "e6953933989335625934408811e463c9ebabc993799fa83ef9694c1788c1a109"
+  },
+  "latest_overlap": {
+    "date": "2026-08-07 00:00:00",
+    "short_rows": 3011,
+    "swing_rows": 3011,
+    "common_rows": 3011,
+    "compare_columns": [
+      "pred",
+      "ridge_pred",
+      "lgbm_pred",
+      "ic_pred",
+      "base_pred",
+      "elastic_pred",
+      "extra_trees_pred"
+    ],
+    "column_matches": {
+      "pred": true,
+      "ridge_pred": true,
+      "lgbm_pred": true,
+      "ic_pred": true,
+      "base_pred": true,
+      "elastic_pred": true,
+      "extra_trees_pred": true
+    }
+  },
+  "passed": true
+}

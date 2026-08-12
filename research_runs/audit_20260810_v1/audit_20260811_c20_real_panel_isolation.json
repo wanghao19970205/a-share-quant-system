@@ -1,0 +1,47 @@
+{
+  "audit": "c20_real_panel_variant_isolation",
+  "pandas_version": "3.0.5",
+  "daily_path": "/app/quant_data/full_a_2018_wide/factor_panel_mainboard_active_h1_parts/prepared_monthly/2026-07.parquet",
+  "daily_shape": [
+    69126,
+    70
+  ],
+  "intraday_path": "/app/intraday_1400_data/prepared_monthly/2026-07.parquet",
+  "intraday_shape": [
+    73321,
+    191
+  ],
+  "merged_shape": [
+    69113,
+    24
+  ],
+  "date_min": "2026-07-01 00:00:00",
+  "date_max": "2026-07-31 00:00:00",
+  "groups": {
+    "daily": [
+      "daily__ret_1d",
+      "daily__ret_3d"
+    ],
+    "asof": [
+      "asof__ret_1d",
+      "asof__ret_3d"
+    ],
+    "minute": [
+      "minute__m5_ret_15m"
+    ],
+    "daily_matched": [
+      "daily__ret_1d",
+      "daily__ret_3d"
+    ],
+    "asof_matched": [
+      "asof__ret_1d",
+      "asof__ret_3d"
+    ]
+  },
+  "result_is_distinct_object": true,
+  "daily_target_matches": true,
+  "daily_excess_centered": true,
+  "parent_target_unchanged_after_result_mutation": true,
+  "parent_feature_unchanged_after_result_mutation": true,
+  "passed": true
+}

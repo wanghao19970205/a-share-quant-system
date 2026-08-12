@@ -1,0 +1,139 @@
+{
+  "selection_range": [
+    "2024-08-02",
+    "2026-01-13"
+  ],
+  "holdout_range": [
+    "2026-01-14",
+    "2026-07-13"
+  ],
+  "candidate_weights": [
+    0.7,
+    0.85,
+    1.0
+  ],
+  "selected_weights": {
+    "down_or_weak__high_vol": 0.7,
+    "down_or_weak__normal_vol": 0.7,
+    "insufficient_history": 1.0,
+    "up__normal_vol": 0.85
+  },
+  "regime_counts": {
+    "down_or_weak__high_vol": 138,
+    "down_or_weak__normal_vol": 184,
+    "insufficient_history": 81,
+    "up__high_vol": 6,
+    "up__normal_vol": 60
+  },
+  "holdout_baseline": [
+    {
+      "horizon": 1,
+      "periods": 118,
+      "total_return": 0.9314714669503992,
+      "annual_return": 3.0788816890997923,
+      "annual_vol": 0.1822965166096475,
+      "sharpe": 16.889415916227396,
+      "max_drawdown": -0.03341526147056528,
+      "win_rate": 0.6864406779661016
+    },
+    {
+      "horizon": 2,
+      "periods": 118,
+      "total_return": 1.2725463883333563,
+      "annual_return": 1.4026090766103958,
+      "annual_vol": 0.18103331302282835,
+      "sharpe": 7.747795437149882,
+      "max_drawdown": -0.04763478933349585,
+      "win_rate": 0.6186440677966102
+    },
+    {
+      "horizon": 3,
+      "periods": 115,
+      "total_return": 1.636082980844693,
+      "annual_return": 1.0299397692245358,
+      "annual_vol": 0.1791817759752766,
+      "sharpe": 5.748016301427029,
+      "max_drawdown": -0.04946280984234597,
+      "win_rate": 0.6260869565217392
+    }
+  ],
+  "holdout_adaptive": [
+    {
+      "horizon": 1,
+      "periods": 118,
+      "total_return": 0.8321119216659312,
+      "annual_return": 2.6438333801996277,
+      "annual_vol": 0.18362089322669728,
+      "sharpe": 14.398325450555163,
+      "max_drawdown": -0.04605842158092899,
+      "win_rate": 0.6610169491525424
+    },
+    {
+      "horizon": 2,
+      "periods": 118,
+      "total_return": 1.2563784816648256,
+      "annual_return": 1.3843613945698365,
+      "annual_vol": 0.1834443385682361,
+      "sharpe": 7.546492878301029,
+      "max_drawdown": -0.05845691850293311,
+      "win_rate": 0.6101694915254238
+    },
+    {
+      "horizon": 3,
+      "periods": 115,
+      "total_return": 1.4261379586427085,
+      "annual_return": 0.9105379303263574,
+      "annual_vol": 0.17507323448918063,
+      "sharpe": 5.200897401496445,
+      "max_drawdown": -0.059852563610337084,
+      "win_rate": 0.6260869565217392
+    }
+  ],
+  "avg_sharpe_gain": -1.0798373081505563,
+  "improved_horizons": 0,
+  "stability_gate": {
+    "passed": false,
+    "nonoverlap_improved_horizons": 0,
+    "significant_improved_horizons": 0,
+    "acceptable_horizons": 1,
+    "min_significant_sharpe_gain": 0.5,
+    "max_other_sharpe_decline": 0.5,
+    "common_horizons": 3,
+    "monthly_win_rate": 0.47619047619047616,
+    "monthly_wins": 10,
+    "months": 21,
+    "details": [
+      {
+        "horizon": 1,
+        "nonoverlap_candidate_sharpe": 14.398325450555163,
+        "nonoverlap_baseline_sharpe": 16.889415916227396,
+        "nonoverlap_sharpe_gain": -2.491090465672233,
+        "significant_improvement": false,
+        "within_allowed_decline": false,
+        "monthly_wins": 3,
+        "months": 7
+      },
+      {
+        "horizon": 2,
+        "nonoverlap_candidate_sharpe": 8.836583470577915,
+        "nonoverlap_baseline_sharpe": 9.505440916111809,
+        "nonoverlap_sharpe_gain": -0.6688574455338934,
+        "significant_improvement": false,
+        "within_allowed_decline": false,
+        "monthly_wins": 5,
+        "months": 7
+      },
+      {
+        "horizon": 3,
+        "nonoverlap_candidate_sharpe": 7.401181948960565,
+        "nonoverlap_baseline_sharpe": 7.579073404772446,
+        "nonoverlap_sharpe_gain": -0.17789145581188137,
+        "significant_improvement": false,
+        "within_allowed_decline": true,
+        "monthly_wins": 2,
+        "months": 7
+      }
+    ]
+  },
+  "passed": false
+}

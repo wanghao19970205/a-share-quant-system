@@ -1,0 +1,27 @@
+{
+  "symbols": [
+    "600000",
+    "000001",
+    "300750"
+  ],
+  "results": [
+    {
+      "symbol": "600000",
+      "broker_code": "600000.SH",
+      "returned": false,
+      "shape": null
+    },
+    {
+      "symbol": "000001",
+      "broker_code": "000001.SZ",
+      "returned": false,
+      "shape": null
+    },
+    {
+      "symbol": "300750",
+      "broker_code": "300750.SZ",
+      "returned": false,
+      "shape": null
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "mode": "strict_pit",
+  "source": "/app/quant_data/full_a_2018_wide/extra_trees_recent24_h3_bt_ridge_lightgbm_ranker_ensemble_predictions.parquet",
+  "audit": "/app/quant_data/full_a_2018_wide/extra_trees_recent24_h3_factor_audit.parquet",
+  "prepared_dir": "/app/quant_data/full_a_2018_wide/factor_panel_mainboard_active_h3_parts/prepared_monthly",
+  "model": "lightgbm_ranker",
+  "target": "target_ret_3d",
+  "exposure_columns": [
+    "log_mv_total",
+    "volatility_20",
+    "ret_20d"
+  ],
+  "threads": 8,
+  "n_estimators": 200,
+  "learning_rate": 0.03,
+  "early_stopping_rounds": 40
+}

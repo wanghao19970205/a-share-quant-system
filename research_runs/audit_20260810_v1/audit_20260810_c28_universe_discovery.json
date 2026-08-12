@@ -1,0 +1,13 @@
+{
+  "candidate_count": 2,
+  "candidates": [
+    {
+      "path": "full_a_universe.txt",
+      "size": 38804
+    },
+    {
+      "path": "mainboard_active_universe.txt",
+      "size": 62440
+    }
+  ]
+}
