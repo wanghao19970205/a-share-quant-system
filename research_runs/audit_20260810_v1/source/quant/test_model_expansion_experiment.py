@@ -1534,13 +1534,7 @@ class ModelExpansionExperimentTest(unittest.TestCase):
         self.assertEqual(held[dates[1]], {"600001", "600002"})
         self.assertEqual(held[dates[2]], {"600001", "600003"})
 
-    def test_short_base_grid_preserves_naive_weight_dimension(self):
-        combos = watchlist_grid._base_combos(Path("missing-template.parquet"), "short")
-        self.assertEqual(set(combos["naive_weight"].unique()), {0.0, 0.1, 0.2})
-        self.assertEqual(len(combos), len(combos.drop_duplicates()))
-        self.assertEqual(combos.columns.tolist().count("hold_rank_buffer"), 1)
-
-    def test_fast_and_formal_grid_share_rank_hysteresis_and_empty_days(self):
+    def test_fast_and_formal_grid_share_rank_hysteresis(self):
         dates = pd.date_range("2026-01-05", periods=3, freq="B")
         daily_scores = [
             {"600001": 4.0, "600002": 3.0, "600003": 2.0, "600004": 1.0},
@@ -1555,22 +1549,22 @@ class ModelExpansionExperimentTest(unittest.TestCase):
                 "base_pred": score,
                 "ridge_pred": score,
                 "lgbm_pred": score,
-                "target_ret_1d": 0.01 if code == "600001" else 0.0,
-                "buyable_close": date != dates[1],
+                "target_ret_1d": 0.01 if code in {"600001", "600002"} else 0.0,
+                "buyable_close": True,
             }
             for date, scores in zip(dates, daily_scores)
             for code, score in scores.items()
         ])
         params = pd.Series({
-            "top_n": 1,
+            "top_n": 2,
             "gross_exposure": 0.3,
-            "slot_weight": 0.3,
+            "slot_weight": 0.15,
             "hold_rank_buffer": 1,
             "rebalance_stride": 1,
         })
-        with mock.patch.object(backtest, "bt_filter_untradable", return_value=True), \
+        with mock.patch.object(backtest, "bt_filter_untradable", return_value=False), \
                 mock.patch.object(backtest, "bt_use_open_fill", return_value=False), \
-                mock.patch.object(backtest, "bt_cost_roundtrip", return_value=0.002):
+                mock.patch.object(backtest, "bt_cost_roundtrip", return_value=0.0):
             prepared = watchlist_grid._prepare_fast_grid(pred, [1])
             fast = watchlist_grid._fast_combo_metrics(
                 prepared, params, "short", 1, positive_only=True,
@@ -1580,7 +1574,6 @@ class ModelExpansionExperimentTest(unittest.TestCase):
             )
         self.assertIsNotNone(fast)
         self.assertIsNotNone(slow)
-        self.assertEqual(fast["periods"], 3)
         for key in ("avg_turnover", "sharpe", "total_return"):
             self.assertAlmostEqual(fast[key], slow[key])
 

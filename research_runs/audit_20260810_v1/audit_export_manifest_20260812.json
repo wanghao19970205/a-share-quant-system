@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "source_commit": "d93451c1a6103d3672785814076d0909908d93f2",
+  "purpose": "Reproducible C42-C44 audit source and validation evidence",
+  "source_files": {
+    "quant/backtest.py": "34509787594875a7b2b9769d7342bed175070cefd4f8a40983a8b0e915de3ebf",
+    "quant/watchlist_grid.py": "e231cd4bed66a559e75ed52c895a1919a81e54d540e363cd80eac96120279706",
+    "quant/full_train_batched.py": "a73dfe86c59ecbec727bf4051ef398cf1aa031bbb993cb417393acbfd9c38943",
+    "quant/model.py": "5cf7ae9089388ea2326236093b39c732d19ab028bcc69cc6564a2dbadb083b66",
+    "quant/test_model_expansion_experiment.py": "4fd92357f48462f106939eab6afb337c6bbf0c665158941fed26eed8ec5a5b38"
+  },
+  "evidence_files": {
+    "research_runs/audit_20260810_v1/audit_20260811_weighted_turnover_cost_validation.json": "fe646d5962bcc6e1bf20c3fed05c1a6876e43ac019757f407ac90af61f6cfe27",
+    "research_runs/audit_20260810_v1/audit_20260811_rebalance_stride_validation.json": "82b9fcd1d13d8983fa25a78d191a041df4a007db512d9c2064cae34075f02c5d",
+    "research_runs/audit_20260810_v1/audit_20260811_portfolio_hysteresis_validation.json": "ceda9210267fa7e98783e318cc356d7a1761dbaa84c1836d0b14d65954b0208e"
+  },
+  "validation": {
+    "environment": "isolated remote Docker stock-scheduler:latest",
+    "production_data_read_only": true,
+    "local_tests_run": false,
+    "model_expansion_tests": "138/138 passed",
+    "real_prediction_shadow": "strict tradability, weighted stock-plus-cash turnover and 20bp cost validated",
+    "production_publication": false,
+    "alpha_claim": false
+  }
+}

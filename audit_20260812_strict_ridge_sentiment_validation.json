@@ -167,6 +167,35 @@
     "decision": "keep_disabled_under_this_protocol",
     "prohibited_claim": "sentiment_is_generally_useless"
   },
+  "rolling_ridge_provenance_v2": {
+    "artifact_prefix": "ridge_only_strict_rolling_provenance_20260812_9w_v2",
+    "windows": 9,
+    "candidate_counts": [67, 67, 67, 67, 67, 67, 67, 67, 67],
+    "selected_counts": [30, 30, 30, 30, 30, 30, 30, 30, 30],
+    "label_col": "tradable_ret_1d",
+    "purge_span": 3,
+    "selection_manifest_rows": 9,
+    "selection_manifest_unique_hashes": 9,
+    "lightgbm_skipped_windows": 9,
+    "prediction_rows": 115165,
+    "prediction_non_null": 115165,
+    "lgbm_prediction_non_null": 0,
+    "total_return": 0.49843988004684614,
+    "annual_return": 0.784364507239047,
+    "sharpe": 3.5333828207941935,
+    "max_drawdown": -0.10380384943167564,
+    "avg_turnover": 0.2551136363636364,
+    "selection_manifest_sha256": "5916e762f800b2c80c9695cc90ba12adb9214d417a9d44223c2014450a20fe18",
+    "summary_sha256": "93b2a19f9be50dde90896a015af4444aa4600a44fe8e5783b90f1b26c28e4ec9",
+    "predictions_sha256": "a469cee2bfce103a0d48347d509b99050d3752ad37576344acc20cc21c59a410",
+    "pit_manifest_sha256": "40a7a1f8330885f39fd05dbe5b789b40ad400434ae106af07d9e5ed95a09f246",
+    "comparison_to_fixed_33_factors": {
+      "total_return_fixed": 0.3822949334621355,
+      "sharpe_fixed": 2.8665092172338453,
+      "avg_turnover_fixed": 0.1954545454545455,
+      "interpretation": "promising directional evidence, not promotion evidence until independent control and provenance review"
+    }
+  },
   "ridge_only": {
     "protocol": {
       "output_prefix": "ridge_only_strict_20260812_h1_csi1000_confirm_9w",

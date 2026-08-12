@@ -162,9 +162,10 @@ def _base_combos(path: Path, kind: str) -> pd.DataFrame:
                                     "gross_exposure": gross,
                                     "slot_weight": gross / top_n,
                                     "ridge_quantile": rq,
-                                    "pred_quantile": pq,
-                                    "naive_weight": naive,
-                                    "rebalance_stride": 1,
+                        "pred_quantile": pq,
+                        "rebalance_stride": 1,
+                        "hold_rank_buffer": 0,
+
                                     "hold_rank_buffer": 0,
                                 })
         standard = pd.DataFrame(rows)
@@ -293,6 +294,8 @@ def _prepare_fast_grid(pred: pd.DataFrame, horizons: list[int]) -> dict:
     buyable = None
     if filter_untradable:
         buy_col = "buyable_next" if use_open else "buyable_close"
+        if buy_col not in pred.columns and "buyable_next" in pred.columns:
+            buy_col = "buyable_next"
         if buy_col not in pred.columns:
             raise ValueError(
                 f"严格可交易网格缺少 {buy_col}；不能静默降级到乐观口径"
@@ -387,11 +390,6 @@ def _fast_combo_metrics(prepared: dict, row: pd.Series, kind: str, horizon: int,
     stride_indices = _prepared_stride_indices(prepared, stride)
     score = score[stride_indices]
     target = target[stride_indices]
-    evaluable_dates = (np.isfinite(score) & np.isfinite(target)).any(axis=1)
-    if not evaluable_dates.any():
-        return None
-    score = score[evaluable_dates]
-    target = target[evaluable_dates]
     top_n = int(row.get("top_n", 3)) if kind == "short" else 3
     raw_max_weight = row.get("slot_weight", row.get("max_weight", 1.0 / max(top_n, 1))) if kind == "short" else row.get("max_weight", 1.0 / max(top_n, 1))
     max_weight = float(raw_max_weight) if _empty_to_none(raw_max_weight) is not None else 1.0 / max(top_n, 1)
@@ -408,13 +406,14 @@ def _fast_combo_metrics(prepared: dict, row: pd.Series, kind: str, horizon: int,
         mask &= score > 0
     buyable = prepared.get("buyable")
     if buyable is not None:
-        buyable = buyable[stride_indices][evaluable_dates]
+        buyable = buyable[stride_indices]
+        mask &= buyable
     mask = _apply_row_quantile(mask, score, float(pred_quantile) if pred_quantile is not None else None)
-    ridge = prepared["ridge"][stride_indices][evaluable_dates]
+    ridge = prepared["ridge"][stride_indices]
     if ridge_quantile is not None and np.isfinite(ridge).any():
         ridge_mask = mask & np.isfinite(ridge)
         mask = _apply_row_quantile(ridge_mask, ridge, float(ridge_quantile))
-    if not np.isfinite(score).any() or not np.isfinite(target).any():
+    if not mask.any():
         return None
 
     n_pick = min(max(top_n, 1), score.shape[1])
@@ -452,13 +451,21 @@ def _fast_combo_metrics(prepared: dict, row: pd.Series, kind: str, horizon: int,
         pick_bool[row_idx, order] = picked
     counts = pick_bool.sum(axis=1)
     weights = np.minimum(max_weight, gross_exposure / np.maximum(counts, 1))
+    if kind == "short":
+        weights = np.minimum(weights, 0.15)
+    valid_rows = counts > 0
+    if not valid_rows.any():
+        return None
     stock_weights = pick_bool.astype(float) * weights[:, None]
-    ret = np.nansum(target * stock_weights, axis=1)
+    active_weights = stock_weights[valid_rows]
+    picked_target = target[valid_rows]
+    picked = pick_bool[valid_rows]
+    ret = np.nansum(picked_target * active_weights, axis=1)
     previous_weights = np.vstack([
-        np.zeros((1, stock_weights.shape[1]), dtype=float),
-        stock_weights[:-1],
+        np.zeros((1, active_weights.shape[1]), dtype=float),
+        active_weights[:-1],
     ])
-    turnover = backtest._weight_turnover(previous_weights, stock_weights)
+    turnover = backtest._weight_turnover(previous_weights, active_weights)
 
     # 计提调仓成本（按换手比例）；QUANT_BT_COST_ROUNDTRIP=0 时忽略
     _cost = backtest.bt_cost_roundtrip()
@@ -468,10 +475,10 @@ def _fast_combo_metrics(prepared: dict, row: pd.Series, kind: str, horizon: int,
     metrics = _evaluate_returns(pd.Series(ret), horizon, rebalance_stride=stride)
     if not metrics:
         return None
-    all_targets = target[pick_bool]
+    all_targets = picked_target[picked]
     metrics["direction_win_rate"] = float((all_targets > 0).mean()) if all_targets.size else np.nan
     metrics["avg_turnover"] = float(turnover.mean()) if turnover.size else np.nan
-    metrics["avg_holdings"] = float(counts.mean())
+    metrics["avg_holdings"] = float(counts[valid_rows].mean())
     return metrics
 
 
