@@ -520,19 +520,26 @@ def _purged_end_by_code(
 class DailyICCache:
     """Reuse date-local factor IC values across windows and process restarts."""
 
-    def __init__(self, workers: int = 8, cache_dir: Path | None = None):
+    def __init__(
+        self,
+        workers: int = 8,
+        cache_dir: Path | None = None,
+        recipe_signature: str = "legacy-v1",
+    ):
         self.workers = max(int(workers), 1)
         self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.recipe_signature = str(recipe_signature)
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._frames: dict[tuple[int, str, tuple[str, ...]], pd.DataFrame] = {}
+        self._frames: dict[tuple[str, int, str, tuple[str, ...]], pd.DataFrame] = {}
 
-    def _path(self, key: tuple[int, str, tuple[str, ...]]) -> Path | None:
-        if self.cache_dir is None:
-            return None
-        horizon, target, factors = key
-        payload = "|".join([str(horizon), target, *factors]).encode("utf-8")
-        return self.cache_dir / f"{hashlib.sha256(payload).hexdigest()}.parquet"
+    def _path(self, key: tuple[str, int, str, tuple[str, ...]]) -> Path | None:
+        recipe_signature, horizon, target, factors = key
+        payload = "|".join([recipe_signature, str(horizon), target, *factors]).encode("utf-8")
+        return (
+            self.cache_dir / f"{hashlib.sha256(payload).hexdigest()}.parquet"
+            if self.cache_dir is not None else None
+        )
 
     def get(
         self,
@@ -543,7 +550,7 @@ class DailyICCache:
     ) -> tuple[pd.DataFrame, int, int]:
         use = tuple(factors)
         target = label_col or f"target_ret_{horizon}d"
-        key = (int(horizon), target, use)
+        key = (self.recipe_signature, int(horizon), target, use)
         desired_dates = pd.Index(pd.to_datetime(train["date"], errors="coerce").dropna().unique())
         cached = self._frames.get(key)
         if cached is None:
@@ -1169,6 +1176,7 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                   random_forest_weight: float = 0.0,
                   rebalance_stride: int = 1,
                   hold_rank_buffer: int = 0,
+                  min_window_completion_ratio: float = 0.90,
                   ridge_only: bool = False,
                   require_selection_provenance: bool = False) -> pd.DataFrame:
     _, _, prepared_dir = _panel_dirs(name)
@@ -1251,14 +1259,11 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
     rolling_selection_manifest_rows: list[dict] = []
     pit_manifest_rows: list[dict] = []
     selected_counts: list[int] = []
+    requested_purge_windows = 0
+    skipped_purge_windows = 0
     side_cols = ["volatility_10", "turnover", "rule_score"]
     windows = 0
     month_cache = MonthFrameCache(month_cache_size)
-    daily_ic_cache = DailyICCache(
-        workers=min(model_threads or 8, 8),
-        cache_dir=(Path(window_cache_dir) / "factor_ic") if window_cache_dir else None,
-    )
-
     recipe_sig = None
     legacy_recipe_sig = None
     cache_dir = None
@@ -1271,6 +1276,12 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         enforce_c30_gates=enforce_c30_gates,
         min_adv20=min_adv20,
         min_listing_sessions=min_listing_sessions,
+    )
+    ic_recipe_signature = _canonical_sha256(label_recipe_params or {"recipe": "baseline"})
+    daily_ic_cache = DailyICCache(
+        workers=min(model_threads or 8, 8),
+        cache_dir=(Path(window_cache_dir) / "factor_ic") if window_cache_dir else None,
+        recipe_signature=ic_recipe_signature,
     )
     expected_status_signature = label_recipe_params.get(
         "trading_status_source_signature"
@@ -1437,7 +1448,11 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         else:
             train_end_ts = valid_start - pd.Timedelta(days=1)
             valid_end_ts = current - pd.Timedelta(days=1)
+        if purge_horizon:
+            requested_purge_windows += 1
         if train_end_ts is None or valid_end_ts is None or valid_end_ts < valid_start:
+            if purge_horizon:
+                skipped_purge_windows += 1
             print(f"[train] window={windows} skipped: purge leaves insufficient train/valid dates", flush=True)
             windows += 1
             current = test_end
@@ -1797,6 +1812,20 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         gc.collect()
         current = test_end
 
+    if purge_horizon:
+        completed_purge_windows = requested_purge_windows - skipped_purge_windows
+        completion_ratio = (
+            completed_purge_windows / requested_purge_windows
+            if requested_purge_windows else 1.0
+        )
+        if completion_ratio < float(min_window_completion_ratio):
+            raise RuntimeError(
+                "purge window completion ratio below threshold: "
+                f"completed={completed_purge_windows} "
+                f"requested={requested_purge_windows} "
+                f"ratio={completion_ratio:.3f} "
+                f"threshold={float(min_window_completion_ratio):.3f}"
+            )
     if month_cache.max_months > 0:
         print(f"[train:cache] final {month_cache.stats()}", flush=True)
     if cache_dir is not None:
@@ -1840,6 +1869,13 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
     summary["max_selected_factors"] = int(max(selected_counts)) if selected_counts else int(len(factors))
     summary["rolling_factor_select"] = bool(rolling_factor_select)
     summary["purge_horizon"] = bool(purge_horizon)
+    summary["purge_windows_requested"] = int(requested_purge_windows)
+    summary["purge_windows_skipped"] = int(skipped_purge_windows)
+    summary["purge_window_completion_ratio"] = (
+        (requested_purge_windows - skipped_purge_windows) / requested_purge_windows
+        if requested_purge_windows else 1.0
+    )
+    summary["min_window_completion_ratio"] = float(min_window_completion_ratio)
     summary["recent_windows"] = int(recent_windows)
     summary["expanding_train"] = bool(expanding_train)
     summary["elastic_net"] = bool(elastic_net)

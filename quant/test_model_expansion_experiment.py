@@ -26,6 +26,7 @@ from quant import shadow_leg_evaluation
 from quant import warehouse
 from quant import watchlist_grid
 from quant.factors import engineering
+from realtime import weight_shadow
 from stock_analyzer import amazingdata_source, sentiment_signal
 
 
@@ -1345,6 +1346,24 @@ class ModelExpansionExperimentTest(unittest.TestCase):
             _, hits, misses = second.get(panel, ["factor"], 1)
         self.assertEqual((hits, misses), (2, 0))
 
+    def test_daily_ic_cache_separates_label_recipe_signatures(self):
+        panel = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-05"] * 6),
+            "factor": np.arange(6, dtype=float),
+            "target_ret_1d": np.arange(6, dtype=float),
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            first = full_train_batched.DailyICCache(
+                workers=1, cache_dir=Path(temporary), recipe_signature="recipe-a"
+            )
+            _, hits, misses = first.get(panel, ["factor"], 1)
+            self.assertEqual((hits, misses), (0, 1))
+            second = full_train_batched.DailyICCache(
+                workers=1, cache_dir=Path(temporary), recipe_signature="recipe-b"
+            )
+            _, hits, misses = second.get(panel, ["factor"], 1)
+        self.assertEqual((hits, misses), (0, 1))
+
     def test_rebalance_stride_uses_source_date_calendar_without_rephasing(self):
         dates = pd.bdate_range("2026-01-05", periods=5)
         pred = pd.DataFrame({
@@ -2499,6 +2518,23 @@ class FutureLabelFeatureSafetyTest(unittest.TestCase):
             ) = original_state
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["horizon"], 1)
+
+    def test_weight_shadow_falls_back_from_empty_target_to_tradable_label(self):
+        frame = pd.DataFrame({
+            "target_ret_1d": [np.nan, np.nan],
+            "tradable_ret_1d": [0.01, 0.02],
+        })
+        normalized, source = weight_shadow._normalize_target_column(frame)
+        self.assertEqual(source, "tradable_ret_1d")
+        self.assertEqual(normalized["target_ret_1d"].tolist(), [0.01, 0.02])
+
+    def test_weight_shadow_rejects_sources_without_realized_targets(self):
+        frame = pd.DataFrame({
+            "target_ret_1d": [np.nan],
+            "tradable_ret_1d": [np.nan],
+        })
+        with self.assertRaisesRegex(ValueError, "no realized target values"):
+            weight_shadow._normalize_target_column(frame)
 
     def test_feature_columns_exclude_all_horizon_targets_and_execution_labels(self):
         panel = pd.DataFrame({

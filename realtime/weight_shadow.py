@@ -27,6 +27,23 @@ from .weight_manifest import (append_history, atomic_write_json,
 MODEL_COLUMNS = ("ridge_pred", "elastic_pred", "extra_trees_pred")
 BASELINE_WEIGHTS = np.array([0.30, 0.20, 0.50], dtype=float)
 TARGET_COLUMN = "target_ret_1d"
+TARGET_CANDIDATES = (TARGET_COLUMN, "tradable_ret_1d", "open_ret_1d")
+
+
+def _normalize_target_column(frame: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    for column in TARGET_CANDIDATES:
+        if column not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if not values.notna().any():
+            continue
+        normalized = frame.copy()
+        normalized[TARGET_COLUMN] = values
+        return normalized, column
+    raise ValueError(
+        "weight shadow source has no realized target values in "
+        f"{list(TARGET_CANDIDATES)}"
+    )
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -240,10 +257,11 @@ def evaluate(predictions_file: Path, output_dir: Path, train_days: int = 60,
     source = Path(predictions_file).resolve()
     output = Path(output_dir).resolve()
     frame = pd.read_parquet(source)
-    required = {"code", "date", TARGET_COLUMN, *MODEL_COLUMNS}
+    required = {"code", "date", *MODEL_COLUMNS}
     missing = sorted(required - set(frame.columns))
     if missing:
         raise ValueError(f"weight shadow source missing columns: {missing}")
+    frame, target_column = _normalize_target_column(frame)
     baseline_weights = _normalize(baseline_weights)
     result = walk_forward(frame, train_days=train_days,
                           rebalance_days=rebalance_days, cost=cost,
@@ -266,7 +284,7 @@ def evaluate(predictions_file: Path, output_dir: Path, train_days: int = 60,
         "train_days": int(train_days), "min_oos_days": int(min_oos_days),
         "rebalance_days": int(rebalance_days), "workers": int(workers),
         "cost_roundtrip": float(cost),
-        "models": list(MODEL_COLUMNS), "target": TARGET_COLUMN,
+        "models": list(MODEL_COLUMNS), "target": target_column,
         "baseline_weights": dict(zip(MODEL_COLUMNS, map(float, baseline_weights))),
         "optimizer_objective": "clipped_cross_section_mse",
         "evaluation_strategy": "top10_equal_weight_daily",
@@ -438,10 +456,11 @@ def _maybe_rollback(cfg: RealtimeConfig, frame: pd.DataFrame,
 def run_routine(cfg: RealtimeConfig) -> dict:
     source = Path(cfg.weight_shadow_predictions_file)
     frame = pd.read_parquet(source)
-    required = {"code", "date", TARGET_COLUMN, *MODEL_COLUMNS}
+    required = {"code", "date", *MODEL_COLUMNS}
     missing = sorted(required - set(frame.columns))
     if missing:
         raise ValueError(f"weight shadow source missing columns: {missing}")
+    frame, _ = _normalize_target_column(frame)
     current_weights, active = _current_weights(cfg)
     rollback = _maybe_rollback(cfg, frame, active)
     if rollback is not None:
