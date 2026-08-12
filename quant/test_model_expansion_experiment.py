@@ -1375,9 +1375,9 @@ class ModelExpansionExperimentTest(unittest.TestCase):
     def test_base_grid_searches_stride_and_hold_buffer(self):
         short = watchlist_grid._base_combos(Path("missing-template.parquet"), "short")
         swing = watchlist_grid._base_combos(Path("missing-template.parquet"), "swing")
-        self.assertEqual(set(short["rebalance_stride"]), {1, 2, 3})
+        self.assertEqual(set(short["rebalance_stride"]), {1})
         self.assertEqual(set(short["hold_rank_buffer"]), {0, 1, 2})
-        self.assertEqual(set(swing["rebalance_stride"]), {1, 2, 3})
+        self.assertEqual(set(swing["rebalance_stride"]), {1})
         self.assertEqual(set(swing["hold_rank_buffer"]), {0, 1, 2})
 
     def test_watchlist_stride_defaults_daily_and_uses_authoritative_calendar(self):

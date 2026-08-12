@@ -156,19 +156,18 @@ def _base_combos(path: Path, kind: str) -> pd.DataFrame:
                     for rq in (0.45, 0.50, 0.55, 0.60, 0.65, 0.70):
                         for pq in (None, 0.50, 0.55, 0.60, 0.65, 0.70):
                                 for naive in (0.0, 0.1, 0.2):
-                                    for stride in (1, 2, 3):
-                                        for buffer in (0, 1, 2):
-                                            rows.append({
-                                                "ic_weight": ic,
-                                                "top_n": top_n,
-                                                "gross_exposure": gross,
-                                                "slot_weight": gross / top_n,
-                                                "ridge_quantile": rq,
-                                                "pred_quantile": pq,
-                                                "naive_weight": naive,
-                                                "rebalance_stride": stride,
-                                                "hold_rank_buffer": buffer,
-                                            })
+                                    for buffer in (0, 1, 2):
+                                        rows.append({
+                                            "ic_weight": ic,
+                                            "top_n": top_n,
+                                            "gross_exposure": gross,
+                                            "slot_weight": gross / top_n,
+                                            "ridge_quantile": rq,
+                                            "pred_quantile": pq,
+                                            "naive_weight": naive,
+                                            "rebalance_stride": 1,
+                                            "hold_rank_buffer": buffer,
+                                        })
         standard = pd.DataFrame(rows)
         if template.empty:
             return standard
@@ -178,14 +177,13 @@ def _base_combos(path: Path, kind: str) -> pd.DataFrame:
         for mw in (0.07, 0.08, 0.09, 0.10):
             for rq in (0.30, 0.35, 0.40, 0.45):
                 for pq in (None, 0.55, 0.60):
-                    for stride in (1, 2, 3):
-                        for buffer in (0, 1, 2):
-                            rows.append({
-                                "ic_weight": ic, "max_weight": mw,
-                                "ridge_quantile": rq, "pred_quantile": pq,
-                                "rebalance_stride": stride,
-                                "hold_rank_buffer": buffer,
-                            })
+                    for buffer in (0, 1, 2):
+                        rows.append({
+                            "ic_weight": ic, "max_weight": mw,
+                            "ridge_quantile": rq, "pred_quantile": pq,
+                            "rebalance_stride": 1,
+                            "hold_rank_buffer": buffer,
+                        })
     standard = pd.DataFrame(rows)
     if template.empty:
         return standard
