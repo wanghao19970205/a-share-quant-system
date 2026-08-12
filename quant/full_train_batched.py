@@ -1425,7 +1425,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                 expected_status_signature=expected_status_signature,
             )
         factors_in_window = [f for f in factors if f in window.columns]
-        _reject_unsafe_factors(factors_in_window, f"training window {windows}")
+        candidate_factors = list(factors_in_window)
+        _reject_unsafe_factors(candidate_factors, f"training window {windows}")
         purge_span = _purge_span(train_target_mode, horizon)
         if purge_horizon and strict_execution_labels:
             train_end_ts = _purged_end_by_calendar(valid_start, purge_span)
@@ -1459,7 +1460,7 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                 _rolling_selection_manifest_row(
                     windows, train_start, train_end_ts, valid_start, valid_end_ts,
                     current, test_end, ab_label_col or f"target_ret_{horizon}d",
-                    factors_in_window, picked, purge_span,
+                    candidate_factors, picked, purge_span,
                 )
             )
             if not audit.empty:

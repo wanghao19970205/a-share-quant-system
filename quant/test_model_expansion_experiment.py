@@ -3143,6 +3143,7 @@ class FutureLabelFeatureSafetyTest(unittest.TestCase):
         self.assertEqual(row["purge_span"], 5)
         self.assertEqual(row["candidate_count"], 2)
         self.assertEqual(row["selected_count"], 1)
+        self.assertNotEqual(row["candidate_pool_sha256"], row["selected_sha256"])
         self.assertEqual(len(row["candidate_pool_sha256"]), 64)
         self.assertEqual(len(row["selected_sha256"]), 64)
         self.assertEqual(len(row["generator_code_sha256"]), 64)
