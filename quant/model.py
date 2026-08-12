@@ -806,14 +806,16 @@ def train_catboost_ranker(panel: pd.DataFrame, features: list[str], horizon: int
                           decay_half_life_days: float | None = 90.0, min_weight: float = 0.05,
                           n_estimators: int = 200, learning_rate: float | None = None,
                           early_stopping_rounds: int = 50, n_jobs: int | None = None,
-                          max_train_rows: int = 0) -> TrainResult:
+                          max_train_rows: int = 0, label_col: str | None = None,
+                          train_mask_col: str | None = None) -> TrainResult:
     try:
         from catboost import CatBoostRanker, Pool
     except Exception as e:  # noqa: BLE001
         return TrainResult("catboost_ranker", False, f"缺少 catboost：{e}", {}, pd.DataFrame())
-    target = f"target_ret_{horizon}d"
+    target = label_col or f"target_ret_{horizon}d"
     train, valid, predict_df = _split_train_valid_predict(
         panel, train_end=train_end, valid_end=valid_end, predict_start=predict_start)
+    train = _apply_train_mask(train, train_mask_col)
     train_sub, x, y, _, qid, _ = _rank_xy(train, features, target)
     valid_sub, xv, yv, _, valid_qid, yv_raw = _rank_xy(valid, features, target)
     pred_sub, xp, yp_raw = _rank_predict_x(predict_df, features, target)

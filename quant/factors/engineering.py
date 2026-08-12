@@ -13,7 +13,9 @@ from __future__ import annotations
 import os
 import re
 import time
+from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -134,10 +136,42 @@ def _first_col(df: pd.DataFrame, patterns: list[str]) -> str | None:
     return None
 
 
+@lru_cache(maxsize=4)
+def _calendar_dates_cached(path: str, size: int, mtime_ns: int) -> pd.DatetimeIndex:
+    del size, mtime_ns
+    calendar = pd.read_parquet(path)
+    if calendar.empty or list(calendar.columns) != ["date"]:
+        raise RuntimeError("authoritative trading calendar unavailable or malformed")
+    dates = pd.to_datetime(calendar["date"], errors="coerce").astype("datetime64[ns]")
+    if dates.isna().any() or dates.duplicated().any() or not dates.is_monotonic_increasing:
+        raise ValueError("authoritative trading calendar must be unique and increasing")
+    return pd.DatetimeIndex(dates)
+
+
+def _align_price_factor_sessions(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DatetimeIndex]:
+    path = Path(config.TRADING_CALENDAR_FILE)
+    if not path.is_file():
+        raise RuntimeError(f"authoritative trading calendar unavailable: {path}")
+    stat = path.stat()
+    dates = _calendar_dates_cached(str(path), int(stat.st_size), int(stat.st_mtime_ns))
+    observed = pd.DatetimeIndex(df["date"].dropna().unique()).sort_values()
+    if observed.empty or not observed.isin(dates).all():
+        raise RuntimeError("price dates absent from authoritative trading calendar")
+    sessions = dates[(dates >= observed.min()) & (dates <= observed.max())]
+    code = str(df["code"].dropna().iloc[0]).zfill(6)
+    aligned = pd.DataFrame({"date": sessions}).merge(
+        df.drop(columns=["code"]), on="date", how="left", validate="one_to_one",
+    )
+    aligned.insert(0, "code", code)
+    return aligned, observed
+
+
 def _price_factors(
     code: str,
     start_date: pd.Timestamp | None = None,
     warmup_rows: int = 0,
+    retain_previous_row: bool = False,
+    strict_calendar_factors: bool = False,
 ) -> pd.DataFrame:
     # EWM-based indicators carry recursive state, so compute from full history and
     # only trim the emitted rows. This preserves exact full-panel factor values.
@@ -152,11 +186,15 @@ def _price_factors(
     for c in _PRICE_COLS:
         if c in df.columns:
             df[c] = _num(df[c])
+    observed_dates = None
+    if strict_calendar_factors:
+        df, observed_dates = _align_price_factor_sessions(df)
 
     close = df["close"]
-    df["ret_1d"] = close.pct_change()
+    pct_change_kwargs = {"fill_method": None} if strict_calendar_factors else {}
+    df["ret_1d"] = close.pct_change(**pct_change_kwargs)
     for n in (3, 5, 10, 20, 60):
-        df[f"ret_{n}d"] = close.pct_change(n)
+        df[f"ret_{n}d"] = close.pct_change(n, **pct_change_kwargs)
         df[f"ma_gap_{n}"] = close / close.rolling(n).mean() - 1
     for n in (5, 10, 20):
         df[f"volatility_{n}"] = df["ret_1d"].rolling(n).std()
@@ -177,9 +215,13 @@ def _price_factors(
     if "high" in df.columns and "low" in df.columns:
         df["intraday_range"] = (df["high"] - df["low"]) / close.replace(0, np.nan)
     if "turnover" in df.columns:
-        df["turnover_chg_5"] = df["turnover"].pct_change(5)
+        df["turnover_chg_5"] = df["turnover"].pct_change(
+            5, **pct_change_kwargs
+        )
     if "amount" in df.columns:
-        df["amount_chg_5"] = df["amount"].pct_change(5)
+        df["amount_chg_5"] = df["amount"].pct_change(
+            5, **pct_change_kwargs
+        )
     # 隔夜跳空因子（factor family C，2026-07 并入）：close[D-1]->open[D] 的隔夜跳空，
     # 在 close[D] 收盘前决策时已实现（生产口径=当日收盘前买入、T+1 卖出），PIT 安全、无前视。
     # 仅并入去前视诊断确认携带信号的 3 个"干净"因子（不含 close[D]，与 target 无共享价格）；
@@ -191,8 +233,14 @@ def _price_factors(
         df["ovn_gap_vol_20d"] = ovn_gap.rolling(20, min_periods=5).std()
     df["rule_score"] = _technical_rule_score(df)
     df["rule_score_chg_5"] = df["rule_score"] - df["rule_score"].shift(5)
+    if observed_dates is not None:
+        df = df[df["date"].isin(observed_dates)].copy()
     if start_date is not None:
-        df = df[df["date"] >= pd.Timestamp(start_date)].copy()
+        start = pd.Timestamp(start_date)
+        current = df[df["date"] >= start]
+        if retain_previous_row:
+            current = pd.concat([df[df["date"] < start].tail(1), current])
+        df = current.copy()
 
     return df[["code", "date", "close"] + [c for c in df.columns if c not in {"code", "date", "close"}]]
 
@@ -217,7 +265,27 @@ def _valuation_factors(code: str, start_date: pd.Timestamp | None = None) -> pd.
     return df[keep].drop_duplicates(["code", "date"], keep="last")
 
 
-def _asof_report_factor(name: str, prefix: str, codes: set[str]) -> pd.DataFrame:
+def _next_authoritative_session(values: pd.Series) -> pd.Series:
+    path = Path(config.TRADING_CALENDAR_FILE)
+    if not path.is_file():
+        raise RuntimeError(f"authoritative trading calendar unavailable: {path}")
+    stat = path.stat()
+    dates = _calendar_dates_cached(str(path), int(stat.st_size), int(stat.st_mtime_ns))
+    announcements = pd.to_datetime(values, errors="coerce").astype("datetime64[ns]")
+    positions = dates.searchsorted(announcements, side="right")
+    result = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns]")
+    valid = announcements.notna() & (positions < len(dates))
+    if valid.any():
+        result.loc[valid] = dates.take(positions[valid])
+    return result
+
+
+def _asof_report_factor(
+    name: str,
+    prefix: str,
+    codes: set[str],
+    strict_announcement_lag: bool = False,
+) -> pd.DataFrame:
     df = warehouse.load(name)
     if df.empty or "code" not in df.columns:
         return pd.DataFrame()
@@ -225,8 +293,12 @@ def _asof_report_factor(name: str, prefix: str, codes: set[str]) -> pd.DataFrame
     if df.empty:
         return pd.DataFrame()
     if "ann_date" not in df.columns:
-        df["ann_date"] = df.get("report_date")
-    df["date"] = pd.to_datetime(df["ann_date"], errors="coerce")
+        return pd.DataFrame()
+    df["date"] = (
+        _next_authoritative_session(df["ann_date"])
+        if strict_announcement_lag
+        else pd.to_datetime(df["ann_date"], errors="coerce")
+    )
     df = df.dropna(subset=["code", "date"])
 
     aliases = {
@@ -286,7 +358,10 @@ def _event_counts(name: str, codes: set[str], prefix: str) -> pd.DataFrame:
     return out
 
 
-def _forecast_events(codes: set[str]) -> pd.DataFrame:
+def _forecast_events(
+    codes: set[str],
+    strict_announcement_lag: bool = False,
+) -> pd.DataFrame:
     df = warehouse.load("performance_forecast")
     if df.empty or "code" not in df.columns:
         return pd.DataFrame()
@@ -294,8 +369,12 @@ def _forecast_events(codes: set[str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
     if "ann_date" not in df.columns:
-        df["ann_date"] = df.get("report_date")
-    df["date"] = pd.to_datetime(df["ann_date"], errors="coerce")
+        return pd.DataFrame()
+    df["date"] = (
+        _next_authoritative_session(df["ann_date"])
+        if strict_announcement_lag
+        else pd.to_datetime(df["ann_date"], errors="coerce")
+    )
     out = df[["code", "date"]].copy()
     if "业绩变动幅度" in df.columns:
         out["forecast_yoy"] = _num(df["业绩变动幅度"])
@@ -352,13 +431,36 @@ def _filter_codes_by_price_rows(codes: list[str], min_price_rows: int = 0) -> li
     return kept
 
 
+def _price_row_eligibility_dates(
+    codes: list[str], min_price_rows: int,
+) -> dict[str, pd.Timestamp]:
+    if min_price_rows <= 0:
+        return {str(code): pd.Timestamp.min for code in codes}
+    eligible: dict[str, pd.Timestamp] = {}
+    for code in codes:
+        path = os.path.join(config.PRICE_DIR, f"{code}.parquet")
+        if not os.path.exists(path):
+            continue
+        try:
+            dates = pd.to_datetime(
+                pd.read_parquet(path, columns=["date"])["date"], errors="coerce",
+            ).dropna().drop_duplicates().sort_values()
+        except Exception:  # noqa: BLE001
+            continue
+        if len(dates) >= int(min_price_rows):
+            eligible[str(code)] = pd.Timestamp(dates.iloc[int(min_price_rows) - 1])
+    return eligible
+
+
 def _factor_subset(factor: pd.DataFrame, codes: set[str]) -> pd.DataFrame:
     if factor.empty or "code" not in factor.columns:
         return factor
     return factor[factor["code"].astype(str).isin(codes)].copy()
 
 
-def _price_factor_job(args: tuple[str, pd.Timestamp | None, int]) -> pd.DataFrame:
+def _price_factor_job(
+    args: tuple[str, pd.Timestamp | None, int, bool, bool],
+) -> pd.DataFrame:
     return _price_factors(*args)
 
 
@@ -366,8 +468,13 @@ def _price_factor_parts(
     codes: list[str],
     start_date: pd.Timestamp | None,
     warmup_rows: int,
+    retain_previous_row: bool = False,
+    strict_calendar_factors: bool = False,
 ) -> list[pd.DataFrame]:
-    jobs = [(code, start_date, warmup_rows) for code in codes]
+    jobs = [
+        (code, start_date, warmup_rows, retain_previous_row, strict_calendar_factors)
+        for code in codes
+    ]
     if len(codes) < _PRICE_PROCESS_MIN_CODES or _PRICE_PROCESS_WORKERS <= 1:
         with ThreadPoolExecutor(max_workers=_PANEL_WORKERS) as executor:
             return list(executor.map(_price_factor_job, jobs))
@@ -375,10 +482,35 @@ def _price_factor_parts(
         return list(executor.map(_price_factor_job, jobs, chunksize=5))
 
 
+def _add_trading_gap_risk(panel: pd.DataFrame) -> pd.DataFrame:
+    """Add per-stock gaps measured in authoritative exchange sessions."""
+    calendar = warehouse.load("trading_calendar")
+    if calendar.empty or list(calendar.columns) != ["date"]:
+        raise RuntimeError("authoritative trading calendar unavailable or malformed")
+    dates = pd.to_datetime(calendar["date"], errors="coerce").astype("datetime64[ns]")
+    if dates.isna().any() or dates.duplicated().any() or not dates.is_monotonic_increasing:
+        raise ValueError("authoritative trading calendar must be unique and increasing")
+    session_ordinal = pd.Series(np.arange(len(dates), dtype=float), index=dates)
+    result = panel.copy()
+    panel_dates = pd.to_datetime(result["date"], errors="coerce").astype("datetime64[ns]")
+    ordinals = panel_dates.map(session_ordinal)
+    if panel_dates.isna().any() or ordinals.isna().any():
+        missing = panel_dates[ordinals.isna()].dropna().drop_duplicates().sort_values()
+        sample = [value.strftime("%Y-%m-%d") for value in missing.iloc[:3]]
+        raise RuntimeError(f"price dates absent from authoritative trading calendar: {sample}")
+    result["risk_trading_gap_days"] = ordinals.groupby(
+        result["code"].astype(str), sort=False,
+    ).diff()
+    return result
+
+
 def build_panel(codes: list[str] | None = None, limit: int = 0, horizon: int = 5,
                 min_price_rows: int = 0, output_start: pd.Timestamp | None = None,
                 warmup_rows: int = 260,
-                shared_factors: dict[str, pd.DataFrame] | None = None) -> pd.DataFrame:
+                shared_factors: dict[str, pd.DataFrame] | None = None,
+                include_trading_gap_risk: bool = False,
+                strict_calendar_factors: bool = False,
+                strict_announcement_lag: bool = False) -> pd.DataFrame:
     """生成训练面板。返回包含 ``target_ret_{horizon}d`` 的 DataFrame。
 
     ``output_start`` limits emitted rows for incremental refreshes. Price factors
@@ -391,11 +523,23 @@ def build_panel(codes: list[str] | None = None, limit: int = 0, horizon: int = 5
     if limit and codes:
         codes = codes[:limit]
     factor_start = pd.Timestamp(output_start) if output_start is not None else None
-    price_parts = _price_factor_parts(codes, factor_start, warmup_rows)
+    price_parts = _price_factor_parts(
+        codes,
+        factor_start,
+        warmup_rows,
+        retain_previous_row=include_trading_gap_risk,
+        strict_calendar_factors=strict_calendar_factors,
+    )
     price_parts = [p for p in price_parts if p is not None and not p.empty]
     if not price_parts:
         return pd.DataFrame()
     panel = pd.concat(price_parts, ignore_index=True).sort_values(["code", "date"])
+    if include_trading_gap_risk:
+        panel = _add_trading_gap_risk(panel)
+        if factor_start is not None:
+            panel = panel[panel["date"] >= factor_start].copy()
+        if panel.empty:
+            return pd.DataFrame()
     panel["market_cat"] = panel["code"].astype(str).map(_market_of_code)
     codes_set = set(panel["code"].astype(str))
     print(
@@ -429,7 +573,10 @@ def build_panel(codes: list[str] | None = None, limit: int = 0, horizon: int = 5
     for name, prefix in (("financial_yjbb", "yjbb"), ("income", "income"), ("cashflow", "cashflow"), ("balance", "balance")):
         factor = shared_factors.get(name)
         if factor is None:
-            factor = _asof_report_factor(name, prefix, codes_set)
+            factor = _asof_report_factor(
+                name, prefix, codes_set,
+                strict_announcement_lag=strict_announcement_lag,
+            )
         else:
             factor = _factor_subset(factor, codes_set)
         panel = _merge_asof_panel(panel, factor)
@@ -441,7 +588,9 @@ def build_panel(codes: list[str] | None = None, limit: int = 0, horizon: int = 5
     stage_started = time.perf_counter()
     forecast = shared_factors.get("performance_forecast")
     if forecast is None:
-        forecast = _forecast_events(codes_set)
+        forecast = _forecast_events(
+            codes_set, strict_announcement_lag=strict_announcement_lag,
+        )
     else:
         forecast = _factor_subset(forecast, codes_set)
     margin = shared_factors.get("margin_underlying_szse")
@@ -534,6 +683,9 @@ _FORBIDDEN_FEATURE_PREFIXES = (
     "sell_return_",
     "exit_return_",
     "holding_return_",
+    "e4_",
+    "prior_",
+    "daily_pred_",
 )
 _FORBIDDEN_FEATURE_COLUMNS = {
     "code",
@@ -548,6 +700,7 @@ _FORBIDDEN_FEATURE_COLUMNS = {
     "exit_open_h",
     "buyable_next",
     "buyable_close",
+    "risk_trading_gap_days",
 }
 
 
@@ -613,23 +766,34 @@ def zscore_cross_section(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 def neutralize_cross_section(df: pd.DataFrame, cols: list[str], neutral_cols: list[str] | None = None) -> pd.DataFrame:
     """按交易日做线性中性化。默认用 log_mv_total，若有 industry 列也会加入行业哑变量。"""
     neutral_cols = neutral_cols or (["log_mv_total"] if "log_mv_total" in df.columns else [])
+    neutral_cols = [c for c in neutral_cols if c in df.columns]
     out = df.copy()
+    for c in cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype(float)
     if not neutral_cols and "industry" not in out.columns:
         return out
     for _, idx in out.groupby("date").groups.items():
         g = out.loc[idx]
-        xs = []
-        if neutral_cols:
-            xs.append(g[neutral_cols].apply(pd.to_numeric, errors="coerce"))
-        if "industry" in g.columns:
-            xs.append(pd.get_dummies(g["industry"], prefix="ind", dummy_na=True, dtype=float))
-        if not xs:
+        if not neutral_cols and "industry" not in g.columns:
             continue
-        x = pd.concat(xs, axis=1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        x.insert(0, "const", 1.0)
-        xmat = x.to_numpy(dtype=float)
+        industry = (
+            pd.get_dummies(g["industry"], prefix="ind", dummy_na=True, dtype=float)
+            if "industry" in g.columns else None
+        )
         for c in cols:
             y = pd.to_numeric(g[c], errors="coerce").to_numpy(dtype=float)
+            regressors = [n for n in neutral_cols if n != c]
+            design_parts = []
+            if regressors:
+                design_parts.append(g[regressors].apply(pd.to_numeric, errors="coerce"))
+            if industry is not None:
+                design_parts.append(industry)
+            if not design_parts:
+                continue
+            x = pd.concat(design_parts, axis=1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            x.insert(0, "const", 1.0)
+            xmat = x.to_numpy(dtype=float)
             ok = np.isfinite(y)
             if ok.sum() <= xmat.shape[1] + 2:
                 continue

@@ -293,7 +293,7 @@ def add_asof_base_features(frame: pd.DataFrame) -> pd.DataFrame:
         lambda values: values.rolling(20, min_periods=5).median()
     )
     rolling_amount_median = grouped["amount"].transform(
-        lambda values: values.rolling(20, min_periods=5).median()
+        lambda values: values.shift(1).rolling(20, min_periods=5).median()
     )
     data["risk_volume_vs_median_20"] = data["volume"] / rolling_volume_median.replace(0, np.nan) - 1.0
     data["risk_amount_vs_median_20"] = data["amount"] / rolling_amount_median.replace(0, np.nan) - 1.0
@@ -336,7 +336,8 @@ def add_asof_base_features(frame: pd.DataFrame) -> pd.DataFrame:
         pd.to_numeric(last_high, errors="coerce")
         - pd.to_numeric(last_low, errors="coerce")
     ).abs()
-    signal_locked = (last_bar_spread <= 0.005) & (signal_return >= 0.045)
+    flat_bar_ratio = last_bar_spread / previous_close.replace(0, np.nan).abs()
+    signal_locked = (flat_bar_ratio <= 0.0005) & (signal_return >= 0.045)
     data["signal_return_1400"] = signal_return
     data["signal_locked_up_1400"] = signal_locked.fillna(False)
     complete = data.get("is_complete", pd.Series(False, index=data.index))

@@ -135,6 +135,15 @@ class RealtimeConfig:
     rank_board_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_RANK_BOARD", True))
     rank_interval_sec: int = field(default_factory=lambda: _env_int("REALTIME_RANK_INTERVAL", 300))
     rank_top_n: int = field(default_factory=lambda: _env_int("REALTIME_RANK_TOP_N", 5))
+    # 实际账户仅做只读调仓提示；绝不生成委托或写入 V1-V5 模拟盘状态。
+    actual_advice_enabled: bool = field(default_factory=lambda: _env_bool(
+        "REALTIME_ACTUAL_ADVICE", True))
+    actual_advice_max_weight: float = field(default_factory=lambda: min(1.0, max(
+        0.05, _env_float("REALTIME_ACTUAL_MAX_WEIGHT", 0.35))))
+    actual_advice_profit_lock: float = field(default_factory=lambda: max(
+        0.0, _env_float("REALTIME_ACTUAL_PROFIT_LOCK", 0.15)))
+    actual_advice_loss_review: float = field(default_factory=lambda: min(
+        0.0, _env_float("REALTIME_ACTUAL_LOSS_REVIEW", -0.15)))
 
     # ---- 盘中动态重排（RerankScorer，RankBoard + PaperTrader 共用）----------
     # 候选池先过三模型融合收益门，再按现役融合 pred 的全A日内百分位取 Top-rank_pool_n。
@@ -253,6 +262,16 @@ class RealtimeConfig:
             "REALTIME_SECTOR_META_FILE", "") or
             (Path(os.environ.get("SNAPSHOT_DIR", "snapshots")) / "all_a_stock_meta.parquet")))
 
+    # ---- V5 模拟盘（V4 + 行业相对强度动态仓位）-------------------------------
+    # 仅改变行业 ETF 对风险预算的缩放，不改变候选、买卖时点、成交价或退出规则。
+    paper_v5_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_V5", True))
+    paper_v5_sector_lagging_factor: float = field(default_factory=lambda: min(1.0, max(
+        0.0, _env_float("REALTIME_PAPER_V5_SECTOR_LAGGING_FACTOR", 0.85))))
+    paper_v5_sector_neutral_factor: float = field(default_factory=lambda: min(1.5, max(
+        0.0, _env_float("REALTIME_PAPER_V5_SECTOR_NEUTRAL_FACTOR", 1.00))))
+    paper_v5_sector_strong_factor: float = field(default_factory=lambda: min(1.5, max(
+        0.0, _env_float("REALTIME_PAPER_V5_SECTOR_STRONG_FACTOR", 1.15))))
+
     # ---- 同量纲预期收益融合 + 历史校准 -------------------------------------
     # Ridge / ElasticNet / ExtraTrees 都直接回归 target_ret_{h}d，可融合为收益率；
     # LightGBM、IC 和 pred 是无量纲排序分，绝不进入收益融合。
@@ -271,7 +290,7 @@ class RealtimeConfig:
     calib_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_CALIB", True))
     calib_bins: int = field(default_factory=lambda: _env_int("REALTIME_CALIB_BINS", 20))
 
-    # ---- Realtime 权重影子评估（只读，不自动晋级）----------------------------
+    # ---- Realtime 权重例行评估与自动晋级（独立于模型训练任务）----------------
     weight_shadow_predictions_file: Path = field(default_factory=lambda: Path(
         os.environ.get("REALTIME_WEIGHT_SHADOW_PREDICTIONS", "")
         or (Path(_qconfig.QUANT_DIR) / "active_quant_short_predictions.parquet")))
@@ -281,9 +300,28 @@ class RealtimeConfig:
     weight_shadow_train_days: int = field(default_factory=lambda: max(
         10, _env_int("REALTIME_WEIGHT_SHADOW_TRAIN_DAYS", 60)))
     weight_shadow_min_oos_days: int = field(default_factory=lambda: max(
-        20, _env_int("REALTIME_WEIGHT_SHADOW_MIN_OOS_DAYS", 20)))
+        40, _env_int("REALTIME_WEIGHT_SHADOW_MIN_OOS_DAYS", 40)))
     weight_shadow_rebalance_days: int = field(default_factory=lambda: max(
         1, _env_int("REALTIME_WEIGHT_SHADOW_REBALANCE_DAYS", 5)))
+    weight_shadow_workers: int = field(default_factory=lambda: min(4, max(
+        1, _env_int("REALTIME_WEIGHT_SHADOW_WORKERS", 4))))
+    weight_auto_promote_enabled: bool = field(default_factory=lambda: _env_bool(
+        "REALTIME_WEIGHT_AUTO_PROMOTE", True))
+    weight_active_manifest_file: Path = field(default_factory=lambda: Path(
+        os.environ.get("REALTIME_WEIGHT_ACTIVE_MANIFEST", "")
+        or (_realtime_dir() / "weight_shadow" / "active_weights.json")))
+    weight_max_step: float = field(default_factory=lambda: min(1.0, max(
+        0.0, _env_float("REALTIME_WEIGHT_MAX_STEP", 0.20))))
+    weight_promotion_cooldown_days: int = field(default_factory=lambda: max(
+        0, _env_int("REALTIME_WEIGHT_PROMOTION_COOLDOWN_DAYS", 20)))
+    weight_min_sharpe_improvement: float = field(default_factory=lambda: _env_float(
+        "REALTIME_WEIGHT_MIN_SHARPE_IMPROVEMENT", 0.0))
+    weight_min_hit_rate_delta: float = field(default_factory=lambda: _env_float(
+        "REALTIME_WEIGHT_MIN_HIT_RATE_DELTA", -0.02))
+    weight_max_drawdown_worsening: float = field(default_factory=lambda: max(
+        0.0, _env_float("REALTIME_WEIGHT_MAX_DRAWDOWN_WORSENING", 0.02)))
+    weight_rollback_days: int = field(default_factory=lambda: max(
+        5, _env_int("REALTIME_WEIGHT_ROLLBACK_DAYS", 10)))
 
     # ---- 账本 ----------------------------------------------------------------
     ledger_dir: Path = field(
@@ -298,7 +336,7 @@ class RealtimeConfig:
     pushdeer_key: str = field(default_factory=lambda: os.environ.get("PUSHDEER_KEY", "").strip())
     pushdeer_endpoint: str = field(
         default_factory=lambda: os.environ.get("PUSHDEER_ENDPOINT", "https://api2.pushdeer.com").strip())
-    # 默认只保留 RankBoard 和 V1-V4 模拟盘的低层 push；逐票/ETF Signal 继续记账但不推送。
+    # 默认只保留 RankBoard 和 V1-V5 模拟盘的低层 push；逐票/ETF Signal 继续记账但不推送。
     signal_push_enabled: bool = field(
         default_factory=lambda: _env_bool("REALTIME_SIGNAL_PUSH", False))
     notify_cooldown_sec: int = field(default_factory=lambda: _env_int("REALTIME_NOTIFY_COOLDOWN", 300))
@@ -339,6 +377,8 @@ class RealtimeConfig:
             files.append(base.parent / f"{base.stem}_v3{base.suffix}")
         if getattr(self, "paper_v4_enabled", False):
             files.append(base.parent / f"{base.stem}_v4{base.suffix}")
+        if getattr(self, "paper_v5_enabled", False):
+            files.append(base.parent / f"{base.stem}_v5{base.suffix}")
         return tuple(files)
 
 

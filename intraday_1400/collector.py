@@ -98,6 +98,7 @@ def collect(
     partition_size: int = config.PARTITION_SIZE,
     feature_workers: int = config.FEATURE_WORKERS,
     resume: bool = True,
+    codes_file_manifest: dict | None = None,
 ) -> FetchStats:
     """Collect in one SDK session; CPU workers only aggregate local DataFrames."""
     config.ensure_dirs()
@@ -275,6 +276,7 @@ def collect(
         "feature_workers": feature_workers,
         "single_sdk_login": True,
         "factor_changes": sorted(factor_changes),
+        "codes_file": codes_file_manifest,
         "finished_at": pd.Timestamp.now().isoformat(),
     }
     atomic_json(report, config.REPORT_DIR / f"collect_{start}_{end}.json")
@@ -287,6 +289,24 @@ def _read_codes(path: str, limit: int = 0) -> list[str]:
 
     codes = list(dict.fromkeys(re.findall(r"(?<!\d)(\d{6})(?!\d)", text)))
     return codes[:limit] if limit else codes
+
+
+def _codes_file_manifest(path: str, codes: list[str], limit: int = 0) -> dict:
+    source_path = Path(path).resolve()
+    if not source_path.is_file():
+        raise RuntimeError(f"codes file unavailable: {source_path}")
+    raw = source_path.read_bytes()
+    all_codes = _read_codes(str(source_path))
+    if not all_codes or not codes:
+        raise RuntimeError(f"codes file contains no valid six-digit codes: {source_path}")
+    return {
+        "path": str(source_path),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+        "source_code_count": len(all_codes),
+        "effective_code_count": len(codes),
+        "limit": int(limit),
+    }
 
 
 def main() -> None:
@@ -305,14 +325,17 @@ def main() -> None:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
         raise SystemExit("intraday_1400 workflow already running") from exc
+    codes = _read_codes(args.codes_file, args.limit)
+    codes_manifest = _codes_file_manifest(args.codes_file, codes, args.limit)
     stats = collect(
-        _read_codes(args.codes_file, args.limit),
+        codes,
         args.start,
         args.end,
         batch_size=args.batch_size,
         partition_size=args.partition_size,
         feature_workers=args.feature_workers,
         resume=not args.no_resume,
+        codes_file_manifest=codes_manifest,
     )
     print(f"[intraday1400:done] {stats}", flush=True)
     # Avoid native SDK teardown crashes after all atomic writes and log flushes complete.

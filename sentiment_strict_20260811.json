@@ -1,0 +1,469 @@
+{
+  "version": 1,
+  "name": "decay_balanced_hl3",
+  "trained_at": "2026-08-11T23:48:46.640192",
+  "train_start": "2025-08-11",
+  "train_end": "2026-08-11",
+  "split_date": "2026-05-11",
+  "signal_source": "lexicon",
+  "half_life_days": 3.0,
+  "lookback_days": 30,
+  "category_weights": {
+    "announcement": 1.0,
+    "research": 1.0,
+    "stock_news": 0.8,
+    "flash": 0.4
+  },
+  "fit": {
+    "n": 0,
+    "ic_1d": null,
+    "ic_3d": null,
+    "direction_1d": null,
+    "score": -999.0
+  },
+  "holdout": {
+    "n": 0,
+    "ic_1d": null,
+    "ic_3d": null,
+    "direction_1d": null,
+    "score": -999.0
+  },
+  "enabled": false,
+  "strict_announcement_lag": true,
+  "blend_weight": 0.0,
+  "validation_note": "留出期 n=0，1日IC=None，3日IC=None，方向胜率=None；未过门槛，不加分",
+  "candidates": [
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 3.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 3.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 3.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 7.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 7.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 7.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 14.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 14.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 14.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 30.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 30.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 30.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 3.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 3.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 3.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 7.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 7.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 7.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 14.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 14.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 14.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 30.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 30.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 30.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 3.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 3.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 3.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 7.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 7.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 7.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 14.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 14.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 14.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 30.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 30.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 30.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 0,
+        "ic_1d": null,
+        "ic_3d": null,
+        "direction_1d": null,
+        "score": -999.0
+      }
+    }
+  ]
+}

@@ -64,18 +64,42 @@ def _last_date(df: pd.DataFrame, col: str = "date") -> dt.date | None:
 
 
 def _probe_latest_price_date(codes: list[str], lookback_days: int) -> dt.date | None:
+    import time as _time
+
     preferred = ["000001", "600000", "300750", "600519", "000333"]
-    probes = [c for c in preferred if c in codes] + [c for c in codes[:20] if c not in preferred]
-    start = _yyyymmdd(max(dt.date.today() - dt.timedelta(days=max(lookback_days, 5)), dt.date(2018, 1, 1)))
-    latest_dates: list[dt.date] = []
-    for code in probes:
-        try:
-            latest = _last_date(datafeed.daily_price(code, start))
-            if latest is not None:
-                latest_dates.append(latest)
-        except Exception:  # noqa: BLE001
-            continue
-    return max(latest_dates) if latest_dates else None
+    probes = [c for c in preferred if c in codes]
+    if not probes:
+        probes = codes[:1]
+    if not probes:
+        return None
+    start = _yyyymmdd(max(
+        dt.date.today() - dt.timedelta(days=max(lookback_days, 5)),
+        dt.date(2018, 1, 1),
+    ))
+    end = _yyyymmdd(dt.date.today())
+    started = _time.perf_counter()
+    print(f"[price:probe] start codes={len(probes)} start={start}", flush=True)
+    try:
+        frames = datafeed.broker_daily_prices(probes, start, end, adjust="")
+        latest_dates = [
+            latest
+            for latest in (_last_date(frames.get(code)) for code in probes)
+            if latest is not None
+        ]
+        latest = max(latest_dates) if latest_dates else None
+        print(
+            f"[price:probe] done latest={latest or ''} "
+            f"seconds={_time.perf_counter() - started:.1f}",
+            flush=True,
+        )
+        return latest
+    except Exception as error:  # noqa: BLE001
+        print(
+            f"[price:probe] failed={type(error).__name__} "
+            f"seconds={_time.perf_counter() - started:.1f}; use local latest date",
+            flush=True,
+        )
+        return None
 
 
 def _probe_latest_valuation_date(codes: list[str]) -> dt.date | None:
@@ -93,12 +117,15 @@ def _probe_latest_valuation_date(codes: list[str]) -> dt.date | None:
 
 
 def _stale_codes(codes: list[str], load_fn, latest_date: dt.date | None, label: str,
-                 force_latest: bool = False) -> list[str]:
+                 force_latest: bool = False,
+                 local_dates_out: dict[str, dt.date | None] | None = None) -> list[str]:
     local_dates: dict[str, dt.date | None] = {}
     local_max: dt.date | None = None
     for code in codes:
         local_latest = _last_date(load_fn(code))
         local_dates[code] = local_latest
+        if local_dates_out is not None:
+            local_dates_out[code] = local_latest
         if local_latest is not None and (local_max is None or local_latest > local_max):
             local_max = local_latest
 
@@ -303,31 +330,39 @@ def _warmup_broker(retries: int = 3) -> bool:
         try:
             amazingdata_source.raw_kline("000001", start, end)
             return True
-        except Exception:  # noqa: BLE001 未就绪 -> 重登录+退避再探，耗尽则让主路径降级
-            amazingdata_source._logged_in = False
+        except Exception:  # noqa: BLE001 未就绪 -> 同一会话退避再探，耗尽则让主路径降级
+            # sdk_call 超时后底层守护线程可能仍持有服务端连接。强制重登录会叠加
+            # 僵持连接并触发账户连接数上限，因此重试必须复用当前会话。
             _time.sleep(2.0 * (attempt + 1))
     return False
 
 
 def _update_prices_batched(codes, lookback_days: int = 5, workers: int = 12,
-                           batch_size: int = 200, gap_threshold_days: int = 45,
-                           batch_retries: int = 2) -> dict:
+                           batch_size: int | None = None, gap_threshold_days: int = 45,
+                           batch_retries: int = 2,
+                           local_dates: dict[str, dt.date | None] | None = None) -> dict:
     """价格更新：券商批量 K 线做主路径 + 逐股缺口/兜底回退。
 
     保留逐股路径三个保护：①免费源兜底(批量缺票转单只)②列标准化(_standardize
     补齐 amount/turnover/pct_change)③缺口恢复(缺口超阈值或无本地数据的票走单只全量)。
     窗口数据驱动：批量起点 = 今天 -(本批最大缺口 + lookback_days 重叠)，平时缺口小
     窗口自动收窄、长假后自动张开，不猜节假日。批量前先 _warmup_broker 预热券商连接
-    (治冷启动竞态)，块超时/失败再重试 batch_retries 次(重登录 + 退避)后降级逐股。
+    (治冷启动竞态)，块超时/失败在当前会话退避重试 batch_retries 次后降级逐股。
     实测批量 65ms/只 vs 逐只 3.15s/只(49x)，全市场拉数 ~40min 压到 ~4min。"""
     import time as _time
-    from stock_analyzer import amazingdata_source
     from stock_analyzer.data import _standardize
+    if batch_size is None:
+        batch_size = int(os.environ.get("AMAZINGDATA_KLINE_BATCH_SIZE", "200") or 200)
+    batch_size = max(int(batch_size), 1)
     today = dt.date.today()
     # 按本地最后日期分流：缺口在阈值内走批量(数据驱动窗口)；无本地数据或缺口过大走逐股全量补
     batch_codes, gap_codes, max_gap = [], [], lookback_days
     for code in codes:
-        last = _last_date(warehouse.load_price(code))
+        last = (
+            local_dates[code]
+            if local_dates is not None and code in local_dates
+            else _last_date(warehouse.load_price(code))
+        )
         if last is None:
             gap_codes.append(code)
             continue
@@ -348,18 +383,23 @@ def _update_prices_batched(codes, lookback_days: int = 5, workers: int = 12,
         print("[price] broker warmup failed; 批量可能整片降级逐股", flush=True)
     ok = rows = 0
     fallback = list(gap_codes)
+    total_batches = (len(batch_codes) + batch_size - 1) // batch_size
     for i in range(0, len(batch_codes), batch_size):
         chunk = batch_codes[i:i + batch_size]
+        batch_idx = i // batch_size
         frames = None
         for attempt in range(batch_retries + 1):
             try:
-                frames = datafeed.broker_daily_prices(chunk, start, end)
+                frames = datafeed.broker_daily_prices(
+                    chunk, start, end,
+                    progress_offset=batch_idx,
+                    progress_total=total_batches,
+                )
                 break
-            except Exception as e:  # noqa: BLE001 批量块失败 -> 退避+重登录重试，仍失败才逐股
+            except Exception as e:  # noqa: BLE001 批量块失败 -> 当前会话退避重试，仍失败才逐股
                 if attempt < batch_retries:
                     print(f"[price] batch chunk={i // batch_size} attempt={attempt + 1} "
-                          f"{type(e).__name__}; 重登录后重试", flush=True)
-                    amazingdata_source._logged_in = False  # 强制下次调用重新登录，冲掉卡死连接
+                          f"{type(e).__name__}; 当前会话退避重试", flush=True)
                     _time.sleep(2.0 * (attempt + 1))
                 else:
                     print(f"[price] batch chunk={i // batch_size} failed={type(e).__name__} "
@@ -491,6 +531,112 @@ def run_snapshots(snapshot_dir: str, codes: list[str] | None = None) -> int:
     return int(res.returncode)
 
 
+def refresh_trading_calendar() -> dict:
+    """Refresh the authoritative AmazingData open-session calendar when available."""
+    if not datafeed.broker_available():
+        return {
+            "status": "broker-unavailable",
+            "path": config.TRADING_CALENDAR_FILE,
+            "exists": os.path.isfile(config.TRADING_CALENDAR_FILE),
+        }
+    calendar = datafeed.broker_trading_calendar().copy()
+    if list(calendar.columns) != ["date"]:
+        raise ValueError("broker trading calendar must contain only the date column")
+    calendar["date"] = pd.to_datetime(calendar["date"], errors="coerce").astype("datetime64[ns]")
+    if calendar.empty or calendar["date"].isna().any():
+        raise ValueError("broker trading calendar is empty or invalid")
+    if calendar["date"].duplicated().any() or not calendar["date"].is_monotonic_increasing:
+        raise ValueError("broker trading calendar must be unique and increasing")
+    warehouse.save("trading_calendar", calendar)
+    return {
+        "status": "refreshed",
+        "path": config.TRADING_CALENDAR_FILE,
+        "rows": int(len(calendar)),
+        "first_date": str(calendar["date"].iloc[0].date()),
+        "last_date": str(calendar["date"].iloc[-1].date()),
+    }
+
+
+def refresh_pit_reference_data(index_codes: list[str] | None = None) -> dict:
+    """Refresh PIT security-master and index-membership inputs without activating them."""
+    if not datafeed.broker_available():
+        return {
+            "status": "broker-unavailable",
+            "security_master_path": config.SECURITY_MASTER_FILE,
+            "index_history_path": config.INDEX_CONSTITUENT_HISTORY_FILE,
+        }
+    requested = index_codes or ["000300.SH", "000905.SH", "000852.SH"]
+    security_master = datafeed.broker_security_master()
+    index_history = datafeed.broker_index_constituent_history(requested)
+    warehouse.save("security_master", security_master)
+    warehouse.save("index_constituent_history", index_history)
+    return {
+        "status": "refreshed",
+        "security_master_path": config.SECURITY_MASTER_FILE,
+        "security_master_rows": int(len(security_master)),
+        "security_master_first_list_date": str(security_master["list_date"].min().date()),
+        "index_history_path": config.INDEX_CONSTITUENT_HISTORY_FILE,
+        "index_history_rows": int(len(index_history)),
+        "index_codes": sorted(index_history["index_code"].astype(str).unique().tolist()),
+        "index_history_first_in_date": str(index_history["in_date"].min().date()),
+    }
+
+
+def refresh_trading_status_reference(
+    codes: list[str],
+    batch_size: int = 0,
+) -> dict:
+    """Refresh selected PIT status histories without activating trading filters."""
+    normalized = sorted({
+        datafeed._norm(code) for code in codes if datafeed._norm(code).isdigit()
+    })
+    if not datafeed.broker_available():
+        return {
+            "status": "broker-unavailable",
+            "path": config.TRADING_STATUS_HISTORY_FILE,
+            "requested_codes": len(normalized),
+        }
+    effective_batch_size = int(batch_size)
+    if effective_batch_size < 0:
+        raise ValueError("batch_size must be non-negative")
+    if effective_batch_size:
+        batches = [
+            normalized[offset:offset + effective_batch_size]
+            for offset in range(0, len(normalized), effective_batch_size)
+        ]
+        frames = [datafeed.broker_history_stock_status(batch) for batch in batches]
+        history = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    else:
+        batches = [normalized]
+        history = datafeed.broker_history_stock_status(normalized)
+    warehouse.save("trading_status_history", history)
+    return {
+        "status": "refreshed",
+        "path": config.TRADING_STATUS_HISTORY_FILE,
+        "rows": int(len(history)),
+        "codes": int(history["code"].nunique()),
+        "batches": int(len(batches)),
+        "batch_size": effective_batch_size,
+        "st_rows": int(history["is_st"].fillna(False).astype(bool).sum()),
+        "suspended_rows": int(history["is_suspended"].fillna(False).astype(bool).sum()),
+        "withdrawal_rows": int(history["is_withdrawal"].fillna(False).astype(bool).sum()),
+    }
+
+    history = datafeed.broker_history_stock_status(normalized)
+    warehouse.save("trading_status_history", history)
+    return {
+        "status": "refreshed",
+        "path": config.TRADING_STATUS_HISTORY_FILE,
+        "requested_codes": len(normalized),
+        "rows": int(len(history)),
+        "first_date": str(history["date"].min().date()),
+        "last_date": str(history["date"].max().date()),
+        "st_rows": int(history["is_st"].sum()),
+        "suspended_rows": int(history["is_suspended"].sum()),
+        "withdrawal_rows": int(history["is_withdrawal"].sum()),
+    }
+
+
 def _refresh_mainboard_universe_isolated() -> None:
     """在子进程里刷新主板股票池，隔离 akshare 抓表对 TGW 连接的进程级污染。
 
@@ -524,10 +670,13 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
         skip_snapshots: bool = False, limit: int = 0, force_latest: bool = False,
         intraday_spot: bool = False, codes_file: str | None = None) -> dict:
     config.ensure_dirs()
+    calendar_summary = refresh_trading_calendar()
     u = config.UNIVERSES[universe]
     if codes_file:
         with open(codes_file, encoding="utf-8") as fh:
-            codes = sorted({line.strip() for line in fh if re.fullmatch(r"\\d{6}", line.strip())})
+            codes = sorted({line.strip() for line in fh if re.fullmatch(r"\d{6}", line.strip())})
+        if not codes:
+            raise ValueError(f"codes file contains no valid six-digit codes: {codes_file}")
     else:
         if u["kind"] == "mainboard_active":
             _refresh_mainboard_universe_isolated()
@@ -536,7 +685,11 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
         codes = codes[:limit]
     print(f"[universe] {universe} codes={len(codes)} quant_dir={config.QUANT_DIR}")
 
-    summary: dict = {"universe": universe, "n_codes": len(codes)}
+    summary: dict = {
+        "universe": universe,
+        "n_codes": len(codes),
+        "trading_calendar": calendar_summary,
+    }
     if not skip_price:
         if intraday_spot:
             summary["price"] = update_intraday_spot(codes, workers=workers)
@@ -546,10 +699,29 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
                 else "whole-market-spot"
             )
         else:
-            price_latest = _probe_latest_price_date(codes, lookback_days)
-            price_codes = _stale_codes(codes, warehouse.load_price, price_latest, "price",
-                                       force_latest=force_latest)
-            summary["price"] = _update_prices_batched(price_codes, lookback_days=lookback_days, workers=workers)
+            if force_latest:
+                price_latest = None
+                print(
+                    "[price:probe] skipped because force_latest refreshes every code",
+                    flush=True,
+                )
+            else:
+                price_latest = _probe_latest_price_date(codes, lookback_days)
+            price_local_dates: dict[str, dt.date | None] = {}
+            price_codes = _stale_codes(
+                codes,
+                warehouse.load_price,
+                price_latest,
+                "price",
+                force_latest=force_latest,
+                local_dates_out=price_local_dates,
+            )
+            summary["price"] = _update_prices_batched(
+                price_codes,
+                lookback_days=lookback_days,
+                workers=workers,
+                local_dates=price_local_dates,
+            )
             summary["price"]["skipped_fresh"] = len(codes) - len(price_codes)
             summary["price"]["source_latest"] = str(price_latest or "")
     if not skip_valuation:

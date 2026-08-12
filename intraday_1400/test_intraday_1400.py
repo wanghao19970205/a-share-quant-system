@@ -12,11 +12,14 @@ import pandas as pd
 
 from intraday_1400 import pipeline
 from quant import model as quant_model
-from intraday_1400.collector import _factor_fingerprint
+from intraday_1400.collector import _codes_file_manifest, _factor_fingerprint, _read_codes
 from intraday_1400.evaluation import (
     _common_labels,
+    _evaluate_negative_controls,
     _evaluate_source,
+    _holm_adjust,
     _metrics as evaluation_metrics,
+    _paired_block_bootstrap,
 )
 from intraday_1400.fair_race_pipeline import (
     DEFAULT_TRAINED_VARIANTS,
@@ -27,6 +30,7 @@ from intraday_1400.fair_race_pipeline import (
     _cash_complete_targets,
     _causal_eligible_predictions,
     _exit_expected_value_frame,
+    _evaluate_recipe_frames,
     _inner_window_spec,
     _select_inner_recipe,
     _top50_risk_constrained_frame,
@@ -100,6 +104,7 @@ from intraday_1400.structural_combo import (    apply_probability_calibrator,
     build_daily_execution_filter_scores,
     build_e0_e4_staged_scores,
     build_structural_combo_scores,
+    e4_coverage_diagnostics,
     fit_probability_calibrator,
     shift_daily_prior_to_signal,
 )
@@ -136,6 +141,20 @@ def _day_bars(date: str, future_shift: float = 0.0) -> pd.DataFrame:
 
 
 class IntradayFeatureTest(unittest.TestCase):
+    def test_codes_file_manifest_records_source_hash_and_effective_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "codes.txt"
+            path.write_text("600001\n000001\n600001\n300001\n", encoding="utf-8")
+            codes = _read_codes(str(path), limit=2)
+            manifest = _codes_file_manifest(str(path), codes, limit=2)
+
+        self.assertEqual(codes, ["600001", "000001"])
+        self.assertEqual(manifest["source_code_count"], 3)
+        self.assertEqual(manifest["effective_code_count"], 2)
+        self.assertEqual(manifest["limit"], 2)
+        self.assertEqual(len(manifest["sha256"]), 64)
+        self.assertTrue(manifest["path"].endswith("codes.txt"))
+
     def test_features_do_not_read_bars_after_cutoff(self):
         normal = aggregate_symbol(_day_bars("2026-07-01"), "600000")
         changed_future = aggregate_symbol(_day_bars("2026-07-01", future_shift=20.0), "600000")
@@ -211,6 +230,12 @@ class IntradayFeatureTest(unittest.TestCase):
         self.assertIn("risk_near_limit_down_count_20", enriched)
         self.assertIn("risk_amount_vs_median_20", enriched)
         self.assertTrue(np.isfinite(enriched.iloc[-1]["ret_20d"]))
+        # The current day's amount must not enter its own historical median baseline.
+        expected_amount_risk = raw.iloc[-1]["amount"] / raw.iloc[-21:-1]["amount"].median() - 1.0
+        self.assertAlmostEqual(
+            float(enriched.iloc[-1]["risk_amount_vs_median_20"]),
+            float(expected_amount_risk),
+        )
         self.assertNotIn("close", feature_columns(enriched))
 
     def test_partition_part_round_trip(self):
@@ -317,6 +342,86 @@ class IntradayFeatureTest(unittest.TestCase):
         self.assertEqual(metrics["missing_targets"], 1)
         self.assertEqual(metrics["mean_names"], 2.0)
 
+    def test_daily_topn_metrics_treat_unbuyable_slot_as_cash(self):
+        selected = pd.DataFrame({
+            "date": pd.to_datetime(["2026-07-01"]),
+            "code": ["600000"],
+            "gross_return": [np.nan],
+            "entry_buyable": [False],
+            "target_outcome_observed_t1": [False],
+        })
+        metrics = evaluation_metrics(selected, "gross_return", 0.002)
+        self.assertAlmostEqual(metrics["mean_return"], 0.0)
+        self.assertEqual(metrics["missing_targets"], 0)
+        self.assertEqual(metrics["immature_targets"], 0)
+
+    def test_daily_topn_metrics_exclude_immature_targets_from_penalty(self):
+        selected = pd.DataFrame({
+            "date": pd.to_datetime(["2026-07-01", "2026-07-01"]),
+            "code": ["600000", "600001"],
+            "gross_return": [np.nan, 0.02],
+            "target_outcome_observed_t1": [False, True],
+        })
+        with mock.patch.dict("os.environ", {"INTRADAY_1400_UNSELLABLE_RETURN": "-0.10"}):
+            metrics = evaluation_metrics(selected, "gross_return", 0.002)
+        self.assertAlmostEqual(metrics["mean_return"], 0.018)
+        self.assertEqual(metrics["missing_targets"], 0)
+        self.assertEqual(metrics["immature_targets"], 1)
+        self.assertEqual(metrics["mean_names"], 1.0)
+
+    def test_daily_topn_metrics_scale_sharpe_for_rebalance_stride(self):
+        selected = pd.DataFrame({
+            "date": pd.date_range("2026-07-01", periods=4, freq="D"),
+            "code": ["600000"] * 4,
+            "gross_return": [0.012, 0.022, 0.032, 0.042],
+        })
+        metrics = evaluation_metrics(selected, "gross_return", 0.002, rebalance_stride=2)
+        expected_daily = pd.Series([0.01, 0.03])
+        expected = expected_daily.mean() / expected_daily.std() * np.sqrt(252 / 2)
+        self.assertEqual(metrics["days"], 2)
+        self.assertAlmostEqual(metrics["sharpe"], expected)
+
+    def test_rebalance_stride_keeps_calendar_phase_when_middle_date_is_immature(self):
+        selected = pd.DataFrame({
+            "date": pd.date_range("2026-07-01", periods=4, freq="D"),
+            "code": ["600000"] * 4,
+            "gross_return": [0.012, np.nan, 0.032, 0.102],
+            "target_outcome_observed_t1": [True, False, True, True],
+        })
+        metrics = evaluation_metrics(selected, "gross_return", 0.002, rebalance_stride=2)
+        self.assertEqual(metrics["days"], 2)
+        self.assertAlmostEqual(metrics["mean_return"], 0.02)
+        self.assertEqual(metrics["immature_targets"], 0)
+
+    def test_paired_block_bootstrap_aligns_dates_and_detects_gain(self):
+        model_index = pd.date_range("2026-01-01", periods=14, freq="D")
+        baseline_index = pd.date_range("2026-01-03", periods=14, freq="D")
+        model = pd.Series(0.01, index=model_index)
+        baseline = pd.Series(0.0, index=baseline_index)
+        first = _paired_block_bootstrap(model, baseline, samples=199, block_length=3, seed=11)
+        second = _paired_block_bootstrap(model, baseline, samples=199, block_length=3, seed=11)
+        self.assertEqual(first, second)
+        self.assertTrue(first["available"])
+        self.assertEqual(first["days"], 12)
+        self.assertAlmostEqual(first["paired_mean_gain"], 0.01)
+        np.testing.assert_allclose(first["ci95"], [0.01, 0.01])
+        self.assertAlmostEqual(first["p_value_one_sided"], 0.005)
+
+    def test_paired_block_bootstrap_does_not_reject_null_gain(self):
+        index = pd.date_range("2026-01-01", periods=12, freq="D")
+        values = pd.Series(np.linspace(-0.02, 0.02, len(index)), index=index)
+        result = _paired_block_bootstrap(values, values, samples=99, block_length=4, seed=17)
+        self.assertTrue(result["available"])
+        self.assertAlmostEqual(result["paired_mean_gain"], 0.0)
+        self.assertAlmostEqual(result["p_value_one_sided"], 1.0)
+
+    def test_holm_adjustment_preserves_input_order_and_step_down_monotonicity(self):
+        raw = [0.01, 0.04, 0.03]
+        adjusted = _holm_adjust(raw)
+        np.testing.assert_allclose(adjusted, [0.03, 0.06, 0.06])
+        ordered = sorted(zip(raw, adjusted))
+        self.assertEqual([value for _, value in ordered], sorted(value for _, value in ordered))
+
     def test_evaluate_source_ranks_before_unsellable_target_handling(self):
         date = pd.Timestamp("2026-07-01")
         labels = pd.DataFrame({
@@ -340,6 +445,79 @@ class IntradayFeatureTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["mean_return"], -0.10)
         self.assertEqual(metrics["missing_targets"], 1)
         self.assertEqual(metrics["mean_names"], 1.0)
+
+    def test_negative_controls_are_deterministic_and_include_market_leg(self):
+        dates = pd.to_datetime(["2026-07-01"] * 4 + ["2026-07-02"] * 4)
+        labels = pd.DataFrame({
+            "code": ["600000", "600001", "600002", "600003"] * 2,
+            "date": dates,
+            "entry_buyable": [True] * 8,
+            "gross__target_net_ret_t1": [0.01, 0.02, 0.03, 0.04, -0.01, 0.0, 0.01, 0.02],
+        })
+        predictions = pd.DataFrame({
+            "code": labels["code"],
+            "date": dates,
+            "score": [4.0, 3.0, 2.0, 1.0] * 2,
+        })
+        metadata = {"gross_columns": {"target_net_ret_t1": "gross__target_net_ret_t1"}}
+        first = _evaluate_negative_controls(
+            labels, predictions, (1, 2), (0.002,), metadata, samples=5, seed=7,
+        )
+        second = _evaluate_negative_controls(
+            labels, predictions, (1, 2), (0.002,), metadata, samples=5, seed=7,
+        )
+        parallel = _evaluate_negative_controls(
+            labels, predictions, (1, 2), (0.002,), metadata, samples=5, seed=7, workers=2,
+        )
+        strided = _evaluate_negative_controls(
+            labels, predictions, (1, 2), (0.002,), metadata,
+            samples=5, seed=7, workers=2, rebalance_stride=2,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["top"], parallel["top"])
+        market = first["market_equal_weight"]["target_net_ret_t1"]["cost_20bp"]
+        self.assertAlmostEqual(market["mean_return"], 0.013)
+        strided_market = strided["market_equal_weight"]["target_net_ret_t1"]["cost_20bp"]
+        self.assertEqual(strided["rebalance_stride"], 2)
+        self.assertEqual(strided_market["days"], 1)
+        self.assertAlmostEqual(strided_market["mean_return"], 0.023)
+        for top_n in ("1", "2"):
+            controls = first["top"][top_n]["target_net_ret_t1"]["cost_20bp"]
+            self.assertEqual(controls["random_topn"]["samples"], 5)
+            self.assertEqual(controls["score_shuffle"]["samples"], 5)
+
+    def test_negative_controls_report_paired_holm_family(self):
+        dates = pd.date_range("2026-01-01", periods=12, freq="D").repeat(4)
+        labels = pd.DataFrame({
+            "code": ["600000", "600001", "600002", "600003"] * 12,
+            "date": dates,
+            "entry_buyable": [True] * 48,
+            "gross__target_net_ret_t1": [0.04, 0.02, 0.0, -0.02] * 12,
+        })
+        predictions = pd.DataFrame({
+            "code": labels["code"],
+            "date": dates,
+            "score": [4.0, 3.0, 2.0, 1.0] * 12,
+        })
+        metadata = {"gross_columns": {"target_net_ret_t1": "gross__target_net_ret_t1"}}
+        serial = _evaluate_negative_controls(
+            labels, predictions, (1,), (0.002,), metadata,
+            samples=7, seed=19, workers=1, bootstrap_samples=99, block_length=3,
+        )
+        parallel = _evaluate_negative_controls(
+            labels, predictions, (1,), (0.002,), metadata,
+            samples=7, seed=19, workers=2, bootstrap_samples=99, block_length=3,
+        )
+        self.assertEqual(serial["top"], parallel["top"])
+        comparisons = serial["top"]["1"]["target_net_ret_t1"]["cost_20bp"][
+            "paired_comparisons"
+        ]
+        self.assertEqual(set(comparisons), {"market_equal_weight", "random_topn", "score_shuffle"})
+        for comparison in comparisons.values():
+            self.assertTrue(comparison["available"])
+            self.assertEqual(comparison["days"], 12)
+            self.assertEqual(comparison["holm_family_size"], 3)
+            self.assertGreaterEqual(comparison["p_value_holm"], comparison["p_value_one_sided"])
 
     def test_common_universe_uses_identical_date_code_keys(self):
         labels = pd.DataFrame({
@@ -668,6 +846,34 @@ class FairRacePipelineTest(unittest.TestCase):
         self.assertFalse(bool(panel.iloc[1]["signal_eligible"]))
         self.assertNotIn("target_penalty_net_ret_t1", sum(groups.values(), []))
 
+    def test_recipe_evaluation_uses_one_common_prediction_universe(self):
+        dates = pd.to_datetime(["2026-07-01", "2026-07-02"])
+        predictions = {
+            "recipe_a": pd.DataFrame({
+                "code": ["600000", "600000"],
+                "date": dates,
+                "score": [2.0, 1.0],
+            }),
+            "recipe_b": pd.DataFrame({
+                "code": ["600000"],
+                "date": dates[1:],
+                "score": [1.0],
+            }),
+        }
+        labels = pd.DataFrame({
+            "code": ["600000", "600000"],
+            "date": dates,
+            "entry_buyable": [True, True],
+            "target_outcome_observed_t1": [True, True],
+            "target_net_ret_t1": [0.01, 0.02],
+        })
+
+        records, metrics = _evaluate_recipe_frames(predictions, labels, top_n=1)
+
+        self.assertEqual(set(records["signal_date"]), {dates[1]})
+        self.assertEqual(metrics["recipe_a"]["selected"], 1)
+        self.assertEqual(metrics["recipe_b"]["selected"], 1)
+
     def test_binary_classifier_returns_sellable_probability(self):
         rows = []
         dates = pd.bdate_range("2026-06-01", periods=12)
@@ -938,6 +1144,10 @@ class FairRacePipelineTest(unittest.TestCase):
         result = panel_for_variant(panel, variant)
         self.assertEqual(result["target_penalty_net_ret_t1"].tolist(), [0.01, 0.03])
         self.assertEqual(panel["target_penalty_net_ret_t1"].tolist(), original.tolist())
+        source_feature = "daily__ret_5d"
+        source_values = panel[source_feature].copy()
+        result.loc[result.index[0], source_feature] = 999.0
+        pd.testing.assert_series_equal(panel[source_feature], source_values)
         self.assertTrue(np.allclose(
             result.groupby("date")["target_penalty_excess_ret_t1"].mean(), 0.0,
         ))
@@ -1180,6 +1390,45 @@ class StructuralComboTest(unittest.TestCase):
         shifted = shift_daily_prior_to_signal(daily, calendar)
         self.assertEqual(shifted["source_date"].tolist(), calendar[:2].tolist())
         self.assertEqual(shifted["date"].tolist(), calendar[1:].tolist())
+
+    def test_e4_coverage_rejects_missing_expected_date(self):
+        daily = pd.DataFrame({
+            "code": ["600000"],
+            "date": pd.to_datetime(["2026-07-06"]),
+            "pred": [1.0],
+        })
+        minute = pd.DataFrame({
+            "code": ["600000"],
+            "date": pd.to_datetime(["2026-07-06"]),
+            "score": [1.0],
+        })
+        with self.assertRaisesRegex(ValueError, "2026-07-07"):
+            e4_coverage_diagnostics(
+                daily,
+                minute,
+                pd.to_datetime(["2026-07-06", "2026-07-07"]),
+                candidate_n=10,
+            )
+
+    def test_e4_coverage_reports_top_candidate_retention(self):
+        date = pd.Timestamp("2026-07-06")
+        codes = [f"{600000 + index:06d}" for index in range(20)]
+        daily = pd.DataFrame({
+            "code": codes,
+            "date": date,
+            "pred": np.arange(20, dtype=float),
+        })
+        minute = pd.DataFrame({
+            "code": codes[:5],
+            "date": date,
+            "score": np.arange(5, dtype=float),
+        })
+        diagnostics = e4_coverage_diagnostics(
+            daily, minute, pd.DatetimeIndex([date]), candidate_n=10
+        )
+        self.assertEqual(diagnostics["candidate_rows"], 10)
+        self.assertEqual(diagnostics["minute_matched_candidate_rows"], 0)
+        self.assertEqual(diagnostics["top_candidate_retention"], 0.0)
 
     def test_daily_execution_filter_keeps_daily_rank_after_buy_gate(self):
         date = pd.Timestamp("2026-07-06")

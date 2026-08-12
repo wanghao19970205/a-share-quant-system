@@ -7,7 +7,7 @@
 实时层负责四件事：
 
 1. 订阅模型候选和持仓的 Level-1 快照。
-2. 在模型候选池内进行有界盘中重排，并推送 Top5 候选榜。
+2. 在模型候选池内进行有界盘中重排，并推送带个股主行业和精简概念标签的 Top5 候选榜。
 3. 用纸上账户执行收盘前买入、A 股 T+1 风控和卖出。
 4. 记录信号、候选过滤、成交和卖出后反事实，供前向评估。
 
@@ -38,7 +38,7 @@
 
 订阅优先级如下：
 
-1. 全部模拟盘账户持仓（`paper_state.json` 与启用时的 `paper_state_v2.json`）；
+1. 全部模拟盘账户持仓（`paper_state.json` 与启用时的 `_v2` 到 `_v5` 独立状态）；
 2. `realtime_holdings.txt` 中的人工持仓；
 3. `mobile_snapshot.json` 中固定候选组（白名单 Top10、全A Top30、创新药 Top10）；
 4. 固定候选快照缺失时使用最新预测文件；
@@ -47,6 +47,16 @@
 模拟盘和人工持仓属于保护性订阅，优先于候选清单。即使保护性持仓数量超过 `REALTIME_MAX_SUBSCRIBE`，也不能因截断而失去报价和卖出能力。
 
 引擎监听固定候选快照、人工持仓和模拟盘状态文件的 mtime。代码集合发生变化时使用 `execv` 自我重启，重新建立订阅。
+
+实际账户持仓使用挂载盘 `logs/realtime/realtime_holdings.txt`，与 V1-V5 模拟盘严格隔离。兼容旧格式 `代码 [买入日期]`；完整格式为：
+
+```text
+# actual_cash=5467.81 updated=2026-08-06
+600664 - 5800 5000 5.592 15 # 哈药股份
+# 代码 买入日期|- 持股数 可用数 成本价 持股交易日 # 名称
+```
+
+RankBoard Push 会附带只读调仓摘要，直接使用“继续持有、暂时不要加仓、建议卖出约 N 股、建议考虑卖出一部分或全部”等大白话，并说明当前占总资产比例、相对成本赚亏、模型预计收益和行业强弱。系统不会生成真实委托，也不会修改任何模拟盘文件。默认单票占总资产超过 35% 时计算建议卖出的整手股数；可通过 `REALTIME_ACTUAL_ADVICE`、`REALTIME_ACTUAL_MAX_WEIGHT`、`REALTIME_ACTUAL_PROFIT_LOCK` 和 `REALTIME_ACTUAL_LOSS_REVIEW` 调整或关闭。
 
 ## 4. 预期收益口径
 
@@ -119,15 +129,15 @@ score = expected_return * (1 + clamp(adj, -cap, +cap))
 
 ## 6. 模拟盘买入
 
-V1-V4 统一买入窗口为 14:50-14:55（闭区间），每个交易日每版只执行一次。
+V1-V5 统一买入窗口为 14:50-14:55（闭区间）：14:50 执行 primary，只有未成交账户在 14:53 执行 retry，每个阶段最多执行一次。
 
 执行顺序：
 
 1. 14:50 后先处理旧仓风险和到期卖出；
-2. 同一轮卖出腿完成后，在 14:50-14:55 内读取当日模型候选；
+2. 同一轮卖出腿完成后，在 primary/retry 阶段读取当日模型候选；
 3. 按重排后的 `score` 降序检查候选；
 4. 买入通过过滤的前 2 只；
-5. 现金按目标只数等额分配，股数向下取整到 100 股；
+5. 预算取剩余名额均分、ATR 风险额度和单票净值上限的最小值，股数向下取整到 100 股；
 6. 买入成本按 round-trip 成本的一半计入。
 
 默认买前过滤：
@@ -180,9 +190,9 @@ REALTIME_PAPER_VWAP_BREAK=0.02
 
 `GapCalibrate` 类仍保留用于显式实验，但不进入默认装配。
 
-信号策略不直接替代 `PaperTrader` 的成交判断。生产默认 `REALTIME_SIGNAL_PUSH=false`：六类通用信号和行业 ETF 状态只写账本、不发 Push；仅保留 RankBoard 的 Top 榜和 V1-V4 模拟盘买卖 Push。需要临时恢复通用信号提醒时，显式设置 `REALTIME_SIGNAL_PUSH=true`，再由 `REALTIME_NOTIFY_KINDS` 控制白名单。
+信号策略不直接替代 `PaperTrader` 的成交判断。生产默认 `REALTIME_SIGNAL_PUSH=false`：六类通用信号和行业 ETF 状态只写账本、不发 Push；仅保留 RankBoard 的 Top 榜和 V1-V5 模拟盘买卖 Push。需要临时恢复通用信号提醒时，显式设置 `REALTIME_SIGNAL_PUSH=true`，再由 `REALTIME_NOTIFY_KINDS` 控制白名单。
 
-### V1-V4 赛马总览
+### V1-V5 赛马总览
 
 | 版本 | 买卖成交价 | 入场增强 | 出场与风险 | 独立文件 |
 |---|---|---|---|---|
@@ -190,8 +200,9 @@ REALTIME_PAPER_VWAP_BREAK=0.02
 | **V2** | `last / last` | V1 + 持仓上限 | 保护止盈、炸板、跌停顺延、时间加权止盈 | `_v2` |
 | **V3** | `ask1 / bid1` | 当日预测、新鲜度、盘口确认 + 风险预算 | 入场锁定ATR、硬止损/止盈/移动止盈、T+N | `_v3` |
 | **V4** | `ask1 / bid1` | V3 + 精确主行业ETF弱势与集中度控制 | 完整继承V3，暂不叠加板块卖出 | `_v4` |
+| **V5** | `ask1 / bid1` | V4 + 行业相对强度动态仓位 | 完整继承V4，只改变风险预算 | `_v5` |
 
-四个账户共享模型候选池、交易成本和二阶段买入：14:50 执行 `primary`，仅未成交账户在 14:53 执行 `retry`，14:55 后关闭；阶段状态跨重启持久化且分别形成审计。仓位取剩余名额均分、ATR 单笔风险额度和单票净值上限的最小值，融合预期收益只做 0.75-1.25 倍有限调整，缺 ATR 时退回固定止损口径。任一版本装配或交易异常均独立降级，不影响其他版本。
+五个账户共享模型候选池、交易成本和二阶段买入：14:50 执行 `primary`，仅未成交账户在 14:53 执行 `retry`，14:55 后关闭；阶段状态跨重启持久化且分别形成审计。仓位取剩余名额均分、ATR 单笔风险额度和单票净值上限的最小值，融合预期收益只做 0.75-1.25 倍有限调整，缺 ATR 时退回固定止损口径。任一版本装配或交易异常均独立降级，不影响其他版本。
 
 ## 8.1 V2 赛马账户
 
@@ -261,7 +272,7 @@ V3 使用更保守的可成交报价，绝对净值可能低于按 `last` 结算
 
 ## 8.3 V4 赛马账户
 
-V4 完整继承 V3 的候选池、当日预测、盘口确认、`ask1/bid1` 成交、T+1 和 ATR 出场，使用独立 `_v4` 文件。第一版只增加一个策略变量：读取本地 `all_a_stock_meta.parquet` 的申万三级主行业 `a_industry`，按版本化精确表映射行业 ETF，并用其相对沪深300 ETF 的当日收益确认入场环境。`a_industries` 只进审计，不参与匹配；概念和模糊关键词均不参与。
+V4 完整继承 V3 的候选池、当日预测、盘口确认、`ask1/bid1` 成交、T+1 和 ATR 出场，使用独立 `_v4` 文件。第一版只增加一个策略变量：读取本地 `all_a_stock_meta.parquet` 的东财最细行业板块 `a_industry`，按版本化精确表映射比较 ETF，并用其相对沪深300 ETF 的当日收益确认入场环境。`a_industries` 只进审计/展示，不参与匹配；概念和模糊关键词均不参与 V4/V5 交易判断。
 
 - 映射必须为 `exact_primary` 且置信度不低于 `0.8`，同时 `行业ETF收益 - 沪深300ETF收益 <= -0.3%` 时才判为弱势并拒绝候选；
 - 强势和中性均按 V3 原规则处理，不加仓、不改排序、不改卖点；
@@ -269,7 +280,7 @@ V4 完整继承 V3 的候选池、当日预测、盘口确认、`ask1/bid1` 成�
 - ETF 与个股使用同一个 `SubscribeData` 登录会话，完整保留 `.SH/.SZ` 后缀；ETF回调只进入板块上下文，不进入个股策略；
 - ETF强弱状态切换写入 `signals_YYYYMMDD.jsonl`，V4买入审计记录映射版本、来源、置信度、主行业、完整行业层级、ETF、基准、超额收益、行情年龄和过滤原因。
 
-默认精确覆盖半导体、证券、银行、医药、军工、锂电/新能源车、光伏、有色、食品饮料、计算机和通信的指定申万三级行业。可用 `REALTIME_SECTOR_ETFS` 按 `名称=完整ETF代码:精确主行业1|精确主行业2;...` 覆盖；同一主行业出现多次时冲突项会被拒绝，防止配置顺序决定归属。关键参数：
+默认精确覆盖半导体、证券、银行、医药、军工、锂电/新能源车、光伏、有色、食品饮料、计算机和通信的指定东财细分行业。Push 将“细分行业”和“走势比较 ETF”分开显示；例如哈药显示 `化学制剂/化学制药`，并注明使用 `医药宽基ETF(512010.SH)` 比较，不能把宽基 ETF 名称理解为个股精确行业。创新药等概念只有在元数据明确命中时才展示，不能替代精确行业映射；元数据超过 7 日未更新时，实际持仓建议会明确提示可能漏掉近期热点。可用 `REALTIME_SECTOR_ETFS` 按 `名称=完整ETF代码:精确主行业1|精确主行业2;...` 覆盖；同一主行业出现多次时冲突项会被拒绝，防止配置顺序决定归属。关键参数：
 
 ```text
 REALTIME_PAPER_V4=true
@@ -282,6 +293,29 @@ REALTIME_PAPER_V4_SECTOR_MAPPING_MIN_CONFIDENCE=0.8
 ```
 
 V1/V2/V3/V4 的持仓都由 `config.paper_state_files()` 纳入保护性订阅和热重载。V3 对 V4 的主要差异为“是否回避相对弱势行业”，赛马时应重点比较 V4 过滤候选的后续收益反事实、交易覆盖率和回撤。
+
+## 8.4 V5 赛马账户
+
+V5 完整继承 V4 的候选、弱势拒绝、同行业上限、二阶段买入、`ask1/bid1` 成交和 ATR 退出，只改变一个变量：行业 ETF 相对沪深300的强度对风险额度的缩放。
+
+```text
+相对收益 <= -0.30%：继承 V4，拒绝买入
+-0.30% < 相对收益 < 0%：风险额度 x 0.85
+0% <= 相对收益 < +0.30%：风险额度 x 1.00
+相对收益 >= +0.30%：风险额度 x 1.15
+低置信度、无映射或 ETF 行情不可用：风险额度 x 1.00
+```
+
+行业系数只作用于 ATR 风险额度，最终预算仍重新受现金、剩余名额均分和单票净值上限约束，因此 `1.15x` 不会突破 40% 单票硬上限。买入持仓和决策审计记录 `sector_allocation`，卖出流水保留 `sector_allocation_at_entry`，用于与 V4 做同候选、同买卖点的仓位归因。
+
+```text
+REALTIME_PAPER_V5=true
+REALTIME_PAPER_V5_SECTOR_LAGGING_FACTOR=0.85
+REALTIME_PAPER_V5_SECTOR_NEUTRAL_FACTOR=1.00
+REALTIME_PAPER_V5_SECTOR_STRONG_FACTOR=1.15
+```
+
+V1-V5 的持仓都由 `config.paper_state_files()` 纳入保护性订阅和热重载。V4/V5 赛马应重点比较成本后收益、最大回撤，以及 strong/neutral/lagging 三组实际兑现收益，不能仅按绝对净值晋级。
 
 ## 9. 持久化与决策审计
 
@@ -296,6 +330,7 @@ V1/V2/V3/V4 的持仓都由 `config.paper_state_files()` 纳入保护性订阅�
 | `paper_*_v2.json(l)` | V2 赛马账户的同名独立副本 |
 | `paper_*_v3.json(l)` | V3 可成交报价与 ATR 规则账户的同名独立副本 |
 | `paper_*_v4.json(l)` | V4 行业ETF弱势回避账户的同名独立副本 |
+| `paper_*_v5.json(l)` | V5 行业相对强度动态仓位账户的同名独立副本 |
 | `signals_YYYYMMDD.jsonl` | 实时信号账本（含ETF强弱状态切换） |
 | `engine.YYYYMMDD.log` | 引擎运行日志 |
 
@@ -336,11 +371,15 @@ REALTIME_EFFECT_SHUTDOWN_GRACE_SEC=3
 
 心跳中的 `effects_pending`、`effects_done`、`effects_dropped` 分别表示待处理、已处理和因队列满而丢弃的副作用任务。`effects_dropped` 非零通常表示通知服务持续超时，需要先检查推送通道，再决定是否调整队列容量。
 
-### Realtime 权重影子评估
+### Realtime 权重自动例行任务
 
-`python -m realtime.weight_shadow` 只读包含 `target_ret_1d` 的历史预测，按滚动窗口执行 Ridge/ElasticNet/ExtraTrees 非负约束堆叠和确定性进化搜索。结果写入 `logs/realtime/weight_shadow/manifest.json` 及 `versions/<version>.json`，状态为 `shadow/eligible/rejected`。
+工作日 18:30 由独立 `realtime-weight-shadow` 任务读取包含 `target_ret_1d` 的历史预测，先在非负且和为1的单纯形上做投影梯度约束堆叠，再用24个候选、24代精英保留/交叉/变异做确定性进化搜索；不是固定网格枚举。互相独立的滚动调仓窗口默认由4个 worker 并发。只有存在有限兑现标签和至少一条有效模型预测的日期才进入训练/调仓日历；某日只有在其权重完全由此前训练窗口产生时才计为样本外交易日，一天数千只股票仍只算一个日期。至少 40 个样本外交易日才允许进入晋级判断。
 
-影子 manifest 固定 `publishable=false`、`auto_apply=false`，至少积累 20 个样本外交易日才可能进入 `eligible`，且仍要求人工审核。该命令不写 `active_quant_model.json`，不修改 `notify.env` 权重，不被 daily/intraday/weekly/monthly 模型任务读取。
+当前优化目标是全截面截断 MSE，自动晋级指标是样本外 Top10 等权组合收益、Sharpe、胜率和回撤，两者口径差异会写入 manifest 诊断。该诊断用于识别全押单模型等目标错位，不会放宽晋级门槛；改为组合/排序目标前必须作为独立 Challenger 积累 OOS 证据。
+
+Challenger 必须同时通过成本后平均收益、Sharpe、胜率、最大回撤、单次权重跳变和晋级冷静期门槛。通过后原子写入 `logs/realtime/weight_shadow/active_weights.json`，V1-V5 下一次引擎启动共同读取；缺失、损坏、负数或非有限权重会安全回退 `30%/20%/50%` 环境配置。晋级后新增至少 10 个前向交易日持续跑输上一 Champion 时自动回滚。
+
+评估版本、当前报告和晋级历史分别写入 `versions/<version>.json`、`manifest.json` 和 `promotion_history.jsonl`。并发数可用 `REALTIME_WEIGHT_SHADOW_WORKERS` 调整，生产夹紧在1-4，默认4。该任务不写 `active_quant_model.json`，不修改 `notify.env`，不调用模型训练/发布，也不被 daily/intraday/weekly/monthly 模型任务读取。
 
 ## 10. 运行与验证
 
@@ -360,8 +399,10 @@ docker compose exec -T scheduler python -m realtime.selftest
 # 虚拟数据流回归
 bash run_sim_streams.sh
 
-# 手工运行 realtime-only 权重影子评估（只产出建议，不自动应用）
-docker compose exec -T scheduler python -m realtime.weight_shadow
+# 手工补跑自动评估/晋级任务（生产已由工作日 18:30 cron 例行触发）
+docker compose exec -T scheduler /app/docker/scheduler_jobs.sh realtime-weight-shadow
+# 仅评估、不晋级
+docker compose exec -T scheduler python -m realtime.weight_shadow --evaluate-only
 
 # 查看运行时关键参数（只打印非密钥字段）
 docker compose exec -T scheduler python -c "from realtime.config import load; c=load(); print(c.paper_time_cap_start, c.paper_buy_start, c.sell_horizon, c.paper_cost)"
@@ -371,15 +412,15 @@ docker compose exec -T scheduler python -c "from realtime.config import load; c=
 
 | 检查项 | 正常标准 | 异常时的含义 |
 |---|---|---|
-| 当日预测 | 14:50前预测最大日期等于交易日 | V3/V4会记录 `预测非当日` 并拒绝新仓 |
+| 当日预测 | 14:50前预测最大日期等于交易日 | V3-V5会记录 `预测非当日` 并拒绝新仓 |
 | 实时行情 | 14:50附近心跳 `active=True` 且 `recv` 持续增长 | 买入窗口可能未获得有效盘口 |
-| 四版决策 | 每版有 primary；未成交版本另有 retry 事件 | 缺失阶段表示买入腿未执行或审计写入失败 |
-| ETF行情 | `sector_recv > 0`，ETF强/中/弱分布可见 | V4标记 `sector_quote_unavailable` 并安全退化为V3 |
+| 五版决策 | 每版有 primary；未成交版本另有 retry 事件 | 缺失阶段表示买入腿未执行或审计写入失败 |
+| ETF行情 | `sector_recv > 0`，ETF强/中/弱分布可见 | V4放行不可用信号，V5按1.00x安全降级 |
 | 异步副作用 | `effects_dropped=0` | 非零表示通知/账本队列持续拥塞 |
 
-`paper_state_v3.json` 和 `paper_state_v4.json` 在首次买入决策保存时才创建；仅在部署后、买入窗口前不存在不代表故障。排查零成交优先运行 `./restart.sh diag`，再查看对应版本决策事件，不应只检查成交流水。
+`paper_state_v3.json`、`paper_state_v4.json` 和 `paper_state_v5.json` 在首次买入决策保存时才创建；仅在部署后、买入窗口前不存在不代表故障。排查零成交优先运行 `./restart.sh diag`，再查看对应版本决策事件，不应只检查成交流水。
 
-当前虚拟数据流回归为 **106 PASS / 0 FAIL**，覆盖模型池封闭、重排有界、A 股 T+1、五级卖出、保护性订阅、融合预期成本安全边际门、二阶段买入及跨重启恢复、决策 trace 和反事实幂等补齐；V1-V4 的 ATR 风险预算、融合收益有限加权、整手约束和 V4 行业集中度；V2-V4 的账户隔离与执行差异；四版同场买卖完整生命周期；NaN/Inf、全模型异常、无效盘口、损坏状态文件故障注入；以及 realtime-only 滚动约束、进化权重、20 日 OOS 和禁止 active model 写入。
+当前虚拟数据流回归为 **128 PASS / 0 FAIL**，覆盖模型池封闭、重排有界、要求有效实时价且排除封涨停票的行业/概念 Top5 Push、实际持仓扩展格式与只读调仓建议隔离、绕过行情 SDK stop 的安全热重载、A 股 T+1、五级卖出、保护性订阅、融合预期成本安全边际门、二阶段买入及跨重启恢复、决策 trace 和反事实幂等补齐；V1-V5 的 ATR 风险预算、融合收益有限加权和整手约束；V4 行业集中度；V5 strong/neutral/lagging 动态仓位、缺行情降级、独立账户和保护性订阅；四版基线同场买卖完整生命周期；NaN/Inf、全模型异常、无效盘口、损坏状态文件故障注入；以及 realtime-only 滚动约束、未兑现日期排除、进化权重目标诊断、40 日 OOS、4 worker 确定性、自动晋级、损坏回退、幂等执行和 10 日前向回滚。
 
 ## 11. 部署纪律
 
@@ -398,7 +439,7 @@ docker compose exec -T scheduler python -c "from realtime.config import load; c=
 - 模拟盘历史样本仍少，不能据此精确拟合止损、止盈、ATR 或 VWAP 阈值；
 - VWAP 位置已有离线正向证据，L1 imbalance 和 spread 仍需依靠买入决策审计做前向评估；
 - 模拟盘使用实时快照近似成交，未建模完整盘口冲击、排队和实际成交概率；V3 只确认一档报价与挂单方向，SDK 挂单量单位核实前不把一档容量当作完整成交深度；
-- V3/V4 新鲜度表示本进程最近收到回调的时间，`trade_time` 格式和时区经真实回调确认前，不能识别行情源重放旧时间戳的情况；
-- V4 的 ETF 是行业价格代理，不等于完整成分股广度；ETF折溢价、资金申赎和行业映射覆盖会产生跟踪误差，必须结合过滤反事实前向评估；
+- V3-V5 新鲜度表示本进程最近收到回调的时间，`trade_time` 格式和时区经真实回调确认前，不能识别行情源重放旧时间戳的情况；
+- V4/V5 的 ETF 是行业价格代理，不等于完整成分股广度；ETF折溢价、资金申赎和行业映射覆盖会产生跟踪误差，必须结合过滤与仓位反事实前向评估；
 - 日线反事实只能评估收盘和日内最高价，不能重建分钟级最优退出路径；
 - `notify.env` 含推送和行情凭证，只能存放在挂载盘，禁止提交到 git。

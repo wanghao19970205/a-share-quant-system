@@ -543,13 +543,14 @@ class PaperTrader:
         risk_budget_cash = equity * self._risk_per_trade * signal_factor
         risk_position_cap = risk_budget_cash / risk_pct if risk_pct > 0 else position_cap
         allocation_factor, factor_reason = self._allocation_factor(code)
-        budget = max(0.0, min(cash, equal_budget, position_cap,
-                              risk_position_cap) * max(0.0, allocation_factor))
+        adjusted_risk_cap = risk_position_cap * max(0.0, allocation_factor)
+        budget = max(0.0, min(cash, equal_budget, position_cap, adjusted_risk_cap))
         return budget, {
             "allocation_method": "risk_budget_v1",
             "equal_budget": round(equal_budget, 2),
             "position_cap": round(position_cap, 2),
             "risk_position_cap": round(risk_position_cap, 2),
+            "adjusted_risk_cap": round(adjusted_risk_cap, 2),
             "risk_budget_cash": round(risk_budget_cash, 2),
             "risk_pct": round(risk_pct, 6), "risk_source": risk_source,
             "allocation_atr": atr, "signal_factor": round(signal_factor, 4),

@@ -37,6 +37,7 @@ ENV PYTHONPATH=/app
 COPY quant ./quant
 COPY stock_analyzer ./stock_analyzer
 COPY realtime ./realtime
+COPY intraday_1400 ./intraday_1400
 COPY docker ./docker
 
 # 定时任务（cron.d 需 root 用户列、0644 权限；文件名不含点，避免 run-parts 忽略）

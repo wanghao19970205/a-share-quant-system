@@ -57,7 +57,17 @@ services:
       - SNAPSHOT_DIR=/app/snapshots
       - QUANT_DATA_DIR=/app/quant_data/full_a_2018_wide
       - QUANT_MODEL=active_quant
+      - SCHEDULER_DISABLED=1
+      - INTRADAY_1400_DATA_DIR=/app/intraday_1400_data
+      - INTRADAY_1400_MINUTE_BATCH_SIZE=50
+      - INTRADAY_1400_PARTITION_SIZE=50
+      - INTRADAY_1400_MINUTE_TIMEOUT=180
+      - INTRADAY_1400_FEATURE_WORKERS=12
+      - INTRADAY_1400_PIPELINE_WORKERS=8
       - AMAZINGDATA_AUTO_LOGIN=1
+      - AMAZINGDATA_KLINE_BATCH_SIZE=800
+      - AMAZINGDATA_KLINE_TIMEOUT=180
+      - AMAZINGDATA_FACTOR_TIMEOUT=240
       - TZ=Asia/Shanghai
       - PYTHONPATH=/app
       - LOG_DIR=/app/logs
@@ -69,6 +79,7 @@ services:
     volumes:
       - ./snapshots:/app/snapshots                                   # 快照读写
       - ./quant_data/full_a_2018_wide:/app/quant_data/full_a_2018_wide  # 行情/预测读写
+      - ./intraday_1400_data:/app/intraday_1400_data                 # 14:00分钟模型独立数据/影子产物
       - ./logs:/app/logs                                             # 定时任务日志
     restart: unless-stopped
     logging:

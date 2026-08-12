@@ -22,19 +22,27 @@ from pathlib import Path
 
 import pandas as pd
 
+from realtime import engine as engine_mod
 from realtime import paper_trader as paper_mod
 from realtime.snapshot import Snapshot, from_mapping
 from realtime.strategy import StrategyContext, default_strategies
 from realtime.rerank import RerankScorer
+from realtime.rankboard import RankBoard
 from realtime.paper_trader import PaperTrader
 from realtime.v2 import V2PaperTrader
 from realtime.v3 import V3PaperTrader
 from realtime.v4 import V4PaperTrader
+from realtime.v5 import V5PaperTrader
 from realtime.sector_etf import SectorETFContext
 from realtime.feed import subscription_code
-from realtime.reference import RefRow, _load_expected_return, expected_return_text
+from realtime.reference import (RefRow, _load_expected_return, _load_hold_days,
+                                _return_model_weights, expected_return_text,
+                                load_actual_holdings)
 from realtime.watchlist import load_codes
-from realtime.weight_shadow import evaluate as evaluate_weight_shadow
+from realtime.weight_shadow import (evaluate as evaluate_weight_shadow,
+                                    run_routine as run_weight_routine,
+                                    walk_forward as walk_forward_weights)
+from realtime.weight_manifest import atomic_write_json
 
 # ---- 轻量断言框架 ----------------------------------------------------------
 _PASS = 0
@@ -57,6 +65,7 @@ class Cfg:
     paper_v2_enabled = True
     paper_v3_enabled = True
     paper_v4_enabled = True
+    paper_v5_enabled = True
     sector_etf_enabled = True
     sector_etf_benchmark = "510300.SH"
     sector_etf_specs = (
@@ -67,6 +76,9 @@ class Cfg:
     paper_v4_sector_weak_excess = -0.003
     paper_v4_sector_strong_excess = 0.003
     paper_v4_sector_mapping_min_confidence = 0.8
+    paper_v5_sector_lagging_factor = 0.85
+    paper_v5_sector_neutral_factor = 1.00
+    paper_v5_sector_strong_factor = 1.15
     sector_meta_file = ""
     paper_buy_n = 2
     paper_buy_start = 1450
@@ -96,6 +108,7 @@ class Cfg:
     paper_entry_rich = 0.01
     paper_entry_ask_strong = 0.2
     ledger_dir = "/tmp"
+    max_subscribe = 100
     paper_state_file = ""  # 每场景覆盖
     rerank_enabled = True
     rank_pool_n = 30
@@ -175,6 +188,8 @@ def new_cfg(**over):
             files.append(base.parent / f"{base.stem}_v3{base.suffix}")
         if getattr(c, "paper_v4_enabled", False):
             files.append(base.parent / f"{base.stem}_v4{base.suffix}")
+        if getattr(c, "paper_v5_enabled", False):
+            files.append(base.parent / f"{base.stem}_v5{base.suffix}")
         return tuple(files)
 
     c.paper_state_files = _paper_state_files
@@ -865,11 +880,14 @@ def scenario_O():
     cfg.sector_meta_file = root / "all_a_stock_meta.parquet"
     pd.DataFrame([
         {"code": "000970", "a_industry": "数字芯片设计",
-         "a_industries": "数字芯片设计、集成电路、电子"},
+         "a_industries": "数字芯片设计、集成电路、电子",
+         "a_concepts": "芯片概念、人工智能、先进封装"},
         {"code": "000971", "a_industry": "股份制银行Ⅲ",
-         "a_industries": "股份制银行Ⅲ、银行Ⅱ、银行"},
+         "a_industries": "股份制银行Ⅲ、银行Ⅱ、银行",
+         "a_concepts": "中特估、沪股通"},
         {"code": "000972", "a_industry": "印制电路板",
-         "a_industries": "印制电路板、军工电子Ⅱ、电子"},
+         "a_industries": "印制电路板、军工电子Ⅱ、电子",
+         "a_concepts": ""},
     ]).to_parquet(cfg.sector_meta_file, index=False)
     sector = SectorETFContext(cfg)
     now = time.time()
@@ -902,7 +920,7 @@ def scenario_O():
     sector_entry = position.get("sector_etf", {})
     check(sector_entry.get("etf_code") == "512800.SH",
           "V4 持仓锁定入场行业ETF上下文，供平仓归因")
-    check(sector_entry.get("mapping_version") == "industry_etf_exact_v2" and
+    check(sector_entry.get("mapping_version") == "industry_etf_exact_v3" and
           sector_entry.get("mapping_source") == "exact_primary" and
           sector_entry.get("mapping_confidence") == 1.0 and
           sector_entry.get("stock_industry") == "股份制银行Ⅲ",
@@ -912,6 +930,31 @@ def scenario_O():
     check(audit["schema_version"] == 4 and audit["event_type"] == "paper_buy_decision_v4" and
           "行业ETF相对弱势" in weak_row.get("entry_filter_reason", ""),
           "V4 独立审计记录版本、ETF弱势过滤原因和候选快照")
+    meta = sector.assessment_for_stock("000970")
+    check(meta["stock_industry"] == "数字芯片设计" and
+          meta["stock_concepts"] == "芯片概念、人工智能、先进封装",
+          "行业上下文启动期缓存个股主行业和概念元数据")
+    rankboard = RankBoard(
+        cfg, ctx, FakeNotifier(), {"000970": "芯片股", "000971": "银行股"}, sector)
+    _, rank_body, _ = rankboard._render(rankboard._rank())
+    check("[细分行业:数字芯片设计/集成电路 概念:芯片概念/人工智能 "
+          "比较ETF:半导体(512480.SH)]" in rank_body and
+          "先进封装" not in rank_body,
+          "Top5 Push 展示主行业和最多两个概念，限制正文长度")
+    check("000972" in rank_body and "行业:印制电路板" in rank_body,
+          "概念缺失时 Top5 Push 保留行业并安全省略空概念")
+    limit_ctx = build_ctx({
+        "000981": RefRow(expected_return=0.04, prediction_date=today),
+        "000982": RefRow(expected_return=0.06, prediction_date=today),
+        "000983": RefRow(expected_return=0.05, prediction_date=today),
+    }, [
+        mk_snap("000981", 10.0, pre_close=10.0),
+        mk_snap("000982", 11.0, pre_close=10.0, high_limit=11.0),
+    ])
+    visible = [row.code for row in RankBoard(
+        cfg, limit_ctx, FakeNotifier(), sector_ctx=sector)._rank()]
+    check(visible == ["000981"],
+          "Top5 同时剔除已封涨停票和启动期尚无实时价的未知状态票")
     check(all("_v4" in p.name for p in (
         trader._state_file, trader._trades_file, trader._decisions_file,
         trader._counterfactuals_file)),
@@ -1302,7 +1345,7 @@ def scenario_U():
     source = root / "historical_predictions.parquet"
     output = root / "weight_shadow"
     rows = []
-    dates = pd.bdate_range("2026-05-01", periods=35)
+    dates = pd.bdate_range("2026-04-01", periods=55)
     for day_index, date in enumerate(dates):
         for code_index in range(16):
             signal = (code_index - 7.5) / 1000.0
@@ -1313,13 +1356,27 @@ def scenario_U():
                 "extra_trees_pred": signal,
                 "target_ret_1d": signal,
             })
+    future_date = dates[-1] + pd.offsets.BDay(1)
+    for code_index in range(16):
+        rows.append({
+            "code": str(code_index).zfill(6), "date": future_date,
+            "ridge_pred": 0.01, "elastic_pred": 0.01,
+            "extra_trees_pred": 0.01, "target_ret_1d": None,
+        })
     pd.DataFrame(rows).to_parquet(source, index=False)
     manifest = evaluate_weight_shadow(
-        source, output, train_days=10, min_oos_days=20,
-        rebalance_days=5, cost=0.0)
-    check(manifest["oos"]["candidate"]["days"] >= 20 and
+        source, output, train_days=10, min_oos_days=40,
+        rebalance_days=5, cost=0.0, workers=4)
+    check(manifest["oos"]["candidate"]["days"] >= 40 and
           manifest["proposed_weights"]["extra_trees_pred"] > 0.6,
-          "滚动约束与进化搜索识别有效 ExtraTrees 收益腿并形成 20 日以上 OOS")
+          "滚动约束与进化搜索识别有效 ExtraTrees 收益腿并形成 40 日以上 OOS")
+    check(manifest["evaluation_period"]["end"] == str(dates[-1].date()) and
+          manifest["data_quality"]["realized_dates"] == len(dates),
+          "最新未兑现预测日期不进入训练、调仓日历或 OOS 区间")
+    check(manifest["recipe"]["optimizer_objective"] == "clipped_cross_section_mse" and
+          manifest["weight_diagnostics"]["objective_alignment"] ==
+          "optimizer_mse_vs_promotion_top10_return",
+          "影子报告显式记录优化目标与 Top10 晋级指标的口径差异")
     check(manifest["state"] == "eligible" and
           manifest["promotion"]["manual_review_required"] and
           not manifest["auto_apply"] and not manifest["publishable"],
@@ -1330,6 +1387,272 @@ def scenario_U():
           "影子 manifest 当前指针与版本文件原子落盘，不生成 active model 产物")
 
 
+# ============================================================================
+# V. V5：继承 V4，仅按行业 ETF 相对强度调整风险预算
+# ============================================================================
+def scenario_V():
+    print("\n== V. V5 赛马（V4 + 行业相对强度动态仓位）==")
+    cfg = new_cfg(paper_buy_n=1, paper_risk_per_trade=0.01,
+                  paper_max_position_weight=0.8)
+    root = Path(cfg.ledger_dir)
+    cfg.sector_meta_file = root / "all_a_stock_meta.parquet"
+    pd.DataFrame([{
+        "code": "000998", "a_industry": "股份制银行Ⅲ",
+        "a_industries": "银行/股份制银行Ⅱ/股份制银行Ⅲ",
+    }]).to_parquet(cfg.sector_meta_file, index=False)
+    today = _dt.date.today().strftime("%Y-%m-%d")
+    refs = {"000998": RefRow(
+        expected_return=0.02, model_score=2.0, model_rank_pct=0.99,
+        atr=0.5, prediction_date=today)}
+    ctx = build_ctx(refs, [mk_snap("000998", 10.0, vwap=10.0, imb=0.8)])
+    sector = SectorETFContext(cfg)
+    now = time.time()
+    sector.update(Snapshot(code="510300.SH", last=10.0, pre_close=10.0), now=now)
+    sector.update(Snapshot(code="512800.SH", last=10.04, pre_close=10.0), now=now)
+    v4 = V4PaperTrader(cfg, ctx, FakeNotifier(), sector)
+    v5 = V5PaperTrader(cfg, ctx, FakeNotifier(), sector)
+
+    v4_strong, _ = v4._allocation_budget("000998", 0.02, 10.0, 1)
+    v5_strong, strong_detail = v5._allocation_budget("000998", 0.02, 10.0, 1)
+    check(v5_strong > v4_strong and
+          strong_detail["allocation_factor"] == 1.15 and
+          v5_strong <= v5._equity() * v5._max_position_weight,
+          "V5 强行业按 1.15x 提高风险额度且不突破单票硬上限")
+
+    sector.update(Snapshot(code="512800.SH", last=9.99, pre_close=10.0), now=now)
+    v5_lagging, lagging_detail = v5._allocation_budget("000998", 0.02, 10.0, 1)
+    check(v5_lagging < v4_strong and lagging_detail["allocation_factor"] == 0.85,
+          "V5 轻度落后但未达弱势拒绝门时按 0.85x 降低风险额度")
+
+    sector.update(Snapshot(code="512800.SH", last=10.01, pre_close=10.0), now=now)
+    v5_neutral, neutral_detail = v5._allocation_budget("000998", 0.02, 10.0, 1)
+    fallback_sector = SectorETFContext(cfg)
+    fallback_v5 = V5PaperTrader(cfg, ctx, FakeNotifier(), fallback_sector)
+    fallback_budget, fallback_detail = fallback_v5._allocation_budget(
+        "000998", 0.02, 10.0, 1)
+    check(v5_neutral == fallback_budget and
+          neutral_detail["allocation_factor"] == 1.0 and
+          fallback_detail["allocation_factor"] == 1.0,
+          "V5 中性及 ETF 行情不可用时均安全退化为 1.00x")
+
+    sector.update(Snapshot(code="512800.SH", last=10.04, pre_close=10.0), now=now)
+    v4.maybe_trade(1450)
+    v5.maybe_trade(1450)
+    check(len(v4._state["positions"]) == len(v5._state["positions"]) == 1 and
+          v5._state["positions"][0]["cost_basis"] > v4._state["positions"][0]["cost_basis"],
+          "V4/V5 同候选同买点成交，V5 仅因强行业获得更高仓位")
+    audit = v5._read_jsonl(v5._decisions_file)[0]
+    check(audit["schema_version"] == 5 and
+          audit["event_type"] == "paper_buy_decision_v5" and
+          audit["candidates"][0]["allocation"]["allocation_factor"] == 1.15 and
+          audit["candidates"][0]["sector_allocation"]["bucket"] == "strong",
+          "V5 独立审计记录行业强度分桶、系数和完整预算明细")
+    check(all("_v5" in p.name for p in (
+        v5._state_file, v5._trades_file, v5._decisions_file,
+        v5._counterfactuals_file)),
+          "V5 状态、交易、决策和反事实文件均以 _v5 隔离")
+
+    cfg_sub = new_cfg(paper_v2_enabled=False, paper_v3_enabled=False,
+                      paper_v4_enabled=False, paper_v5_enabled=True)
+    sub_root = Path(cfg_sub.ledger_dir)
+    (sub_root / "paper_state_v5.json").write_text(
+        json.dumps({"cash": 1, "positions": [{"code": "600998"}]}), encoding="utf-8")
+    cfg_sub.mobile_snapshot_file = sub_root / "missing.json"
+    cfg_sub.predictions_file = sub_root / "missing.parquet"
+    cfg_sub.holdings_file = sub_root / "missing.txt"
+    cfg_sub.universe_file = sub_root / "missing_universe.txt"
+    check(load_codes(cfg_sub) == ["600998"],
+          "V5 持仓进入保护性订阅并优先于候选名单")
+
+
+# ============================================================================
+# W. Realtime 权重例行任务：自动晋级、加载、幂等与前向回滚
+# ============================================================================
+def scenario_W():
+    print("\n== W. Realtime 权重自动例行（晋级 + 加载 + 回滚）==")
+    root = Path(tempfile.mkdtemp(prefix="sim_weight_routine_"))
+    source = root / "historical_predictions.parquet"
+    output = root / "weight_shadow"
+    rows = []
+    dates = pd.bdate_range("2026-02-02", periods=55)
+    for day_index, date in enumerate(dates):
+        for code_index in range(16):
+            signal = (code_index - 7.5) / 1000.0
+            rows.append({
+                "code": str(code_index).zfill(6), "date": date,
+                "ridge_pred": -signal,
+                "elastic_pred": ((code_index * 5 + day_index) % 9 - 4) / 1000.0,
+                "extra_trees_pred": signal,
+                "target_ret_1d": signal + ((day_index % 5) - 2) * 0.0002,
+            })
+    frame = pd.DataFrame(rows)
+    serial = walk_forward_weights(
+        frame, train_days=10, rebalance_days=5, cost=0.0, workers=1)
+    parallel = walk_forward_weights(
+        frame, train_days=10, rebalance_days=5, cost=0.0, workers=4)
+    check(serial == parallel,
+          "4 worker 并发与单 worker 的权重历史和 OOS 指标完全一致")
+    frame.to_parquet(source, index=False)
+    cfg = new_cfg()
+    cfg.weight_shadow_predictions_file = source
+    cfg.weight_shadow_dir = output
+    cfg.weight_shadow_train_days = 10
+    cfg.weight_shadow_min_oos_days = 40
+    cfg.weight_shadow_rebalance_days = 5
+    cfg.weight_shadow_workers = 4
+    cfg.weight_auto_promote_enabled = True
+    cfg.weight_active_manifest_file = output / "active_weights.json"
+    cfg.weight_max_step = 1.0
+    cfg.weight_promotion_cooldown_days = 20
+    cfg.weight_min_sharpe_improvement = 0.0
+    cfg.weight_min_hit_rate_delta = -0.02
+    cfg.weight_max_drawdown_worsening = 0.02
+    cfg.weight_rollback_days = 10
+    cfg.paper_cost = 0.0
+
+    promoted = run_weight_routine(cfg)
+    active = json.loads(cfg.weight_active_manifest_file.read_text(encoding="utf-8"))
+    check(promoted["action"] == "promoted" and active["state"] == "active" and
+          active["weights"]["extra_trees_pred"] > 0.6,
+          "例行任务在 40 日以上 OOS 且门槛通过后自动晋级 active 权重")
+    check(_return_model_weights(cfg) == active["weights"],
+          "实时参考层自动加载晋级权重，V1-V5 下一次启动共同生效")
+
+    cfg.weight_active_manifest_file.write_text("{broken", encoding="utf-8")
+    check(_return_model_weights(cfg) == {
+        "ridge_pred": 0.30, "elastic_pred": 0.20, "extra_trees_pred": 0.50},
+          "active manifest 损坏时安全回退固定生产权重")
+    atomic_write_json(cfg.weight_active_manifest_file, active)
+    repeated = run_weight_routine(cfg)
+    check(repeated["action"] == "kept_champion" and
+          json.loads(cfg.weight_active_manifest_file.read_text(encoding="utf-8"))[
+              "version"] == active["version"],
+          "相同样本重复运行不伪造新证据，不重复晋级")
+
+    future_rows = list(rows)
+    for day_index, date in enumerate(pd.bdate_range(dates[-1] + pd.Timedelta(days=1), periods=10)):
+        for code_index in range(16):
+            signal = (code_index - 7.5) / 1000.0
+            future_rows.append({
+                "code": str(code_index).zfill(6), "date": date,
+                "ridge_pred": -10.0 * signal,
+                "elastic_pred": 0.0,
+                "extra_trees_pred": signal,
+                "target_ret_1d": -signal,
+            })
+    pd.DataFrame(future_rows).to_parquet(source, index=False)
+    rolled_back = run_weight_routine(cfg)
+    restored = json.loads(cfg.weight_active_manifest_file.read_text(encoding="utf-8"))
+    check(rolled_back["action"] == "rolled_back" and
+          restored["action"] == "automatic_rollback" and
+          restored["version"] == "configured-default",
+          "晋级权重新增 10 个前向交易日持续跑输时自动回滚上一 Champion")
+
+
+# ============================================================================
+# X. 热重载：直接 exec 替换，避免行情 SDK stop 退出期崩溃
+# ============================================================================
+def scenario_X():
+    print("\n== X. 实时引擎热重载（绕过不可靠 SDK stop）==")
+    cfg = new_cfg()
+    root = Path(cfg.ledger_dir)
+    cfg.watchlist_reload = True
+    cfg.mobile_snapshot_file = root / "mobile.json"
+    cfg.predictions_file = root / "predictions.parquet"
+    cfg.holdings_file = root / "holdings.txt"
+    cfg.sector_meta_file = root / "sector.parquet"
+    for path in (cfg.mobile_snapshot_file, cfg.predictions_file,
+                 cfg.holdings_file, cfg.sector_meta_file):
+        path.write_text("v1", encoding="utf-8")
+
+    engine = engine_mod.Engine.__new__(engine_mod.Engine)
+    engine._cfg = cfg
+    engine._codes_key = frozenset({"000001"})
+    engine._src_mtime = engine._src_mtimes()
+    time.sleep(0.01)
+    cfg.predictions_file.write_text("v2", encoding="utf-8")
+    stopped = []
+    shutdown = []
+    executed = []
+    engine._stop_feed = lambda reason="": stopped.append(reason)
+    engine._shutdown_effect_dispatcher = lambda reason: shutdown.append(reason)
+    original_load = engine_mod.wl_mod.load_codes
+    original_execv = engine_mod.os.execv
+    try:
+        engine_mod.wl_mod.load_codes = lambda _: ["000001"]
+        engine_mod.os.execv = lambda executable, args: executed.append((executable, args))
+        engine._maybe_reload()
+    finally:
+        engine_mod.wl_mod.load_codes = original_load
+        engine_mod.os.execv = original_execv
+    check(bool(executed) and shutdown == ["清单热重载"] and not stopped,
+          "预测热更新直接 exec 替换进程且不调用可能崩溃的行情 SDK stop")
+
+
+# ============================================================================
+# Y. 实际持仓只读调仓建议：与 V1-V5 模拟盘严格隔离
+# ============================================================================
+def scenario_Y():
+    print("\n== Y. 实际持仓只读调仓建议（不写模拟盘）==")
+    cfg = new_cfg()
+    root = Path(cfg.ledger_dir)
+    cfg.holdings_file = root / "realtime_holdings.txt"
+    cfg.mobile_snapshot_file = root / "missing_mobile_snapshot.json"
+    cfg.predictions_file = root / "missing_predictions.parquet"
+    cfg.universe_file = root / "missing_universe.txt"
+    cfg.max_subscribe = 100
+    cfg.sector_meta_file = root / "all_a_stock_meta.parquet"
+    cfg.sector_etf_specs = (
+        Cfg.sector_etf_specs + ";医药宽基=512010.SH:化学制剂")
+    pd.DataFrame([{
+        "code": "600664", "a_industry": "化学制剂",
+        "a_industries": "化学制剂、化学制药、医药生物",
+        "a_concepts": "流感、创新药",
+        "meta_updated_at": "2026-07-16T16:21:06+08:00",
+    }]).to_parquet(cfg.sector_meta_file, index=False)
+    cfg.holdings_file.write_text(
+        "# actual_cash=5467.81 updated=2026-08-06\n"
+        "600664 - 5800 5000 5.592 15 # 哈药股份\n"
+        "000725 - 1000 1000 8.185 20 # 京东方A\n"
+        "000021 - 100 100 38.230 5 # 深科技\n"
+        "000938 - 200 200 42.265 10 # 紫光股份\n"
+        "002149 - 1100 1100 51.551 27 # 西部材料\n",
+        encoding="utf-8")
+    today = _dt.date.today().strftime("%Y-%m-%d")
+    refs = {
+        "600664": RefRow(expected_return=0.01, prediction_date=today),
+        "000725": RefRow(expected_return=-0.01, prediction_date=today),
+        "000021": RefRow(expected_return=0.03, prediction_date=today),
+        "000938": RefRow(expected_return=-0.005, prediction_date=today),
+        "002149": RefRow(expected_return=-0.02, prediction_date=today),
+    }
+    ctx = build_ctx(refs, [
+        mk_snap("600664", 6.79), mk_snap("000725", 5.92),
+        mk_snap("000021", 39.51), mk_snap("000938", 36.93),
+        mk_snap("002149", 38.21),
+    ])
+    paper_before = Path(cfg.paper_state_file).read_bytes() if Path(
+        cfg.paper_state_file).exists() else None
+    actual_sector = SectorETFContext(cfg)
+    board = RankBoard(cfg, ctx, FakeNotifier(), {
+        code: holding.name for code, holding in load_actual_holdings(cfg).items()},
+        actual_sector)
+    advice, _ = board._actual_advice()
+    holdings = load_actual_holdings(cfg)
+    check(len(holdings) == 5 and _load_hold_days(cfg)["002149"] == 27 and
+          "600664" in load_codes(cfg),
+          "扩展实际持仓格式保留数量/成本/天数且继续进入保护性订阅")
+    check("实际持仓怎么处理" in advice and "哈药股份" in advice and
+          "西部材料" in advice and "建议卖出约" in advice and
+          "只提醒，不会自动买卖" in advice and "暂时不要补仓" in advice and
+          "细分行业:化学制剂/化学制药" in advice and
+          "走势比较:医药宽基ETF(512010.SH)" in advice and
+          "行业资料更新于07/16，可能漏掉近期热点" in advice and
+          (Path(cfg.paper_state_file).read_bytes() if Path(
+              cfg.paper_state_file).exists() else None) == paper_before,
+          "调仓 Push 给出集中度/盈亏复核且不创建或修改任何模拟盘状态")
+
+
 def main() -> int:
     print("=" * 68)
     print(" 虚拟数据流验证：实时层重排/模拟盘/出场逻辑")
@@ -1338,7 +1661,8 @@ def main() -> int:
                scenario_E, scenario_F, scenario_G, scenario_H,
                scenario_I, scenario_J, scenario_K, scenario_L,
                scenario_M, scenario_N, scenario_O, scenario_P, scenario_Q,
-               scenario_R, scenario_S, scenario_T, scenario_U):
+               scenario_R, scenario_S, scenario_T, scenario_U, scenario_V,
+               scenario_W, scenario_X, scenario_Y):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

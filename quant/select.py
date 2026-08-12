@@ -18,8 +18,8 @@ from quant import warehouse
 from quant.factors import engineering
 
 
-def _target_col(df: pd.DataFrame, horizon: int) -> str:
-    col = f"target_ret_{horizon}d"
+def _target_col(df: pd.DataFrame, horizon: int, label_col: str | None = None) -> str:
+    col = label_col or f"target_ret_{horizon}d"
     if col not in df.columns:
         raise ValueError(f"缺少标签列 {col}")
     return col
@@ -43,8 +43,9 @@ def _daily_ic_rows(panel: pd.DataFrame, groups: list[tuple[object, np.ndarray]],
 
 
 def daily_ic(panel: pd.DataFrame, factors: list[str], horizon: int = 5,
-             method: str = "spearman", workers: int = 1) -> pd.DataFrame:
-    target = _target_col(panel, horizon)
+             method: str = "spearman", workers: int = 1,
+             label_col: str | None = None) -> pd.DataFrame:
+    target = _target_col(panel, horizon, label_col=label_col)
     groups = list(panel.groupby("date").indices.items())
     worker_count = min(max(int(workers), 1), len(groups))
     if worker_count <= 1:
@@ -77,9 +78,16 @@ def ic_summary_from_daily_ic(ic: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["abs_ic_mean", "icir"], ascending=False).reset_index(drop=True)
 
 
-def ic_summary(panel: pd.DataFrame, factors: list[str] | None = None, horizon: int = 5) -> pd.DataFrame:
+def ic_summary(
+    panel: pd.DataFrame,
+    factors: list[str] | None = None,
+    horizon: int = 5,
+    label_col: str | None = None,
+) -> pd.DataFrame:
     factors = factors or engineering.feature_columns(panel, horizon)
-    return ic_summary_from_daily_ic(daily_ic(panel, factors, horizon=horizon))
+    return ic_summary_from_daily_ic(
+        daily_ic(panel, factors, horizon=horizon, label_col=label_col)
+    )
 
 
 def quantile_returns(panel: pd.DataFrame, factor: str, horizon: int = 5, q: int = 5) -> pd.DataFrame:
@@ -139,10 +147,16 @@ def decay_summary(raw_panel: pd.DataFrame, factors: list[str], horizons: list[in
     return pd.DataFrame(rows)
 
 
-def select_factors(panel: pd.DataFrame, horizon: int = 5, min_abs_ic: float = 0.02, min_icir: float = 0.15,
-                   top_n: int = 50) -> pd.DataFrame:
+def select_factors(
+    panel: pd.DataFrame,
+    horizon: int = 5,
+    min_abs_ic: float = 0.02,
+    min_icir: float = 0.15,
+    top_n: int = 50,
+    label_col: str | None = None,
+) -> pd.DataFrame:
     factors = engineering.feature_columns(panel, horizon)
-    summ = ic_summary(panel, factors, horizon=horizon)
+    summ = ic_summary(panel, factors, horizon=horizon, label_col=label_col)
     if summ.empty:
         return summ
     picked = summ[(summ["abs_ic_mean"] >= min_abs_ic) & (summ["icir"].abs() >= min_icir)].copy()

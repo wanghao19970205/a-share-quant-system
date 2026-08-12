@@ -13,9 +13,9 @@ from quant import model as qmodel
 
 
 # ------------------------- 回测成交口径（可用环境变量切换） -------------------------
-# 默认口径：按当日收盘价成交、忽略成本、含可交易性摩擦（涨停封板当日买不进、
-# 跌停封板顺延到下一可卖日收盘卖出）。这是「尾盘 T 买、T+1 卖」的贴近实盘口径。
-# 如需复现旧的乐观口径（不理会涨跌停），设 QUANT_BT_FILTER_UNTRADABLE=0。
+# 默认口径：按当日收盘价成交、计入 20bp 双边成本、含可交易性摩擦（涨停封板当日买不进、
+# 跌停封板顺延到下一可卖日收盘卖出）。这是「尾盘 T 买、T+1 卖」的严格研究口径。
+# 如需复现旧的乐观口径（不理会涨跌停或忽略成本），必须显式传入参数或环境变量。
 # 其它开关：
 #   QUANT_BT_FILL=next_open          # 次日开盘成交（此时用 open_ret + buyable_next）
 #   QUANT_BT_COST_ROUNDTRIP=0.003    # 双边综合成本(佣金+印花税+滑点)
@@ -37,9 +37,9 @@ def bt_sell_roll_max_days() -> int:
 
 def bt_cost_roundtrip() -> float:
     try:
-        return float(os.environ.get("QUANT_BT_COST_ROUNDTRIP", "0") or 0.0)
+        return float(os.environ.get("QUANT_BT_COST_ROUNDTRIP", "0.002") or 0.002)
     except Exception:  # noqa: BLE001
-        return 0.0
+        return 0.002
 
 
 def _max_drawdown(nav: pd.Series) -> float:
@@ -56,14 +56,16 @@ def evaluate_returns(ret: pd.Series, periods_per_year: int = 252) -> dict:
         return {}
     ret = ret.clip(lower=-0.99)
     nav = (1 + ret).cumprod()
-    ann = nav.iloc[-1] ** (periods_per_year / max(len(ret), 1)) - 1 if nav.iloc[-1] > 0 else np.nan
-    vol = ret.std() * np.sqrt(periods_per_year)
+    annual_return = nav.iloc[-1] ** (periods_per_year / max(len(ret), 1)) - 1 if nav.iloc[-1] > 0 else np.nan
+    annual_vol = ret.std() * np.sqrt(periods_per_year)
+    # Sharpe uses arithmetic mean excess return, not compounded annual return.
+    sharpe = ret.mean() / ret.std() * np.sqrt(periods_per_year) if ret.std() > 0 else None
     return {
         "periods": int(len(ret)),
         "total_return": float(nav.iloc[-1] - 1),
-        "annual_return": float(ann) if np.isfinite(ann) else None,
-        "annual_vol": float(vol),
-        "sharpe": float(ann / vol) if vol and np.isfinite(vol) and np.isfinite(ann) else None,
+        "annual_return": float(annual_return) if np.isfinite(annual_return) else None,
+        "annual_vol": float(annual_vol),
+        "sharpe": float(sharpe) if sharpe is not None and np.isfinite(sharpe) else None,
         "max_drawdown": _max_drawdown(nav),
         "win_rate": float((ret > 0).mean()),
     }
@@ -77,6 +79,128 @@ def _daily_zscore(s: pd.Series) -> pd.Series:
     return (s - s.mean()) / std
 
 
+def _weight_turnover(
+    previous: np.ndarray,
+    current: np.ndarray,
+) -> float | np.ndarray:
+    """Return one-way traded NAV from stock weights plus residual cash."""
+    previous = np.asarray(previous, dtype=float)
+    current = np.asarray(current, dtype=float)
+    if previous.shape != current.shape or previous.ndim not in (1, 2):
+        raise ValueError("weight arrays must have the same one- or two-dimensional shape")
+    if (
+        not np.isfinite(previous).all()
+        or not np.isfinite(current).all()
+        or (previous < 0).any()
+        or (current < 0).any()
+    ):
+        raise ValueError("portfolio weights must be finite and non-negative")
+    axis = previous.ndim - 1
+    previous_exposure = previous.sum(axis=axis)
+    current_exposure = current.sum(axis=axis)
+    if (previous_exposure > 1.0 + 1e-12).any() or (
+        current_exposure > 1.0 + 1e-12
+    ).any():
+        raise ValueError("portfolio stock weights must not exceed total NAV")
+    previous_cash = np.maximum(1.0 - previous_exposure, 0.0)
+    current_cash = np.maximum(1.0 - current_exposure, 0.0)
+    stock_turnover = np.abs(current - previous).sum(axis=axis)
+    turnover = 0.5 * (stock_turnover + np.abs(current_cash - previous_cash))
+    if previous.ndim == 1:
+        return float(turnover)
+    return turnover
+
+
+def _mapping_turnover(
+    previous: dict[str, float],
+    current: dict[str, float],
+) -> float:
+    codes = sorted(set(previous) | set(current))
+    previous_weights = np.asarray([previous.get(code, 0.0) for code in codes])
+    current_weights = np.asarray([current.get(code, 0.0) for code in codes])
+    return float(_weight_turnover(previous_weights, current_weights))
+
+
+def _apply_rebalance_stride(
+    pred: pd.DataFrame,
+    rebalance_stride: int,
+    trading_calendar: pd.DataFrame | pd.DatetimeIndex | None = None,
+) -> pd.DataFrame:
+    stride = max(int(rebalance_stride), 1)
+    if pred.empty or stride == 1:
+        return pred.copy()
+    pred_dates = pd.DatetimeIndex(
+        pd.to_datetime(pred["date"], errors="coerce").dropna().sort_values().unique()
+    )
+    if trading_calendar is None:
+        rebalance_dates = pred_dates[::stride]
+    else:
+        if isinstance(trading_calendar, pd.DataFrame):
+            if trading_calendar.empty or list(trading_calendar.columns) != ["date"]:
+                raise ValueError(
+                    "authoritative trading calendar must contain only date"
+                )
+            raw_dates = trading_calendar["date"]
+        else:
+            raw_dates = trading_calendar
+        calendar_dates = pd.DatetimeIndex(
+            pd.to_datetime(raw_dates, errors="coerce")
+        )
+        if (
+            calendar_dates.empty
+            or calendar_dates.hasnans
+            or calendar_dates.has_duplicates
+            or not calendar_dates.is_monotonic_increasing
+        ):
+            raise ValueError(
+                "authoritative trading calendar must be unique and increasing"
+            )
+        if not pred_dates.isin(calendar_dates).all():
+            raise RuntimeError(
+                "prediction dates absent from authoritative trading calendar"
+            )
+        rebalance_dates = calendar_dates[::stride]
+    return pred[
+        pd.to_datetime(pred["date"], errors="coerce").isin(rebalance_dates)
+    ].copy()
+
+
+def _select_with_rank_hysteresis(
+    codes: np.ndarray,
+    scores: np.ndarray,
+    eligible: np.ndarray,
+    top_n: int,
+    hold_rank_buffer: int,
+    previous_codes: set[str],
+) -> np.ndarray:
+    """Select positions while retaining incumbents inside the exit-rank buffer."""
+    limit = max(int(top_n), 0)
+    if limit == 0:
+        return np.asarray([], dtype=int)
+    code_values = np.asarray(codes).astype(str)
+    score_values = np.asarray(scores, dtype=float)
+    mask = np.asarray(eligible, dtype=bool) & np.isfinite(score_values)
+    candidates = np.flatnonzero(mask)
+    if candidates.size == 0:
+        return np.asarray([], dtype=int)
+    order = np.lexsort((code_values[candidates], -score_values[candidates]))
+    ranked = candidates[order]
+    buffer = max(int(hold_rank_buffer), 0)
+    if buffer == 0 or not previous_codes:
+        return ranked[:limit]
+    retention_pool = ranked[:limit + buffer]
+    retained = [
+        index for index in retention_pool
+        if code_values[index] in previous_codes
+    ][:limit]
+    retained_set = set(retained)
+    selected = retained + [
+        index for index in ranked
+        if index not in retained_set
+    ][:limit - len(retained)]
+    return np.asarray(selected, dtype=int)
+
+
 def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int = 20,
                                max_weight: float = 0.1, positive_only: bool = False,
                                pred_quantile: float | None = None,
@@ -85,16 +209,20 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
                                rule_weight: float = 0.0, min_rule_score: float | None = None,
                                ridge_quantile: float | None = None,
                                use_open_fill: bool | None = None, filter_untradable: bool | None = None,
-                               cost_roundtrip: float | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+                               cost_roundtrip: float | None = None, no_refill: bool = False,
+                               require_tradability: bool = False,
+                               hold_rank_buffer: int = 0) -> tuple[pd.DataFrame, pd.DataFrame]:
     """由每日预测构建组合并计算收益。
 
-    成交口径由参数或环境变量决定（默认：当日收盘成交、无成本、不过滤涨停/停牌）：
+    成交口径由参数或环境变量决定（默认：当日收盘成交、20bp 双边成本、过滤涨停/停牌）：
     - use_open_fill=True 且存在 ``open_ret_{h}d`` 列时，用「T+1 开盘买入、T+1+h 开盘卖出」的收益；
       收盘口径下若 filter_untradable=True 且存在 ``tradable_ret_{h}d`` 列，用跌停顺延后的实现收益，
       否则用 ``target_ret_{h}d``（信号日收盘→h日后收盘，乐观口径）。
     - filter_untradable=True 时剔除买不进的候选：next_open 口径看 ``buyable_next``（次日一字涨停），
-      收盘口径看 ``buyable_close``（当日涨停封板/一字涨停）。
-    - cost_roundtrip：单次调仓双边综合成本，按当期换手比例计提；0 表示忽略成本。
+      收盘口径看 ``buyable_close``（当日涨停封板/一字涨停）；缺列直接报错。
+    - no_refill=True 时先按预测分数取固定 TopN，再将不可成交名额记为现金，绝不从候选池回填。
+    - require_tradability=True 时，严格要求买入资格列存在；研究诊断不得把缺列结果标成严格口径。
+    - cost_roundtrip：单次调仓双边综合成本，按当期换手比例计提；默认 20bp。
     """
     if use_open_fill is None:
         use_open_fill = bt_use_open_fill()
@@ -112,17 +240,18 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
     else:
         ret_col = target
     buy_col = "buyable_next" if use_open_fill else "buyable_close"
-    if buy_col not in pred.columns and "buyable_next" in pred.columns:
-        buy_col = "buyable_next"
+    if require_tradability and filter_untradable and buy_col not in pred.columns:
+        raise ValueError(
+            f"严格可交易回测缺少 {buy_col}；请先从价格面板补齐可交易列，"
+            "不能静默降级到乐观口径"
+        )
     holdings = []
     returns = []
-    last_codes: set[str] = set()
+    last_weights: dict[str, float] = {}
     if pred.empty or "pred" not in pred.columns or ret_col not in pred.columns:
         return pd.DataFrame(), pd.DataFrame()
     for date, g in pred.dropna(subset=["pred", ret_col]).groupby("date"):
         pool = g.copy()
-        if filter_untradable and buy_col in pool.columns:
-            pool = pool[pool[buy_col].fillna(False).astype(bool)]
         if positive_only:
             pool = pool[pool["pred"] > 0]
         if pred_quantile is not None and len(pool) >= 5:
@@ -140,10 +269,49 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
             pool = pool.copy()
             pool["ensemble_pred"] = _daily_zscore(pool["pred"]) + float(rule_weight) * _daily_zscore(pool["rule_score"])
             rank_col = "ensemble_pred"
-        pick = pool.sort_values(rank_col, ascending=False).head(top_n).copy()
+        ranked = pool.sort_values(rank_col, ascending=False)
+
+        def select(candidates: pd.DataFrame) -> pd.DataFrame:
+            if int(hold_rank_buffer) <= 0:
+                return candidates.head(top_n).copy()
+            selected = _select_with_rank_hysteresis(
+                candidates["code"].astype(str).to_numpy(),
+                pd.to_numeric(candidates[rank_col], errors="coerce").to_numpy(),
+                np.ones(len(candidates), dtype=bool),
+                top_n,
+                hold_rank_buffer,
+                set(last_weights),
+            )
+            return candidates.iloc[selected].copy()
+
+        if no_refill:
+            # Select the fixed slots first. Unbuyable names become cash instead of
+            # being backfilled by lower-ranked candidates.
+            pick = select(ranked)
+            if filter_untradable and buy_col in pick.columns:
+                pick = pick[pick[buy_col].fillna(False).astype(bool)]
+        else:
+            if filter_untradable and buy_col in pool.columns:
+                pool = pool[pool[buy_col].fillna(False).astype(bool)]
+            pick = select(pool.sort_values(rank_col, ascending=False))
         if pick.empty:
+            if no_refill:
+                current_weights: dict[str, float] = {}
+                turnover = _mapping_turnover(last_weights, current_weights)
+                cost = float(turnover) * float(cost_roundtrip)
+                returns.append({
+                    "date": date,
+                    "ret": -cost,
+                    "gross_ret": 0.0,
+                    "cost": cost,
+                    "cash": 1.0,
+                    "turnover": turnover,
+                    "n_holdings": 0,
+                })
+                last_weights = current_weights
             continue
-        w = min(1.0 / len(pick), max_weight)
+        denominator = int(top_n) if no_refill else len(pick)
+        w = min(1.0 / max(denominator, 1), max_weight)
         if w * len(pick) < 1:
             cash = 1 - w * len(pick)
         else:
@@ -151,9 +319,12 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
         pick["weight"] = w
         if rank_col != "pred":
             pick["pred"] = pick[rank_col]
-        codes = set(pick["code"].astype(str))
-        turnover = 1.0 if not last_codes else len(codes.symmetric_difference(last_codes)) / max(len(codes.union(last_codes)), 1)
-        last_codes = codes
+        current_weights = dict(zip(
+            pick["code"].astype(str),
+            pick["weight"].astype(float),
+        ))
+        turnover = _mapping_turnover(last_weights, current_weights)
+        last_weights = current_weights
         gross_ret = float((pick[ret_col] * pick["weight"]).sum())
         cost = float(turnover) * float(cost_roundtrip)
         period_ret = gross_ret - cost
@@ -183,7 +354,8 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
                  n_estimators: int = 200, learning_rate: float | None = None,
                  early_stopping_rounds: int = 40,
                  use_open_fill: bool | None = None, filter_untradable: bool | None = None,
-                 cost_roundtrip: float | None = None) -> dict:
+                 cost_roundtrip: float | None = None, rebalance_stride: int = 1,
+                 trading_calendar: pd.DataFrame | pd.DatetimeIndex | None = None) -> dict:
     df = panel.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     dates = pd.Series(sorted(df["date"].dropna().unique()))
@@ -264,6 +436,8 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
         current = test_end
 
     pred = pd.concat(preds, ignore_index=True) if preds else pd.DataFrame()
+    stride = max(int(rebalance_stride), 1)
+    pred = _apply_rebalance_stride(pred, stride, trading_calendar=trading_calendar)
     side_cols = [c for c in ("volatility_10", "turnover", "rule_score",
                              f"open_ret_{horizon}d", f"tradable_ret_{horizon}d",
                              "buyable_next", "buyable_close") if c in df.columns]
@@ -277,7 +451,10 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
                                                    ridge_quantile=ridge_quantile,
                                                    use_open_fill=use_open_fill, filter_untradable=filter_untradable,
                                                    cost_roundtrip=cost_roundtrip)
-    summary = evaluate_returns(returns["ret"] if not returns.empty else pd.Series(dtype=float), periods_per_year=max(1, 252 // horizon))
+    summary = evaluate_returns(
+        returns["ret"] if not returns.empty else pd.Series(dtype=float),
+        periods_per_year=max(1, int(round(252 / stride))),
+    )
     if not returns.empty:
         summary["avg_turnover"] = float(returns["turnover"].mean())
         summary["avg_holdings"] = float(returns["n_holdings"].mean())
@@ -286,6 +463,8 @@ def walk_forward(panel: pd.DataFrame, factors: list[str], model_name: str = "rid
             summary["gross_total_return"] = float((1 + returns["gross_ret"]).prod() - 1)
         _use_open = use_open_fill if use_open_fill is not None else bt_use_open_fill()
         summary["fill"] = "next_open" if (_use_open and f"open_ret_{horizon}d" in pred.columns) else "close"
+    summary["rebalance_stride"] = stride
+    summary["authoritative_rebalance_calendar"] = trading_calendar is not None
     if ensemble_model:
         summary["ridge_quantile"] = ridge_quantile
         summary["lgbm_weight"] = lgbm_weight
@@ -301,6 +480,12 @@ def main():
     ap.add_argument("--train-months", type=int, default=24)
     ap.add_argument("--validation-months", type=int, default=1, help="训练窗口末尾用于早停/调参的验证月份，不参与最终测试回测")
     ap.add_argument("--test-months", type=int, default=1)
+    ap.add_argument("--rebalance-stride", type=int, default=1,
+                    help="只在每 N 个可用交易日调仓；用于非重叠持有期研究")
+    ap.add_argument(
+        "--authoritative-rebalance-calendar", action="store_true",
+        help="按权威交易日历固定调仓相位；缺失预测日不会重置后续相位",
+    )
     ap.add_argument("--top-n", type=int, default=3)
     ap.add_argument("--max-weight", type=float, default=None, help="单票最大权重；默认 1/top_n，即 topN 满仓等权")
     ap.add_argument("--ridge-alpha", type=float, default=10.0, help="Ridge L2 正则强度")
@@ -321,7 +506,7 @@ def main():
                     help="回测成交口径：close=尾盘T买(默认,含可交易性摩擦)；next_open=T+1开盘买/卖。也可用环境变量 QUANT_BT_FILL")
     ap.add_argument("--no-tradable-filter", action="store_true", help="关闭可交易性口径(还原乐观：不理会涨停买不进/跌停顺延卖出)")
     ap.add_argument("--cost-roundtrip", type=float, default=bt_cost_roundtrip(),
-                    help="单次调仓双边综合成本(佣金+印花税+滑点)，按换手计提；默认0=忽略。也可用环境变量 QUANT_BT_COST_ROUNDTRIP")
+                    help="单次调仓双边综合成本(佣金+印花税+滑点)，按换手计提；默认0.002。也可用环境变量 QUANT_BT_COST_ROUNDTRIP")
     ap.add_argument("--output-prefix", default="", help="实验输出前缀，避免覆盖默认 bt_* 产物")
     args = ap.parse_args()
 
@@ -338,6 +523,11 @@ def main():
         factors = engineering.feature_columns(panel, args.horizon)
     decay = args.decay_half_life_days if args.decay_half_life_days > 0 else None
     early_stopping_rounds = args.early_stopping_rounds if args.early_stopping_rounds > 0 else 0
+    trading_calendar = (
+        warehouse.load("trading_calendar")
+        if args.authoritative_rebalance_calendar
+        else None
+    )
     res = walk_forward(panel, factors, model_name=args.model, horizon=args.horizon,
                        train_months=args.train_months, validation_months=args.validation_months,
                        test_months=args.test_months, top_n=args.top_n,
@@ -349,10 +539,12 @@ def main():
                        rule_weight=args.rule_weight, min_rule_score=args.min_rule_score,
                        ridge_quantile=args.ridge_quantile, lgbm_weight=args.lgbm_weight,
                        n_estimators=args.n_estimators, learning_rate=args.learning_rate,
-                       early_stopping_rounds=early_stopping_rounds,
-                       use_open_fill=(args.fill == "next_open"),
-                       filter_untradable=(False if args.no_tradable_filter else bt_filter_untradable()),
-                       cost_roundtrip=args.cost_roundtrip)
+                        early_stopping_rounds=early_stopping_rounds,
+                        use_open_fill=(args.fill == "next_open"),
+                        filter_untradable=(False if args.no_tradable_filter else bt_filter_untradable()),
+                        cost_roundtrip=args.cost_roundtrip,
+                        rebalance_stride=args.rebalance_stride,
+                        trading_calendar=trading_calendar)
     name_prefix = f"{args.output_prefix}_" if args.output_prefix else ""
     warehouse.save(f"{name_prefix}bt_{args.model}_returns", res["returns"])
     warehouse.save(f"{name_prefix}bt_{args.model}_holdings", res["holdings"])

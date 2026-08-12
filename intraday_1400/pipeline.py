@@ -104,9 +104,11 @@ def _read_matching_labels(
     labels["previous_close"] = labels.groupby("code")["label_close_1455"].shift(1)
     labels["signal_previous_close"] = labels["previous_close"]
     labels["entry_return"] = labels["label_entry_price_1450"] / labels["previous_close"] - 1.0
-    entry_locked = (
-        (labels["label_entry_high_1450"] - labels["label_entry_low_1450"]).abs() <= 0.005
-    ) & (labels["entry_return"] >= 0.045)
+    entry_spread_ratio = (
+        (labels["label_entry_high_1450"] - labels["label_entry_low_1450"]).abs()
+        / labels["previous_close"].replace(0, np.nan).abs()
+    )
+    entry_locked = (entry_spread_ratio <= 0.0005) & (labels["entry_return"] >= 0.045)
     labels["entry_buyable"] = (
         labels["label_entry_bar_present"].fillna(False).astype(bool)
         & (labels["label_entry_volume_1450"].fillna(0.0) > 0)
@@ -137,9 +139,11 @@ def _read_matching_labels(
         "entry_return": "label_exit_day_return_t1",
     })
     labels = labels.merge(exits, on=["code", "next_trade_date"], how="left", validate="many_to_one")
-    exit_locked_down = (
-        (labels["label_exit_high_t1"] - labels["label_exit_low_t1"]).abs() <= 0.005
-    ) & (labels["label_exit_day_return_t1"] <= -0.045)
+    exit_spread_ratio = (
+        (labels["label_exit_high_t1"] - labels["label_exit_low_t1"]).abs()
+        / labels["label_exit_price_t1"].replace(0, np.nan).abs()
+    )
+    exit_locked_down = (exit_spread_ratio <= 0.0005) & (labels["label_exit_day_return_t1"] <= -0.045)
     exit_day_present = labels["exit_day_row_present_t1"].astype("boolean").fillna(False).astype(bool)
     exit_bar_present = labels["label_exit_bar_present_t1"].astype("boolean").fillna(False).astype(bool)
     exit_positive_volume = labels["label_exit_volume_t1"].fillna(0.0) > 0
@@ -642,7 +646,10 @@ def _evaluate_close_baseline(
     predictions = predictions[["code", "date", pred_column]].copy()
     predictions["code"] = predictions["code"].astype(str).str[:6]
     predictions["date"] = pd.to_datetime(predictions["date"], errors="coerce").astype("datetime64[ns]")
-    labels = panel[["code", "date", "target_net_ret_t1", "entry_buyable"]].copy()
+    label_columns = ["code", "date", "target_net_ret_t1", "entry_buyable"]
+    if "target_outcome_observed_t1" in panel.columns:
+        label_columns.append("target_outcome_observed_t1")
+    labels = panel[label_columns].copy()
     labels = labels[
         (labels["date"] > pd.Timestamp(train_end))
         & (labels["date"] <= pd.Timestamp(valid_end))
@@ -653,6 +660,12 @@ def _evaluate_close_baseline(
         return {"ok": False, "reason": "no overlapping baseline labels"}
     merged["rank"] = merged.groupby("date")[pred_column].rank(method="first", ascending=False)
     selected = merged[merged["rank"] <= int(top_n)].copy()
+    observed = (
+        selected["target_outcome_observed_t1"].fillna(False).astype(bool)
+        if "target_outcome_observed_t1" in selected else pd.Series(True, index=selected.index)
+    )
+    immature_targets = int((~observed).sum())
+    selected = selected[observed].copy()
     missing_targets = int(selected["target_net_ret_t1"].isna().sum())
     unsellable_return = float(
         os.environ.get("INTRADAY_1400_UNSELLABLE_RETURN", "-0.10") or -0.10
@@ -671,6 +684,7 @@ def _evaluate_close_baseline(
         "max_drawdown": float(((1.0 + daily).cumprod() / (1.0 + daily).cumprod().cummax() - 1.0).min()),
         "mean_names": float(selected.groupby("date")["code"].nunique().mean()),
         "missing_targets": missing_targets,
+        "immature_targets": immature_targets,
         "unsellable_return": unsellable_return,
     }
 
@@ -768,7 +782,10 @@ def _realized_leg_metrics(
     top_n: int = 10,
 ) -> dict:
     """Evaluate a model leg by daily selection on actual net returns."""
-    labels = panel[["code", "date", "target_net_ret_t1", "entry_buyable"]]
+    label_columns = ["code", "date", "target_net_ret_t1", "entry_buyable"]
+    if "target_outcome_observed_t1" in panel.columns:
+        label_columns.append("target_outcome_observed_t1")
+    labels = panel[label_columns]
     labels = labels[
         (labels["date"] > pd.Timestamp(train_end))
         & (labels["date"] <= pd.Timestamp(valid_end))
@@ -783,6 +800,12 @@ def _realized_leg_metrics(
     ).dropna()
     merged["daily_rank"] = merged.groupby("date")["pred"].rank(method="first", ascending=False)
     selected = merged[merged["daily_rank"] <= int(top_n)].copy()
+    observed = (
+        selected["target_outcome_observed_t1"].fillna(False).astype(bool)
+        if "target_outcome_observed_t1" in selected else pd.Series(True, index=selected.index)
+    )
+    immature_targets = int((~observed).sum())
+    selected = selected[observed].copy()
     missing_targets = int(selected["target_net_ret_t1"].isna().sum())
     unsellable_return = float(
         os.environ.get("INTRADAY_1400_UNSELLABLE_RETURN", "-0.10") or -0.10
@@ -800,6 +823,7 @@ def _realized_leg_metrics(
         ),
         "realized_mean_names": float(selected.groupby("date")["code"].nunique().mean()),
         "realized_missing_targets": missing_targets,
+        "realized_immature_targets": immature_targets,
         "realized_unsellable_return": unsellable_return,
     }
 
@@ -1250,7 +1274,10 @@ def rolling_validate(
                 "minute_features_by_family": grouped,
             }
 
-        labels = window_panel[["code", "date", "target_net_ret_t1", "entry_buyable"]]
+        label_columns = ["code", "date", "target_net_ret_t1", "entry_buyable"]
+        if "target_outcome_observed_t1" in window_panel.columns:
+            label_columns.append("target_outcome_observed_t1")
+        labels = window_panel[label_columns]
         labels = labels[
             (labels["date"] >= valid_start)
             & (labels["date"] <= valid_end)
@@ -1262,6 +1289,12 @@ def rolling_validate(
             merged = labels.merge(predictions, on=["code", "date"], how="inner")
             merged["rank"] = merged.groupby("date")["pred"].rank(method="first", ascending=False)
             selected = merged[merged["rank"] <= top_n].copy()
+            observed = (
+                selected["target_outcome_observed_t1"].fillna(False).astype(bool)
+                if "target_outcome_observed_t1" in selected else pd.Series(True, index=selected.index)
+            )
+            immature_targets = int((~observed).sum())
+            selected = selected[observed].copy()
             missing_targets = int(selected["target_net_ret_t1"].isna().sum())
             unsellable_return = float(
                 os.environ.get("INTRADAY_1400_UNSELLABLE_RETURN", "-0.10") or -0.10
@@ -1273,6 +1306,7 @@ def rolling_validate(
                 "days": int(len(daily)),
                 "mean_names": float(selected.groupby("date")["evaluation_return"].count().mean()),
                 "missing_targets": missing_targets,
+                "immature_targets": immature_targets,
                 "unsellable_return": unsellable_return,
                 "mean_net_return": float(daily.mean()),
                 "win_rate": float((daily > 0).mean()),

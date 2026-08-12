@@ -33,6 +33,7 @@ from .paper_trader import PaperTrader
 from .v2 import V2PaperTrader
 from .v3 import V3PaperTrader
 from .v4 import V4PaperTrader
+from .v5 import V5PaperTrader
 from .rankboard import RankBoard
 from .sector_etf import SectorETFContext
 from .snapshot import Snapshot
@@ -65,6 +66,7 @@ class Engine:
         self._paper_v2 = None  # 实时模拟盘 V2（赛马对照）
         self._paper_v3 = None  # 实时模拟盘 V3（执行确认 + ATR 出场）
         self._paper_v4 = None  # 实时模拟盘 V4（V3 + 行业 ETF 弱势回避）
+        self._paper_v5 = None  # 实时模拟盘 V5（V4 + 行业相对强度动态仓位）
         self._sector_ctx = SectorETFContext(self._cfg)
         self._sector_recv = 0
         self._feed: feed_mod.BaseFeed | None = None
@@ -248,7 +250,8 @@ class Engine:
             reason = "订阅清单更新"
         print(f"[engine] {reason}（代码数 {len(self._codes_key)}→{len(new_key)}），"
               "重启引擎刷新参考数据和订阅 ...", flush=True)
-        self._stop_feed("清单热重载")
+        # AmazingDataFeed.stop() 在真实盘中连接上偶发 SIGSEGV，会使进程在 execv 前消失。
+        # 直接替换进程映像，由内核关闭旧连接和线程；只先排空我们自己的异步副作用队列。
         self._shutdown_effect_dispatcher("清单热重载")
         sys.stdout.flush()
         sys.stderr.flush()
@@ -287,7 +290,8 @@ class Engine:
             print(f"[engine] 参考基准构建失败(降级)：{type(e).__name__}: {e}", flush=True)
         # 装配实时买入候选榜（跨票聚合器）：按模型预期收益排名 + 盘中量标注，主循环内定期推 digest。
         if self._cfg.rank_board_enabled:
-            self._rankboard = RankBoard(self._cfg, self._ctx, self._notifier, name_map)
+            self._rankboard = RankBoard(
+                self._cfg, self._ctx, self._notifier, name_map, self._sector_ctx)
             print(f"[engine] 实时候选榜就绪：每 {self._cfg.rank_interval_sec}s 推 Top{self._cfg.rank_top_n}"
                   f"（仅榜单变化时）", flush=True)
         # 装配实时模拟盘：收盘前先执行 T+N 到期腿，再按模型 Top-N 建新仓。
@@ -336,6 +340,19 @@ class Engine:
                 self._paper_v4 = None
                 print(f"[engine] 模拟盘V4装配失败(降级跳过，V1/V2/V3 不受影响)："
                       f"{type(e).__name__}: {e}", flush=True)
+        if getattr(self._cfg, "paper_v5_enabled", True):
+            try:
+                self._paper_v5 = V5PaperTrader(
+                    self._cfg, self._ctx, self._notifier, self._sector_ctx, name_map)
+                print(f"[engine] 模拟盘V5就绪：{self._paper_v5.summary()}，"
+                      f"V4规则 | 行业仓位系数"
+                      f"{self._paper_v5._sector_lagging_factor:.2f}/"
+                      f"{self._paper_v5._sector_neutral_factor:.2f}/"
+                      f"{self._paper_v5._sector_strong_factor:.2f}", flush=True)
+            except Exception as e:  # noqa: BLE001 - V5 独立降级，不影响 V1-V4
+                self._paper_v5 = None
+                print(f"[engine] 模拟盘V5装配失败(降级跳过，V1-V4 不受影响)："
+                      f"{type(e).__name__}: {e}", flush=True)
         print(f"[engine] 启动实时层：股票 {len(codes)} 只 + 行业ETF/基准 "
               f"{len(sector_codes)} 只，同一会话共 {len(subscription_codes)} 只；"
               f"时段 {self._cfg.session_start}-{self._cfg.session_end}，"
@@ -380,6 +397,11 @@ class Engine:
                         self._paper_v4.maybe_trade(t)
                     except Exception as e:  # noqa: BLE001
                         print(f"[engine] 模拟盘V4交易异常: {type(e).__name__}", flush=True)
+                if self._paper_v5 is not None:
+                    try:
+                        self._paper_v5.maybe_trade(t)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[engine] 模拟盘V5交易异常: {type(e).__name__}", flush=True)
             else:
                 self._stop_feed("非交易时段/规避窗")
 

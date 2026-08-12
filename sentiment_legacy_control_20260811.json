@@ -1,0 +1,473 @@
+{
+  "version": 1,
+  "name": "decay_official_heavy_hl14",
+  "trained_at": "2026-08-12T00:48:02.508982",
+  "train_start": "2025-08-11",
+  "train_end": "2026-08-11",
+  "split_date": "2026-05-11",
+  "fit_end_exclusive": "2026-05-11",
+  "holdout_start": "2026-05-11",
+  "strict_label_purge": false,
+  "purge_sessions": 0,
+  "signal_source": "lexicon",
+  "half_life_days": 14.0,
+  "lookback_days": 70,
+  "category_weights": {
+    "announcement": 1.3,
+    "research": 1.0,
+    "stock_news": 0.5,
+    "flash": 0.2
+  },
+  "fit": {
+    "n": 37258,
+    "ic_1d": 0.0030912550469919587,
+    "ic_3d": 0.0020828798649947414,
+    "direction_1d": 0.4951419829298406,
+    "score": 0.00258706745599335
+  },
+  "holdout": {
+    "n": 21828,
+    "ic_1d": 0.014612215753514091,
+    "ic_3d": 0.02947135306412012,
+    "direction_1d": 0.4958310426974528,
+    "score": 0.022041784408817107
+  },
+  "enabled": false,
+  "strict_announcement_lag": false,
+  "blend_weight": 0.0,
+  "validation_note": "留出期 n=21828，1日IC=0.014612215753514091，3日IC=0.02947135306412012，方向胜率=0.4958310426974528；未过门槛，不加分",
+  "candidates": [
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 3.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 31103,
+        "ic_1d": -0.00645228315539576,
+        "ic_3d": -0.015117966891015433,
+        "direction_1d": 0.49127093849467895,
+        "score": -0.010785125023205597
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 3.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 31103,
+        "ic_1d": -0.006320154450979249,
+        "ic_3d": -0.01503592199128041,
+        "direction_1d": 0.4913673922129698,
+        "score": -0.010678038221129829
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 3.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 31103,
+        "ic_1d": -0.0064056553537809,
+        "ic_3d": -0.014891533904574348,
+        "direction_1d": 0.4916567533678423,
+        "score": -0.010648594629177624
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 7.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 32478,
+        "ic_1d": -0.003846313200133273,
+        "ic_3d": -0.010604194901871634,
+        "direction_1d": 0.49236406182646714,
+        "score": -0.0072252540510024535
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 7.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 32478,
+        "ic_1d": -0.0037799615525242487,
+        "ic_3d": -0.010747079751313846,
+        "direction_1d": 0.4920869511669438,
+        "score": -0.007263520651919047
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 7.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 32478,
+        "ic_1d": -0.0036929889794314603,
+        "ic_3d": -0.010286310557468767,
+        "direction_1d": 0.49233327175318675,
+        "score": -0.006989649768450114
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 14.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 37258,
+        "ic_1d": 0.0027418021213910246,
+        "ic_3d": 0.0014823723388419608,
+        "direction_1d": 0.49549090128294593,
+        "score": 0.0021120872301164926
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 14.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 37258,
+        "ic_1d": 0.0030912550469919587,
+        "ic_3d": 0.0020828798649947414,
+        "direction_1d": 0.4951419829298406,
+        "score": 0.00258706745599335
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 14.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 37258,
+        "ic_1d": 0.0022703227724019948,
+        "ic_3d": 0.0007123802123282969,
+        "direction_1d": 0.4953298620430512,
+        "score": 0.0014913514923651458
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 30.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 42607,
+        "ic_1d": -0.0012671485794356503,
+        "ic_3d": -0.0032063938596632834,
+        "direction_1d": 0.4946605017954796,
+        "score": -0.002236771219549467
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 30.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 42607,
+        "ic_1d": -0.0002944863858452191,
+        "ic_3d": -0.0017546590605717314,
+        "direction_1d": 0.4945666205083672,
+        "score": -0.0010245727232084754
+      }
+    },
+    {
+      "signal_source": "lexicon",
+      "half_life_days": 30.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 42607,
+        "ic_1d": -0.0020470073483171434,
+        "ic_3d": -0.004206127316146927,
+        "direction_1d": 0.49496561597859506,
+        "score": -0.003126567332232035
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 3.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 34446,
+        "ic_1d": -0.007723254710310801,
+        "ic_3d": -0.015081797387918499,
+        "direction_1d": 0.4928293560935958,
+        "score": -0.01140252604911465
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 3.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 34446,
+        "ic_1d": -0.00759954096234892,
+        "ic_3d": -0.014869220849056763,
+        "direction_1d": 0.4929745108285432,
+        "score": -0.011234380905702841
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 3.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 34446,
+        "ic_1d": -0.007759958295488458,
+        "ic_3d": -0.015082781063816641,
+        "direction_1d": 0.4924809847297219,
+        "score": -0.01142136967965255
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 7.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 35886,
+        "ic_1d": -0.007041496050569956,
+        "ic_3d": -0.013867448939019507,
+        "direction_1d": 0.49292203087555037,
+        "score": -0.010454472494794732
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 7.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 35886,
+        "ic_1d": -0.007036617826592351,
+        "ic_3d": -0.013737679143963712,
+        "direction_1d": 0.49317282505712534,
+        "score": -0.010387148485278032
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 7.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 35886,
+        "ic_1d": -0.006976740771361308,
+        "ic_3d": -0.013843199813553562,
+        "direction_1d": 0.49320069107730036,
+        "score": -0.010409970292457434
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 14.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 40582,
+        "ic_1d": -0.004798851784567285,
+        "ic_3d": -0.008068194870778762,
+        "direction_1d": 0.49642698733428614,
+        "score": -0.006433523327673024
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 14.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 40582,
+        "ic_1d": -0.004478675299019265,
+        "ic_3d": -0.007564929108595143,
+        "direction_1d": 0.49618057266768517,
+        "score": -0.0060218022038072035
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 14.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 40582,
+        "ic_1d": -0.0050836050911223065,
+        "ic_3d": -0.008545646108922169,
+        "direction_1d": 0.49635306293430587,
+        "score": -0.006814625600022238
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 30.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 42769,
+        "ic_1d": -0.0069462512551634655,
+        "ic_3d": -0.01150159667084146,
+        "direction_1d": 0.49636418901540835,
+        "score": -0.009223923963002463
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 30.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 42769,
+        "ic_1d": -0.005955678431971826,
+        "ic_3d": -0.00980864093665489,
+        "direction_1d": 0.49671491033225,
+        "score": -0.007882159684313357
+      }
+    },
+    {
+      "signal_source": "llm_structured",
+      "half_life_days": 30.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 42769,
+        "ic_1d": -0.00773720351298587,
+        "ic_3d": -0.012876545798150557,
+        "direction_1d": 0.49636418901540835,
+        "score": -0.010306874655568213
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 3.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 34803,
+        "ic_1d": -0.006861873333236018,
+        "ic_3d": -0.014237424532507342,
+        "direction_1d": 0.4924575467632101,
+        "score": -0.010549648932871681
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 3.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 34803,
+        "ic_1d": -0.006704687151449815,
+        "ic_3d": -0.013977960266200315,
+        "direction_1d": 0.49265867884952447,
+        "score": -0.010341323708825064
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 3.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 34803,
+        "ic_1d": -0.006829477028167923,
+        "ic_3d": -0.01410188163081268,
+        "direction_1d": 0.49271614515990003,
+        "score": -0.010465679329490302
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 7.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 36283,
+        "ic_1d": -0.0054596513205816604,
+        "ic_3d": -0.012030024732052391,
+        "direction_1d": 0.4938676515172395,
+        "score": -0.008744838026317026
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 7.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 36283,
+        "ic_1d": -0.005491456753873985,
+        "ic_3d": -0.0119260542480507,
+        "direction_1d": 0.4938952126340159,
+        "score": -0.008708755500962343
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 7.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 36283,
+        "ic_1d": -0.00543891983032995,
+        "ic_3d": -0.011994185401163447,
+        "direction_1d": 0.4937298459333572,
+        "score": -0.008716552615746699
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 14.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 41456,
+        "ic_1d": 0.00014920470239308326,
+        "ic_3d": -0.0014908334698813639,
+        "direction_1d": 0.4977084137398688,
+        "score": -0.0006708143837441402
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 14.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 41456,
+        "ic_1d": 0.0004966450374849667,
+        "ic_3d": -0.0008215684451036663,
+        "direction_1d": 0.49749131609417213,
+        "score": -0.0001624617038093498
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 14.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 41456,
+        "ic_1d": -0.0001889956930197532,
+        "ic_3d": -0.0020806886565605657,
+        "direction_1d": 0.49766016981860284,
+        "score": -0.0011348421747901594
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 30.0,
+      "weights_name": "balanced",
+      "fit": {
+        "n": 45882,
+        "ic_1d": -0.002769386057334221,
+        "ic_3d": -0.00445274479961747,
+        "direction_1d": 0.49649099864870755,
+        "score": -0.0036110654284758456
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 30.0,
+      "weights_name": "official_heavy",
+      "fit": {
+        "n": 45882,
+        "ic_1d": -0.001821664547898588,
+        "ic_3d": -0.0029248184561448363,
+        "direction_1d": 0.4965127936881566,
+        "score": -0.0023732415020217123
+      }
+    },
+    {
+      "signal_source": "hybrid",
+      "half_life_days": 30.0,
+      "weights_name": "media_heavy",
+      "fit": {
+        "n": 45882,
+        "ic_1d": -0.0035567524741179518,
+        "ic_3d": -0.005733914630532602,
+        "direction_1d": 0.4966435639248507,
+        "score": -0.004645333552325277
+      }
+    }
+  ]
+}

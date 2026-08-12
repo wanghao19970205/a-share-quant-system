@@ -16,15 +16,15 @@ PATH=/usr/local/bin:/usr/bin:/bin
 # 若某天任务没跑：有心跳=cron活着(任务条目/执行有问题)；无心跳=cron本身没在调度。
 */10 * * * * root date '+\%Y-\%m-\%d \%H:\%M:\%S cron-heartbeat' >> /app/logs/cron.log 2>&1
 
-# 交易日 10:30、13:30：轻量盘中刷新，只拉当天慢数据以外的行情并训练最近 6 个窗口。
-30 10 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh intraday-light
-30 13 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh intraday-light
-# 每周一~周五 11:40：盘中快速日更 + 短线/波段训练 + 发布。
+# 交易日 11:40、14:00：普通日更，使用最新盘中行情重训最近 24 个窗口并发布。
 40 11 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh daily-light
-# 每周一~周四 15:05（收盘后）：用当日完整收盘数据快速日更 + 训练 + 发布。
+0 14 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh daily-light
+# 每周一~周四 15:05（收盘后）：第三次普通日更，用完整收盘数据覆盖盘中临时值。
 5 15 * * 1,2,3,4 root /app/docker/scheduler_jobs.sh daily-light
-# 每周五 15:05（收盘后）：完整日更（估值/财报/180天事件窗口）+ 训练 + 发布。
+# 每周五 15:05（收盘后）：第三次刷新保留完整周更（估值/财报/180天事件窗口）。
 5 15 * * 5 root /app/docker/scheduler_jobs.sh weekly-full
+# 工作日 18:30：realtime 独立权重影子评估、门控晋级与前向回滚；不触发模型训练/发布。
+30 18 * * 1,2,3,4,5 root /app/docker/scheduler_jobs.sh realtime-weight-shadow
 # 每月第一个周六 01:00：最近36个窗口滚动因子审计；前30个月选参数、后6个月验收，达标才升级
 0 1 * * 6 root [ "$(date '+\%d')" -le 7 ] && /app/docker/scheduler_jobs.sh monthly-factor
 # 每月第一个周六 05:23：qfq 口径维护——把最近约一个月内除权(因子跳变)的票整条重拉，

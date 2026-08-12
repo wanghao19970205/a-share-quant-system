@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from intraday_1400 import config
+from intraday_1400.adaptive_exit_replay import load_trading_calendar
 from intraday_1400.fair_race_pipeline import (
     _fit_four_classifier_head,
     _fit_four_model_head,
@@ -21,6 +22,7 @@ from intraday_1400.structural_combo import (
     build_daily_execution_filter_scores,
     build_e0_e4_staged_scores,
     build_structural_combo_scores,
+    e4_coverage_diagnostics,
     fit_probability_calibrator,
     shift_daily_prior_to_signal,
 )
@@ -244,7 +246,7 @@ def run_frozen_holdout(
         _evaluation_frame(e3["predictions"], evaluation_dates),
     )
     daily = pd.read_parquet(active_predictions_path, columns=["code", "date", "pred"])
-    calendar = pd.DatetimeIndex(pd.to_datetime(panel["date"].unique())).sort_values()
+    calendar = load_trading_calendar(intraday_dir)
     daily_prior = shift_daily_prior_to_signal(daily, calendar)
     daily_prior = daily_prior[
         daily_prior["date"].isin(evaluation_dates)
@@ -252,6 +254,12 @@ def run_frozen_holdout(
     ].copy()
     daily_prior["score"] = daily_prior["e4_daily_prior"]
     daily_prior["model_variant"] = "e4_daily_top10"
+    e4_coverage = e4_coverage_diagnostics(
+        daily_prior,
+        minute_scores["c2_fixed_50_50"],
+        evaluation_dates,
+        candidate_n=100,
+    )
     staged = build_e0_e4_staged_scores(
         daily_prior,
         minute_scores["c2_fixed_50_50"],
@@ -322,6 +330,7 @@ def run_frozen_holdout(
         "holdout_end": str(evaluation_end.date()),
         "holdout_days": int(len(evaluation_dates)),
         "variants": list(predictions),
+        "e4_coverage": e4_coverage,
         "calibration": {"e1_buy": e1_calibrator, "e2_liquidate": e2_calibrator},
         "comparison": _json_report(comparison),
         "account_comparison": _json_report(account_comparison),

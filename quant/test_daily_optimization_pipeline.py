@@ -10,27 +10,59 @@ import pandas as pd
 from quant import daily_optimization_pipeline as pipeline
 
 
+def decision_metrics(daily_return: float, **overrides):
+    metrics = {
+        "mean_return": daily_return,
+        "mean_filled_names": 1.5,
+        "max_drawdown": -0.2,
+        "positive_months": 4,
+        "daily_returns": [
+            {
+                "date": str(pd.Timestamp("2026-01-01") + pd.Timedelta(days=index)),
+                "return": daily_return,
+            }
+            for index in range(12)
+        ],
+    }
+    metrics.update(overrides)
+    return metrics
+
+
 class DailyOptimizationPipelineTest(unittest.TestCase):
     def test_failed_branch_routes_in_registered_order(self):
         result = pipeline.choose_next_branch(
             "open_buyin_ridge",
-            {"metrics": {"mean_return": -0.001, "mean_filled_names": 1.8, "max_drawdown": -0.2, "positive_months": 4}},
+            {"metrics": decision_metrics(-0.001)},
+            decision_metrics(0.0),
         )
         self.assertEqual(result["status"], "branch_failed")
         self.assertEqual(result["next_branch"], "open_ridge")
 
-    def test_top2_absolute_fill_gate_accepts_one_position(self):
+    def test_paired_gain_and_top2_fill_gate_accept_one_position(self):
         result = pipeline.choose_next_branch(
             "open_ridge",
-            {"metrics": {"mean_return": 0.0001, "mean_filled_names": 1.0, "max_drawdown": -0.2, "positive_months": 4}},
+            {"metrics": decision_metrics(0.001, mean_filled_names=1.0)},
+            decision_metrics(0.0),
         )
         self.assertEqual(result["status"], "candidate_requires_independent_reproduction")
         self.assertEqual(result["next_branch"], "independent_reproduction")
+        self.assertGreater(
+            result["paired_incumbent_comparison"]["ci95"][0], 0.0,
+        )
+
+    def test_positive_candidate_without_relative_gain_fails(self):
+        result = pipeline.choose_next_branch(
+            "open_ridge",
+            {"metrics": decision_metrics(0.001)},
+            decision_metrics(0.001),
+        )
+        self.assertEqual(result["status"], "branch_failed")
 
     def test_last_failed_branch_requires_human_review(self):
         result = pipeline.choose_next_branch(
             "open_random_forest",
-            {"metrics": {"mean_return": -0.001, "mean_filled_names": 2.0, "max_drawdown": -0.2, "positive_months": 4}},
+            {"metrics": decision_metrics(-0.001, mean_filled_names=2.0)},
+            decision_metrics(0.0),
         )
         self.assertEqual(result["next_branch"], "human_review_required")
 
@@ -145,18 +177,9 @@ class DailyOptimizationPipelineTest(unittest.TestCase):
                 pipeline.validate_attempt_manifest(manifest, verify_artifact=False)
 
     def test_pipeline_automatically_runs_next_failed_branch(self):
-        failed = {
-            "mean_return": -0.001,
-            "mean_filled_names": 1.5,
-            "max_drawdown": -0.2,
-            "positive_months": 4,
-        }
-        passed = {
-            "mean_return": 0.001,
-            "mean_filled_names": 1.2,
-            "max_drawdown": -0.2,
-            "positive_months": 4,
-        }
+        failed = decision_metrics(-0.001)
+        passed = decision_metrics(0.001, mean_filled_names=1.2)
+        baseline = decision_metrics(0.0)
         calls = []
 
         def fake_run_once(branch, research_root, **kwargs):
@@ -172,7 +195,10 @@ class DailyOptimizationPipelineTest(unittest.TestCase):
                 "output_dir": str(output_dir),
                 "status": "evaluated",
                 "metrics": metrics,
-                "decision": pipeline.choose_next_branch(branch, {"metrics": metrics}),
+                "baseline_metrics": baseline,
+                "decision": pipeline.choose_next_branch(
+                    branch, {"metrics": metrics}, baseline,
+                ),
             }
 
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(

@@ -12,5 +12,6 @@ __pycache__
 .comate
 snapshots
 quant_data
+intraday_1400_data
 logs
 *.zip

@@ -1,0 +1,2529 @@
+# A股量化系统审计交接文档
+
+- **审计目标代码库**：`/home/work/A_test/a-share-quant-system-main`
+- **审计日期**：2026-08-10
+- **审计方式**：纯代码静态阅读 + 23 个并行子代理审计（第一轮 14 + 第二轮 9，其中 3 份仍在跑）+ 纯 numpy 数值复现 + 对已公布结果的逐位算术分解。**未执行任何项目代码**，**未修改任何仓库文件**。
+- **本文档用途**：供另一个会话的 agent 快速接手。所有结论均带 `file:line` 证据。**接手者请先读第 1、3.6、4 节，再按第 9 节 P00 系列行动。**
+- **本版增补（第一轮）**：3.6（负号的逐位算术分解）、4.2（sentiment 生产侧泄漏）、P00–P00e（成本量级、统计功效、多重比较、基准中性、未采样维度）、E12–E15（新排除项）、S5–S7（新疑似项）、P13–P19（新修复项）。
+- **本版增补（第二轮"再严格审计一遍"）**：§3.2 B5/B6（赛跑在不同日期集合上比较模型；1/6 入口缺 `signal_eligible`）、§4.1.1（**E4 专项复核，推翻我自己两处原判**）、§4.2.1（sentiment 逐行复核补 13 条）、§5.9（上游 active 产物可变 —— E4/H1/H2 的根因）、§5.10（跨目标量纲混用 + `raw_pred` 未 z 化）、§5.11（两个独立成本旋钮、惩罚被钉死）、**§5.12–§5.20（宇宙生存者偏差 · 交易日历 · 行位移 · 数据闸门 · ST/新股 · codes-file 定论 —— 本轮新领域最多的一块，由三份独立审计交叉确认）**、§7 E16–E23（新排除项）、§7.1 S6 升级为已确认 + 新增 S8/S9、§10 第二轮数字表、§11.6 第二轮报告清单、**P17 整体重写**、P20–P28、§12.2（第四条净增量）。
+- **⚠️ 接手者注意（两条）**：
+  1. 第二轮更正了第一轮的两处判断（`daily_history_causal: False` 不是死锁而是刻意诚实标记；E4 移位因果正确）。凡本文出现「**第二轮审计更正**」字样处，**以更正后的表述为准**。
+  2. §5.12（生存者偏差）是**唯一一个方向明确乐观且量级可能达年化数个百分点**的偏差，它不改变「策略不可盈利 —— 成立」这条判定（修掉它只会更负），但**会改变"日更相对候选好多少"这个比较**，因此与 §1.1 第四条判定直接相关。行动见 P26。
+
+---
+
+## 0. 用户的原始问题（必须回答的三件事）
+
+> "分析这个代码,我需要你帮详细的check一下分数特征是否真的无用,这个结论是否置信;目前日更是最好的感觉很反直觉,现在无论做什么探索都超不过现有版本"
+
+1. 分析该 A 股量化代码库。
+2. **严格验证"分数特征无用"是否成立、置信度多少。** 注意术语歧义：可能指"分数类特征"（`rule_score`、sentiment 分、E4 里作为盘中先验的日更模型分），也可能是"分钟特征"的口误。**两条线都已审计，两条线结论一致。**
+3. **解释为什么日更（daily-update）模型看起来最好、为什么任何探索都超不过它。**
+
+这是**只读分析任务**，用户未要求改代码。
+
+---
+
+## 1. 结论摘要（接手者只读这一节也能用）
+
+### 1.1 判定表
+
+| 命题 | 判定 | 置信度 |
+|---|---|---|
+| **该策略在 20bp 双边成本、T+1 全换手、当前配置下不可盈利** | **成立** | **高** |
+| **负收益证明模型比随机选股差** | **不成立 —— 负号来自成本与尾部假设，不是选股能力** | **高**（见 3.6 精确分解） |
+| **分钟特征 / 分数特征本身不携带增量信号** | **不成立（未被有效检验）** | **低** |
+| **"日更最好、什么都超不过"** | **主要是流程产物，不是真结论** | **中高** |
+
+第一条为什么高置信：18 轮实验全部绝对负值；唯一两个正结果（`INTRADAY_ASOF_1400_PLAN.md` §1.17 400 股试点 `+13.60bp/天`、§13.1 十日校准 `+13.86bp/天`）已被**三重推翻**——全市场不复现（§1.18 `−13.31bp/天`）、因果泄漏审计（plan:983 降级为无效参考）、封存 60 日 holdout（`−30.06bp/天`，plan:1033）。
+
+**第二条是本次审计最重要的发现**：`−29.10bp/天` 可被**逐位精确分解**为 `−18.98bp 真实双边成本 + −13.33bp 的 −10% 尾部惩罚 + **+3.21bp 正毛收益**`。换成自适应真实退出后：`−10.80bp/天 = −19.79bp 成本 + −1.12bp 惩罚 + **+10.10bp 正毛收益**`。两次分解与报告数字**逐位吻合** → **核算层算术上自洽、无致命 bug，但真实成交的毛收益是正的，不是负的。** 详见 3.6。
+
+第三条为什么低置信：至少 **7 项方向一致向下**的构造/预处理/评估缺陷（见 4.3），其中任意一项单独就有能力抹掉文档所声称的 `0.41bp/天` 效应；且实验本身对该量级**功效近似为零**（bootstrap CI 半宽 ≈ 效应的 50 倍）。纠正后剩下的 `+3.4 ~ +10.2bp/笔` 毛收益在 1771 笔上标准误约 **6.7bp**（未计日内截面相关，实际更宽）→ **统计上不可区分于零**。现有证据只支持"**在这套筛选、评估宇宙与消融设计下测不出增量**"。
+
+> **第三条在第二轮又拿到一条独立的、方法论层面的支撑（§4.5，本轮对用户原始问题最直接的发现）**：判定"无用"的两条常用依据**都不可用** —— 拟合前的单变量 IC 筛选（4.3 D1）漏掉需要联合才显现的特征；拟合后的 Ridge 系数也不可用，因为 `alpha=10` 在 n≈20 万的 z-score 输入上**数值等价于 OLS**（实测 `max|β_ridge − β_OLS| = 1.79e-06`），同方向高相关列族会把单列系数摊薄到 1/k 并使其**排在真正更弱的独立特征之后**（8 克隆最大系数 0.00395 < 独立弱特征 0.00513）。共线性解药 `--rolling-factor-select` 确实有效，但**生产日更是否开启取决于一个我读不到的 manifest 布尔值**（见 §4.5.4，待办 S10，生产主机上 10 分钟可定案）。
+
+第四条的核心机制：**在位者与挑战者用的不是同一把尺子**（见 3.1 组 A）。第二轮又补了一层更底层的机制：**在位者的历史本身是在一个只含"今天仍在上市"的池子上、用一条把停牌算作免费的时间轴测出来的**（见 §5.12 / §5.13 / §5.14，行动见 P25 / P26）。这一层方向明确乐观，但只放大在位者的历史优势，**不改变第一条判定**。
+
+### 1.2 全仓库最致命的单一空缺
+
+**不存在任何负对照（negative control）。** 已穷举全仓库每一处 RNG 调用确认。没有 random TopN、没有分数 shuffle/permutation、没有等权全域腿、没有指数基准腿走过一次收益核算。
+
+**为什么它现在比之前更关键**：审计已能确定被选组合的**毛**收益约 `+3.4bp/笔`（固定退出）到 `+10.2bp/笔`（自适应退出），但**没有任何数字告出同期全市场 14:50→次日 14:50 等权毛收益是多少**。若市场同期为 `+10bp/天`，则毛 alpha ≈ 0 甚至为负；若为 `−10bp`，则模型确有正 alpha。**这一个数字就能定案，而它不存在。** 这是第 9 节 P0 的由来。
+
+---
+
+## 2. 环境阻塞（接手者第一件要知道的事）
+
+**下面任何实验在当前机器上都跑不了**，原因两条：
+
+### 2.1 没有可用的 Python
+
+- 系统 `python3` 是 **3.6.5**，拒绝 `from __future__ import annotations`（项目代码普遍使用）。
+- 唯一另一个解释器 `/home/work/.pyenv/versions/zhw_env/bin/python` 同为 **3.6.5 且无 pandas**。
+- 本次审计的两个数值验证（中性化坍塌、Sharpe 公式）都是**用纯 numpy 手写 one-hot 重写**才跑通的。
+- **需要 Python 3.12 + pandas + pyarrow + lightgbm 才能重跑任何实验。**
+
+### 2.2 磁盘上没有任何数据
+
+- `/home/work` 下**不存在** `quant_data/`、`intraday_1400_data/`、`prepared_monthly/`（bounded find 到 depth 6 + 全树扫描，零命中）。
+- `/app` 不存在，所以 `RESEARCH_ARCHIVE_20260810.md:247,267,285` 引用的远端产物（`/app/quant_data/full_a_2018_wide/...`）也不在。
+- 仓库里**零个 `.json` 文件**（唯一的 `.json` 是 `/home/work/A_test/.claude/settings.local.json`，属 harness 配置）。
+- **不是 git 仓库**，无历史可查。
+- `.gitignore:26-39` 排除 `quant_data/`、`*.parquet`、`logs/`、`snapshots/`、`.env`、`*.pem`、`*.key`。
+- `config.REPORT_DIR` = `intraday_1400_data/reports`（`intraday_1400/config.py:7,14`），`ensure_dirs()` 从未被调用过。
+
+### 2.3 唯一的运行证据
+
+**两份 markdown 是全部证据来源，且无法从这个 checkout 复现或审计**（没有预测、没有标签、没有执行记录、没有报告哈希）：
+
+1. `quant/RESEARCH_ARCHIVE_20260810.md`（英文，362 行）
+2. `quant/INTRADAY_ASOF_1400_PLAN.md`（中文，1035 行）
+
+`RESEARCH_ARCHIVE_20260810.md:227` 自己承认这一点。
+
+### 2.4 最有价值的证据取不到
+
+前向纸交易账本（V1–V5 真实成交盈亏）只存在于**运行主机**的 `logs/realtime`，不入库。**建议接手者优先去运行主机把它捞出来**——这比任何回测重跑都更有说服力。详见 8.3。
+
+---
+
+## 3. 为什么日更看起来最好（核心分析）
+
+### 3.1 组 A：尺子不同（已确认，影响量级最大）
+
+#### A1. Sharpe 公式 bug —— 档案里的 Sharpe 264 就是它的输出
+
+`quant/backtest.py:53-66` 用**复利年化收益**除以**算术年化波动**：
+
+```python
+ann = nav.iloc[-1] ** (periods_per_year / max(len(ret), 1)) - 1 if nav.iloc[-1] > 0 else np.nan
+vol = ret.std() * np.sqrt(periods_per_year)
+"sharpe": float(ann / vol) if vol and np.isfinite(vol) and np.isfinite(ann) else None,
+```
+
+**纯 numpy 复现结果**（日均 +1.62% → ann_ret ≈ 5638%）：
+
+| 日 std | 该公式输出 Sharpe | 正确年化 Sharpe |
+|---|---|---|
+| 0.010 | 355 | 25.7 |
+| 0.012 | 296 | 21.4 |
+| 0.015 | 237 | 17.1 |
+| 0.020 | 178 | 12.9 |
+
+反解：`56.4 / 264 = 0.214` 年化波动 → 日波动 ≈ **1.35%**，是 A 股 Top2 组合的合理量级 → **Sharpe 264 可精确复现，不是笔误**。
+
+**仓库里并存两套互不兼容的 Sharpe 定义，跨文件数字不可直接比较：**
+
+| 定义 | 位置 |
+|---|---|
+| 年化收益 / 年化波动（**错**） | `quant/backtest.py:66`、`quant/watchlist_grid.py:161-179` |
+| `mean/std*sqrt(252)`（对） | `intraday_1400/evaluation.py:53`、`intraday_1400/offline_race.py:121`、`realtime/weight_shadow.py:164` |
+
+**定义差异只贡献约 14 倍放大（264 vs 19）。剥掉定义问题后剩下的日均 +1.62%（常规 Sharpe 仍 ≈19）本身就不可能** —— 这部分是执行语义泄漏，且是主要部分。`RESEARCH_ARCHIVE_20260810.md:50` 自己判定：无泄漏重训**复现了**同样离谱的 native 分数，"execution semantics, not only feature-schema contamination, were the dominant issue"。
+
+#### A2. 三套互不兼容的收益核算口径
+
+| 口径 | 位置 | 不可交易票 | 成本 | 空仓日 |
+|---|---|---|---|---|
+| **R2 日更 grid**（在位者走这条） | `quant/backtest.py:124-125, 143-149` | **排序前过滤 → 回填 rank N+1，权重重归一** | 默认 **0** | **整天丢弃** |
+| **R1 盘中** | `intraday_1400/offline_race.py:218-247` | 固定分母，不回填，现金补位 | 硬编码 0.002 | 保留 |
+| **R3 日更优化** | `quant/daily_optimization_pipeline.py:257-259` | 固定 Top2，不回填 | 0.002 | 保留 |
+
+**R2 在两个独立维度上都更乐观**（回填 + 零成本）+ 第三个（丢弃空仓日）。在位者一直在用一把更容易的尺子打分。
+
+R3 的严格实现（对照用）：
+```python
+# quant/daily_optimization_pipeline.py:257-259
+selected["slot_ret"] = np.where(selected["filled"], selected["open_ret_1d"].fillna(-0.10) - COST, 0.0)
+daily = selected.groupby("date")["slot_ret"].sum().mul(1.0 / TOP_N)
+```
+
+#### A3. 成本是环境依赖的，默认为 0
+
+- `quant/backtest.py:38-42` `bt_cost_roundtrip()` 默认 **0**
+- `quant/backtest.py:23-24` `QUANT_BT_FILL` 默认 **`"close"`** → T 日收盘成交
+- 只有 `docker/scheduler_jobs.sh:19` 导出 `QUANT_BT_COST_ROUNDTRIP="${QUANT_BT_COST_ROUNDTRIP:-0.002}"`
+- 该文件**全文没有任何 `QUANT_BT_FILL` 导出**（grep 仅命中上面那一行 `QUANT_BT`）→ **日更始终是收盘成交**
+- `quant/target_ab_experiment.py` 和 `sentiment_feature_experiment.py`（硬编码 `cost_roundtrip=0.0`）**零成本评估**
+- `docker/scheduler_jobs.sh:16-18` 的注释自己记录了一个实证：2026-07-25 仅仅加上成本，月度候选月胜率就从 **0.4286 掉到约 0.30**、晋升决策由 **True 翻成 False**
+
+#### A4. 生产日更腿的摩擦被静默禁用（关键链条，完整版）
+
+这是"+1.62%/日、Sharpe 264"的确切产生路径：
+
+```
+quant/full_train_batched.py:1155   pred = pd.concat(pred_parts, ...)
+quant/full_train_batched.py:1156-1163  backtest.portfolio_from_predictions(pred, horizon=, top_n=, max_weight=, positive_only=, ridge_quantile=)
+                                        ↑ 没有传 use_open_fill / filter_untradable / cost_roundtrip
+quant/full_train_batched.py:1164   backtest.evaluate_returns(..., periods_per_year=max(1, 252 // horizon))
+```
+
+三个参数为 `None` → 回落到环境变量默认（`quant/backtest.py:99-104`）→ close 成交 + 零成本。
+
+**更致命的是 baseline 腿的预测里根本没有可交易列：**
+
+```python
+# quant/full_train_batched.py:803-804
+if train_target_mode != "baseline" and not window.empty:
+    window = _join_tradability(window, horizon)     # ← baseline 跳过
+```
+
+- `full_train_batched.py:645-658`：baseline 的 `ab_label_col=None`、`ab_mask_col=None`
+- `full_train_batched.py:1104-1115`：`ab_cols` 只在列存在于 `model_window` 时才 merge
+- → baseline 输出**无** `tradable_ret_*` / `open_ret_*` / `buyable_*`
+
+**后果一**：`quant/backtest.py:108-113` 逐级回落到 `else: ret_col = target` → 用 `target_ret_{h}d`（T 收盘 → T+h 收盘的乐观口径）。
+
+**后果二**：`quant/backtest.py:124-125` `if filter_untradable and buy_col in pool.columns` —— 列不存在时该判断**静默 no-op，涨跌停约束完全不生效**。
+
+**文档与实现不符**：`quant/backtest.py:16-18` 的注释自称"默认口径：…含可交易性摩擦（涨停封板当日买不进、跌停封板顺延）"。这个承诺只在预测表带 `tradable_ret_*`/`buyable_close` 时成立；**baseline 腿恰好不带**。这正是口径分裂长期没被发现的原因。
+
+**注意**：这不是"偷看未来可买性"，而是"**假设永远可成交**"，方向上比严格口径更宽松。
+
+#### A5. 生产标签口径本身也是宽松的
+
+`quant/full_train_batched.py:645-658, 683, 1275` + `quant/scheduled_workflow.py:924-945`：`train_target_mode` 默认 `"baseline"` 且**从未被覆盖** → 生产模型训练在**朴素 close-to-close `target_ret_1d`、无可买性 mask** 上。带 mask / 开盘价的变体只存在于**不发布**的 `quant/daily_optimization_pipeline.py:388`。
+
+#### A6. 盘中快照冒充收盘价（限 10:30/13:30 任务）
+
+- `quant/daily_update.py:141` `_update_one_intraday_spot`、`:233-258` `update_intraday_spot()` 用 `trade_date = dt.date.today()`，优先 AmazingData 券商日线，否则回落 `datafeed.market_spot()`，把**盘中快照写成当日 bar**；`run()` 在 `:542` 仅当 `intraday_spot=True` 时调用。
+- `docker/scheduler_jobs.sh:95-175`：`intraday-light`（10:30/13:30）**传** `--intraday-spot`（`--recent-windows 6`）；`daily-light`（11:40 和 15:05）**不传** —— 它传 `--force-latest-price --lookback-days 5 --recent-windows 24`。
+- **结论**：该风险属于 10:30/13:30 刷新，15:05 那次会纠正它。`quant/scheduled_workflow.py` 的训练调用（`run_training`）不传任何执行口径参数。
+
+### 3.2 组 B：低成交率与惩罚项（已确认，仓库自己承认）
+
+#### B1. 低成交率的现金稀释效应 —— 日更的"稳"大部分是空仓
+
+`gross_exposure` 只有 **0.18–0.30**（`quant/scheduled_workflow.py:39-73` `FINAL_TRADE_STYLES`），组合只有 18–30% 在仓。未成交槽位对固定分母贡献**恰好为零的方差**，机械抬高 Sharpe。
+
+仓库自述（`INTRADAY_ASOF_1400_PLAN.md`）：
+
+| 项 | 数值 | 出处 |
+|---|---|---|
+| 日更 active 成交槽位 | **143 / 1800**（均 0.79/天） | §1.15 / `:376` |
+| 明文结论 | "日更看似更稳是**低成交现金效应**" | §1.15 |
+| 严格口径下日更日均 | **−4.78bp**，Sharpe **−1.80** | `:374-378` |
+| 明文 | "1800 个名额只成交 143 个，表面较小亏损主要来自**持有现金，并非选股盈利**" | `:380` |
+| 成交部分 | 137 笔 **−18.98bp/笔**；计入 6 次不可卖后 **−60.14bp/成交笔** | `:383` |
+| 自适应退出回放 | +4.60bp/天 Sharpe 1.41，但成交 1.01/10 | `:397-401` |
+| 明文 | "仍有 1610 个不可买名额，结果**不能解释为日更满仓策略胜出**" | `:403` |
+| 作为 E4（T−1 日更分数）全市场 26 日 | **−42.87bp/天**，Sharpe **−4.97**，成交 6.19/10 | `:439-444` |
+| 明文 | "T−1 日更 Top100 两阶段假设在该独立样本中**失败**" | `:428`, `:447-449` |
+
+**量级对照：日更 native 的 +1.62%/天，上了同一把尺子后塌成 −4.78bp/天 —— 差约 340 倍。**
+
+**B1 附加（本次审计新增，最关键的可比性陷阱）**：`INTRADAY_ASOF_1400_PLAN.md:400-409` 那张"日更自适应退出 `+4.60bp/天` vs 分钟 E3 `−10.80bp/天`"的表，**两边都是 ÷10 固定分母**（日更侧已逐位复核：`180 × 0.004573 / 1790 = +4.60bp`，其中 `1790 − 1610 不可买 = 180` 笔真实成交）。但：
+
+| | 日更腿 | 分钟腿 |
+|---|---|---|
+| 名额 | 1790 | 1790 |
+| 真实成交 | **180（10.1%）** | **1771（98.9%）** |
+| ÷10 口径日均 | +4.60bp | −10.80bp |
+| **按实际投入资本折算的毛收益/笔** | **+65.7bp** | **+10.2bp** |
+
+**也就是说，这张表比较的是"10% 仓位的现金保护效应"对"接近满仓的暴露"，不是选股能力的排序。** 计划书 `:407` 自己承认了这一点（"不能解释为日更满仓策略胜出"），但表格的呈现方式极易被读成日更胜出 —— 这正是"什么探索都超不过日更"这个印象的最直接来源之一。若把日更也拉到满仓，它的 180 笔样本量甚至不足以给出可用的 CI。
+
+#### B2. −10% 不可卖惩罚支配信号，且仓库自己承认过苛
+
+**先看精确量级（见 3.6 的完整分解）：在 `−29.10bp/天` 里，惩罚项贡献 `−13.33bp`（45.8%），成本贡献 `−18.98bp`（65.2%），真实毛收益是 `+3.21bp`。**
+
+- 惩罚是成本的 **50 倍**。Top10 里一只不可卖 = 当天 **−100bp**
+- 34 次事件 = **−18.89bp/天**的拖累，而赚到的收益是 **+0.07bp/笔**
+- 惩罚单独就能翻转策略符号：**−18.98 → −60.14bp/笔**
+- `INTRADAY_ASOF_1400_PLAN.md:405-409`：**6/6 个日更、26/28 个分钟**不可卖仓位实际在 **T+2/T+3 都能出掉**；`:407` 还发现固定标签把 **37 笔**实际有量可成交的日更持仓误判为不可买
+- 可 env 覆盖：`INTRADAY_1400_UNSELLABLE_RETURN`（`intraday_1400/evaluation.py`）
+
+**这不是估计，是刻意的保守假设 —— 而它的量级压过了所有被测的真实效应。**
+
+#### B3. 一只 NaN 作废整天，静默缩减 days 计数
+
+`intraday_1400/offline_race.py:142-144` 的 `.where(grouped["outcome_observed"].all())` 意味着**一只票 NaN 就作废该模型整天**，而门槛检查的正是 `days == 60` / `== 20`。
+
+`intraday_1400/offline_race.py:218-247` 的完整填充约定：
+```python
+selected.loc[~buyable, "net_return"] = 0.0          # 不可买 → 现金，零成本
+penalty = buyable & observed & isna()  → -0.10       # 可买不可卖 → −10%
+selected.loc[buyable & ~observed] = np.nan           # 可买未成熟 → NaN（作废整天）
+```
+
+#### B4. 分母口径矛盾（本次审计已完整确认：两套口径并存，且同一产物里同时输出两套）
+
+**÷N（固定槽位，现金补位）一侧：**
+- `intraday_1400/offline_race.py:141-143` + `select_daily_top`（`:100-105`）—— 不可买行被**写成 `0.0` 而不是删除**（`:246`），因此 groupby 均值的分母天然是 N
+- `intraday_1400/structural_combo_holdout.py:109-137` —— 显式插入 `cash_{slot:02d}` 补位行
+
+```python
+if count > int(top_n):
+    raise ValueError(f"{model} selected {count} names above top_n={int(top_n)}")
+for slot in range(count, int(top_n)):
+    cash_rows.append({... "code": f"cash_{slot:02d}", "entry_buyable": False, "net_return": 0.0, ...})
+```
+
+**÷实际成交数一侧（同时构成完美成交前视）：**
+- `intraday_1400/pipeline.py:775` → `:791`
+- `intraday_1400/evaluation.py:87` → `:114`
+
+两者都只对 `entry_buyable` 为真的行取均值 → 相当于**事后才知道哪些能买**，等于假设资金可以无摩擦重新分配到能买的名额上。
+
+**最刺眼的一处：`intraday_1400/structural_combo_holdout.py:152-155` 在同一个产物里同时写出 `comparison`（÷实际）和 `account_comparison`（÷N）两套数字** —— 读者拿哪一套完全取决于读了哪个 key，而两套数字可以差一个数量级（见 B1 表）。
+
+同文件 `:332-333` 硬编码 `"daily_history_causal": False`，使 `research_winner`/`forward_shadow_eligible` 从该模块**结构性不可达**；`:345-372` `main()` **完全绕过 holdout 账本**。
+
+> **【第二轮审计更正 —— 此处原判过重】** `daily_history_causal: False` **不是 bug，而是一处刻意的诚实标记**。同一份报告在 `:313-333` 主动写出 `"daily_history_caveat": "active daily history has no row-level publication timestamps; daily-dependent variants are diagnostic only"`；而 `auto_research.py:63-68` 定义 `DAILY_HISTORY_DEPENDENT_VARIANTS = {e4_daily_top10, e0_e4_staged_combo, h1_daily_top100_structural_rerank, h2_daily_top100_buy_filter}`，`:201-208` 在 `daily_history_causal` 非 True 时**只把这 4 个依赖日更历史的变体排除在分支选择之外**，`e0_direct` / `e1_e3_structural` / `e0_e3_minute_block` 三个纯分钟变体**仍然可以正常竞选**。所以"结构性不可达"只对 E4 家族成立，且那正是设计意图（上游产物不可信 → 不许它选分支）。真正的问题在上游（见 §5.9），而不在这个硬编码。P17 已按此重写。
+
+**本次新发现的三处静默失真：**
+
+| 位置 | 问题 |
+|---|---|
+| `intraday_1400/fair_race_pipeline.py:1707-1708`、`:1718-1719` | `if len(candidates) < top_n: continue` —— 候选不足 N 的整天被**直接跳过**，对 `:1806-1808` 的成交率门槛完全不可见 |
+| `intraday_1400/fair_race_pipeline.py:1287` | 用 `score = -1e12` 哨兵值把**非候选票塞进选择池**以凑满 N（薄候选日） |
+| `intraday_1400/offline_race.py:218-221` | 潜在退化：`observed` 列缺失时静默降级为 `notna()` → 未成熟标签被当作已观测 |
+
+#### B5（第二轮新增，被其审计者判为"本次发现的最严重核算缺陷"）赛跑在**不同的日期集合**上比较模型
+
+`_evaluate_recipe_frames` **对每个模型单独调用一次模拟器**：
+
+```python
+# intraday_1400/fair_race_pipeline.py:1772-1775
+for name, frame in predictions.items():
+    model_records, comparison = simulate_fixed_exit_race(
+        {name: frame}, labels, ExecutionConfig(top_n=top_n)
+    )
+```
+
+模拟器一次只看见一个模型，于是"共同宇宙"退化：因为 `offline_race.py:141-144` 的日均值带 `.where(grouped["outcome_observed"].all())`（一只未成熟标签作废整天，见 B3），**每个模型各自作废的是不同的天**。后果：
+- `:1827-1838` 的**内层配方选择**按 `mean_return` 排序 —— 而这些 `mean_return` 是在**不同天集合**上算出来的；
+- `:2008-2012` 的**外层头对头**同样不做宇宙对齐。
+
+其余 5 个调用点（`:775`、`:1205`、`:1376`、`:1552`）都正确地把整个 `predictions` 字典一次传进去，所以这是**局部**而非全局缺陷 —— 但它污染的恰好是"选哪个配方"和"哪个头更好"这两个判决。
+
+#### B6（第二轮新增）`run_screened_rolling_race` 缺 `signal_eligible` 过滤，与其余 5 个入口不一致
+
+它直接走到模拟器（`:758-779`），在**完整合并面板**上排序，而另外 5 个入口都先过 `signal_eligible`（`:1125`、`:1369-1371`、`:1545-1547`、`:1951-1953`、`:1993-1995`）。→ 该入口产出的数字与其他入口**不可比**。
+
+### 3.3 组 C：结构性在位者偏置（已确认）
+
+#### C1. 日更适配被限制在冠军的极小邻域
+
+`quant/scheduled_workflow.py:107-128` `_daily_short_neighbor()` —— 日更只在**月度冠军的微小邻域**内搜索。
+
+#### C2. 两套标准：晋升是相对的，研究是绝对的
+
+- **晋升门槛**（相对在位者）：`quant/watchlist_grid.py:565-655`
+- **绝对研究门槛**：只存在于**不发布**的 `quant/daily_optimization_pipeline.py:281-286`
+```python
+passed = (float(metrics.get("mean_return", float("nan"))) > 0.0
+    and float(metrics.get("mean_filled_names", 0.0)) >= MIN_FILLED
+    and float(metrics.get("max_drawdown", -1.0)) >= -0.60
+    and int(metrics.get("positive_months", 0)) >= 3)
+```
+- 配置：`:30-32` `TOP_N=2, COST=0.002, MIN_FILLED=1.0`
+- **候选侧强制严格**：`:157-159` 显式 `QUANT_BT_FILL=next_open`、`QUANT_BT_FILTER_UNTRADABLE=1`、`QUANT_BT_COST_ROUNDTRIP=0.002`；`:225-228` **硬性要求** `open_ret_1d` + `buyable_next` 存在，缺列直接报错 —— **在位 baseline 的产物根本过不了这个校验**
+- **在位侧从未进这把尺子**：`:298` 和 `:304` 两处出口，对在位者**只贴标签 `"daily_baseline_retained"`，不计算任何指标**
+
+**这不是"日更赢了"，而是"日更没上场"。**
+
+**更根本的一层（本次审计新增）：`choose_next_branch(current, result)` 的函数签名里根本没有 baseline 参数**（`quant/daily_optimization_pipeline.py:279`），整个模块也从不加载基线指标 → **这个控制器在代码层面就无法表达"优于现有版本"，只能表达"绝对达标"。** `"daily_baseline_retained"`（`:298`、`:304`）只是失败时写回的字符串标签，不是一次比较的结果。
+
+而四个绝对门槛里**只有两个是活的**：
+
+| 门槛 | 值 | 实际约束力 |
+|---|---|---|
+| `mean_return > 0` | 0 | **活的，且在位基线自己过不去**（`RESEARCH_ARCHIVE_20260810.md:315` 记录 `−9.21bp/天`，"Failed return"） |
+| `max_drawdown ≥ −0.60` | −0.60 | 活的 |
+| `mean_filled_names ≥ 1`（TOP_N=2） | 1.0 | **空门** —— 四个候选 fill 都 ~99% |
+| `positive_months ≥ 3` | 3 | **空门** —— 225 天≈10.7 个月，纯随机游走期望正月数 5.4，实测四个候选全部是 4，全过 |
+
+**所以"研究门槛"实际上退化成一条：绝对净收益 > 0。而这一条在 20bp/天满换手成本下要求毛 edge ≥ 年化 50%（见 3.6 与 P00）。**
+
+#### C3. 门槛函数本身的实现缺陷
+
+`quant/watchlist_grid.py:565-655` 两个函数都是**无方差的点估计比较**：
+
+```python
+def stability_decision(candidate, baseline, min_significant_sharpe_gain: float = 0.50,
+                       max_other_sharpe_decline: float = 0.50,
+                       min_monthly_win_rate: float = 2 / 3) -> dict:
+    ...
+        sampled = merged.iloc[::max(int(horizon), 1)].copy()   # 抽取，不是块聚合
+    ...
+        monthly = merged.set_index("date")[["ret_candidate", "ret_baseline"]].resample("ME").apply(
+            lambda x: (1.0 + x).prod() - 1.0)
+        wins = int((valid_months["ret_candidate"] > valid_months["ret_baseline"]).sum())
+    passed = (significant >= 1 and acceptable == common and common > 0
+              and monthly_win_rate >= float(min_monthly_win_rate))
+```
+```python
+def promotion_decision(candidate, baseline, min_sharpe_gain: float = 0.10,
+                       max_drawdown_worsening: float = 0.02, min_improved_horizons: int = 2):
+    ...
+    promote = avg_gain >= float(min_sharpe_gain) and improved >= int(min_improved_horizons) \
+              and worst_dd_change >= -float(max_drawdown_worsening)
+```
+
+问题：
+- `"significant"` 是**命名滥用** —— 纯量级阈值，**没有 SE、没有 p 值**
+- `month_wins`/`month_total` 跨重叠 horizon **池化 → 2/3 胜率重复计数月份**
+- **所有下游调用都覆盖 `min_improved_horizons=1`**，顺带关掉了最小共同 horizon 保护
+- `iloc[::horizon]` 是抽取而非块聚合，不能处理重叠 horizon 的自相关
+
+#### C4. 晋升闸门试 top 20 无校正
+
+`quant/scheduled_workflow.py:390-522` `_promotion_gate()` 在**同一个 holdout** 上测试**前 20 名**候选对抗在位者，**无多重比较校正**。
+
+**注意（一处需要为闸门本身辩护的地方）**：`_promotion_gate` 的设计本身是合理的 —— `:440-452` 选参严格限定在 `holdout_start` **之前**、`:462-465` 在位与候选走同一个 `prepare_fixed_context`、`:472-505` Top20 试验 + `promotion_decision` + `stability_decision` 双闸。它比 native 诊断严的原因是 `quant/watchlist_grid.py:90-103` `_ensure_targets` 会从 price 文件**补回可交易列**。**虚高数字不出自这里。**
+
+#### C5. active 历史可变、可覆盖
+
+`quant/scheduled_workflow.py:530-645` 用 `keep="last"` 合并 active 预测 → active 历史**可变/可覆盖**；`:336-354` `assert_active_is_latest` 是唯一硬性时效门，且可用 `--allow-stale-active` 绕过。
+
+`intraday_1400/dual_paper_evaluation.py:43-93` `capture_daily_publication` 明确知道这个问题：它强制 active manifest 的 `published_at` **不得晚于信号日 14:50**（`:61-65` 否则 `RuntimeError`），并对快照做 SHA256 不可覆盖固化（`:78-79,83-90`）。
+
+#### C6. holdout 纪律严重不对称
+
+| | `intraday_1400/` | `quant/` |
+|---|---|---|
+| 机制 | **真的 fcntl 锁 + SHA256 claim/consume 账本** | **无** |
+| holdout 边界 | 固定 | **从数据自身最后日期推导 → 随新数据到来而移动** |
+| 重跑后果 | 被账本拦住 | **静默地在旧 holdout 上重新选择** |
+| 唯一保护 | — | 输出目录的 `FileExistsError` |
+
+注：`intraday_1400/` 的账本虽被真正强制执行，但有 6 种绕过方式（见 `structural_combo_holdout.py:345-372` `main()` 直接绕过）。
+
+### 3.4 组 D：统计功效远低于在追的效应量（已确认）
+
+- 计划书自己的配对 CI：分钟增量 **+0.41bp/天，CI `[−22.14bp, +22.45bp]`**（§1.8）→ **CI 半宽 ≈ 效应的 50 倍**
+- `quant/model_expansion_experiment.py` 单文件筛 **~58 个 arm**，门槛宽松到"Sharpe gain > 0"，然后 argmax
+- **仓库里没有 scipy / statsmodels**（不是声明依赖）→ 任何"显著"字样都是**从未被计算过的**
+- `ae4fb3696c2dc25c6` 确认 `quant/target_ab_experiment.py` 的"显著"是**纯文本，无对应代码**，且该文件**零个程序化门槛**
+- 无 block bootstrap、无 Newey-West、无 Deflated Sharpe、无多重比较校正
+- `intraday_1400/evaluation.py:28-33` 和 `offline_race.py:126-131` 的 `_bootstrap_ci` 是 **iid 百分位 bootstrap**，对**已实现**的日收益重采样
+
+**在这个功效水平下，"探索超不过现有版本"是设计的必然输出，与探索的真实质量无关。**
+
+**完整的功效解析已移到第 9 节 P00b**（含 σ_p≈234bp/天、单样本 MDE≈44bp/天、配对 MDE≈28bp/天 vs 实测候选间差异 16bp/天、检测 5bp/天 需 28 年）。**一句话：`mean_return > 0` 这个门槛作为统计判据，只能可靠识别年化 110% 以上的 edge。**
+
+### 3.5 组 E：诚实的反面 —— 哪些成分可能是真的
+
+不能把全部归为流程产物。以下是真实的、不利于分钟侧的因素：
+
+- **分钟侧训练窗口只有 ~33 个交易日，却对 60 天 holdout 评估**（子代理 `ad9c336f4d579584e`）—— 样本严重不足，这是真实劣势
+- 5 分钟 bar 的信噪比本身低于日频，40 个分钟特征在 33 天上必然过拟合
+- 日更有更长历史、更多截面样本、更成熟的调参积累
+- A 股 T+1 + 涨跌停确实会吃掉大部分盘中 alpha，方向上是对的
+- `ad9c336f4d579584e` 另发现：**声明了 33 个网格点，实际评估 0 个**
+
+**但这些都不能解释"档案里每一个结果都是 −13 ~ −43bp/天、−53% ~ −79% 复利"。这个量级的普遍性更像核算框架在系统性扣分，而不像 alpha 缺失。这正是负对照排第一的原因。**
+
+### 3.6 精确算术分解：负号来自哪里（本次审计最重要的定量结果）
+
+这一节把"为什么所有结果都是负的"从推测变成**逐位可复核的算术**。分解只用报告里已公布的四个数：日均净收益、名额数、不可买笔数、不可卖笔数。
+
+**案例一 —— 固定 T+1 退出，`INTRADAY_ASOF_1400_PLAN.md:198`（因果 as-of 控制，240 日窗口）**
+
+已公布：日均 `−0.2910%`，2400 个名额，91 笔不可买，32 笔不可卖。
+
+```
+2400 × (−0.002910) = 91 × 0        (不可买 → 现金零收益)
+                   + 32 × (−0.10)  (不可卖 → −10% 惩罚)
+                   + 2277 × m      (真实成交)
+⇒ m = −16.62bp/笔（净）
+```
+
+| 分项 | 对日均的贡献 | 占比 |
+|---|---|---|
+| −10% 尾部惩罚 | **−13.33bp/天** | 45.8% |
+| 双边成本（0.002） | **−18.98bp/天** | 65.2% |
+| **真实毛收益** | **+3.21bp/天（= +3.38bp/笔）** | **正** |
+| 合计 | **−29.10bp/天** | 与报告**逐位吻合** |
+
+**案例二 —— 自适应退出，`INTRADAY_ASOF_1400_PLAN.md:403`**
+
+已公布：日均 `−10.80bp`，179 天，1773 笔入场，1771 笔卖出，已实现 `−9.79bp/笔`。
+
+| 分项 | 贡献 |
+|---|---|
+| 尾部惩罚（仅 2 笔不可卖） | −1.12bp/天 |
+| 双边成本 | −19.79bp/天 |
+| **真实毛收益** | **+10.10bp/天（= +10.2bp/笔）** |
+| 合计 | **−10.81bp/天**，与报告**逐位吻合** |
+
+**这两次独立分解都逐位闭合，说明三件事：**
+
+1. **核算层算术上自洽** —— 没有成本重复扣减、没有符号错误、没有单位错误（这三项已在第 7 节转为"已排除"）。
+2. **真实成交的毛收益是正的**，`+3.4 ~ +10.2bp/笔`。"负收益 ⇒ 模型不如随机"这个推论**被证伪**。
+3. **但毛收益不显著。** 1771 笔上，若单笔波动取分钟侧隐含的量级，标准误约 **6.7bp/笔**（未计日内截面相关，实际更宽）→ `+10.2bp ± 13bp`，**跨零**。这与计划书自己的三个 CI 完全一致：`:207-213` `+12.84bp` CI `[−8.49, +34.87]`；`:231` `+0.41bp` CI `[−22.14, +22.45]`；`:454` `+28.98bp` CI `[−5.80, +65.10]`。
+
+**结论的正确表述**：策略在 20bp 成本下不可盈利（成立，且成本几乎恰好等于毛收益的量级）；模型选股优于随机（**无法确认，也无法否认**）。**要把 `+10.2bp/笔` 变成可解释的数字，唯一缺的就是同期全市场 14:50→次日 14:50 等权毛收益。** 这就是 P0 负对照的全部价值。
+
+**另一个被这个分解暴露的问题：4 处未加成熟度门的 `fillna(-0.10)`。**
+
+| 位置 | 上下文 |
+|---|---|
+| `intraday_1400/pipeline.py:660` | `_evaluate_close_baseline` |
+| `intraday_1400/pipeline.py:790` | `_realized_leg_metrics` |
+| `intraday_1400/pipeline.py:1269` | `rolling_validate` |
+| `intraday_1400/evaluation.py:43` | 主指标函数 |
+
+这些路径把**尚未成熟的标签**（数据还没到，不是真的不可卖）也当成 `−10%`。`evaluation.py:87` 只按 `entry_buyable` 过滤，**没有任何成熟度门**。与 `offline_race.py:218-247` 那条正确的三分支约定（不可买→0、可买不可卖→−10%、可买未成熟→NaN）不一致 → **这四条路径系统性偏低**，且偏低的量级是 −10%/笔，极大。
+
+**还有一处口径 bug：`0.005` 的平板容差是绝对元值，不是比例。**
+
+`intraday_1400/pipeline.py:108`、`:141`、`features.py:339`、`offline_race.py:301` 都写 `abs(high - low) <= 0.005`，单位是**元**：
+
+| 股价 | 0.005 元对应振幅 | 后果 |
+|---|---|---|
+| ¥3 | 0.17% | 正常波动就被判为"封板" → 大量假不可买 |
+| ¥200 | 0.0025% | 几乎永不触发 → 真封板判不出来 |
+
+低价股（A 股数量占比很高）被系统性地误判为不可买 → 计入 `−10%` 或现金稀释，两者都向下。**这是"低价股方向的系统性向下偏置"，且从未被记录过。**
+
+---
+
+## 4. "分数特征 / 分钟特征无用"—— 判定：不置信
+
+### 4.1 三类"无用"必须分开（这是用户要的核心区分）
+
+| 特征 | 判定 | 依据 |
+|---|---|---|
+| `_technical_rule_score()` | **(ii) 有信息但冗余** | 它是价量特征的**确定性函数**，模型本来就拿到了那些原始特征。只能证明"没有增量"，不能证明"没有信息" |
+| sentiment / news-annotation | **(iii) 被实验设计抹掉** | 见 4.2 |
+| E4（T−1 日更分数作为盘中先验） | **(ii) 有信息但冗余 + (iii) 测量环境不可信** | 见 §4.1.1（第二轮审计已把此行大幅改写）。移位本身**因果正确**（`structural_combo.py:130-142` 显式交易日历后继映射，非 `groupby().shift()`）；真正的问题是上游产物可变 + 零覆盖率仪表 |
+| 分钟特征（103 个 `m5_*`） | **(iii) 被筛选 + 评估宇宙抹掉** | 见 4.3，6 项方向一致向下的缺陷 |
+| **`rule_score`（这就是字面意义的"分数特征"）** | **(ii) 有信息但冗余 + (iii) 被三重计入而无法归因** | 见 §4.6 S6：它同时是特征、朴素融合腿、组合阈值。`naive_weight>0` 时模型 alpha 与规则 alpha **在算术上不可分离** |
+| **(i) 真的没有预测信息** | **无一条成立** | 没有任何一个特征达到了能做出这个判断的证据门槛。**第二轮补充**：连"看系数/看单变量 IC"这个判定手段本身都不成立，见 §4.5 |
+
+### 4.1.1（第二轮新增）E4 专项复核：原判部分推翻
+
+原文档把 E4 的淘汰主要归因于"测量环境不可信 + 硬编码排除"。逐行读 `structural_combo.py` / `structural_combo_experiment.py` / `structural_combo_holdout.py` / `auto_research.py` 后，**四条原判需要更正，三条新缺陷需要补入**。
+
+**先明确 E0–E4 各是什么**（`structural_combo_experiment.py:156-159`，四个头训练在自适应标签面板的四个不同目标上）：
+
+```python
+"e0_direct":    "adaptive_stress_net_ret_t3",      # 直接回归 T+3 压力调整净收益（单头基线）
+"e1_buy":       "adaptive_entry_buyable",          # 分类：入场能否真的买到
+"e2_liquidate": "adaptive_liquidated_by_t3",       # 分类：T+3 前能否平掉
+"e3_return":    "adaptive_realized_net_ret_t3",    # 回归：条件于平仓的实现收益
+```
+
+结构组合在 `structural_combo.py:110-113` 装配，`STRUCTURAL_STRESS_RETURN = -0.10`（`:9`）、固定 50/50 z 融合 `STRUCTURAL_BLEND_WEIGHT = 0.50`（`:10`，用于 `:116`）。
+
+**更正 1：E4 不是"模型自己的滞后预测"，不存在自指。** 它读的是日更生产冠军的输出（`structural_combo_experiment.py:189` `pd.read_parquet(active_predictions_path, columns=["code","date","pred"])`；`scheduled_workflow.py:29` `MODEL_NAME = "ridge_lightgbm_ranker_ensemble"`，`:32-35` 把 `short_1_3` 映射到 `active_quant_short_predictions.parquet`）。那个 `pred` 是日线因子面板上 ridge 与 LightGBM ranker 的 z 融合（`full_train_batched.py:1030-1096`），目标属 `target_ret_1d` 族 —— **不同特征空间、不同标签期限、不同估计器**。
+→ 但它确实是"T−1 收盘时已完全可得信息"的确定性非线性函数，而组合面板本来就带 `daily__*`（日线块）和 `asof__*`（14:00 块）两个前缀（`fair_race_pipeline.py:153-235` `merge_prepared_frames`）。**所以 E4 不增加信息集，只是对分钟头本来就看得见的那个集合做了一次针对 1 日期限的有监督压缩。** 判定应从"(iii) 被环境抹掉"改为"**主要是 (ii) 冗余**，叠加 (iii)"。
+
+**更正 2：移位方向是对的，而且实现得比原先假设的好。** 不是 `groupby().shift()`，也不是 `date - 1 day` 合并，而是显式的交易日历后继字典映射（`structural_combo.py:130-142`）：
+
+```python
+next_date = {pd.Timestamp(dates[i]): pd.Timestamp(dates[i+1]) for i in range(len(dates)-1)}
+prior["source_date"] = prior["date"]
+prior["date"] = prior["source_date"].map(next_date)
+return prior.dropna(subset=["date"]).reset_index(drop=True)
+```
+
+`source_date` 上产生的分数被盖到**下一个**交易日，所以信号时刻 T 只看到 T−1 的分数，**移位方向无前视**；末日映射为 `NaT` 被 `dropna` 丢掉，是唯一一处有意的行损失。`_raw_head`（`:58-74`）还做了 dtype 卫生：`code` 强转 `str[:6]`、`date` 过 `pd.to_datetime().dt.normalize()`、值列 `pd.to_numeric(errors="coerce")`，再 `dropna` + `drop_duplicates(["code","date"], keep="last")`。**"str 与 Timestamp 不匹配导致整列 NaN"这条失效模式是关闭的（已在本环境用只读单行验证 `Series.map({Timestamp: Timestamp})` 保 `datetime64[ns]`）。**
+
+**更正 3：holdout 协议本身是全仓库最强的一处，不该被列为缺陷。** `structural_combo_holdout.py`：`HOLDOUT_DAYS = 60`（`:38`）；`validated_holdout_dates`（`:70-79`）在 `dates[0] <= max(training_end, CALIBRATION_END)` 时**直接 raise**（时间隔离是强制的，不是假设的）；六个输入产物 SHA 哈希（`:41-60`），两端漂移都致命（`:185-186` claim 后变更、`:305-306` 评估中变更）；固定资本记账用现金行补空槽（`:109-137`），变体不能靠少持仓取胜；三个 20 日子区块（`:140-157`）；**报告主动自标局限**（`:313-333`）。
+
+**更正 4：`auto_research.py` 的排除逻辑是正确设计，不是死锁。** 详见 §3.2-B4 的更正块与 P17。`BASELINE_MODEL = "e4_daily_top10"`（`:18`）、`TOP_N = 10`（`:19`）；拒绝 `untouched_holdout` 非真的报告（`:180-181`）；要求 ≥60 天（`:182`）且**每个**模型恰好 60 个固定资本日（`:193`）；要求 3 个有序不重叠的严格 20 日区块（`:231-241`）；`research_winner = relative_winner and positive_blocks >= 2`（`:258`）；前向影子门 `:260-267`（`winner_mean > 0`、`compound_return > 0`、`max_drawdown >= -0.20`、`fill_rate >= 0.60`）；`production_candidate` 无条件 `False`（`:130` 处逻辑）。
+
+**新缺陷 1（最重要）：交易日历来自面板自身，缺失交易日会让先验静默变旧超过一个 session。**
+
+```python
+# intraday_1400/structural_combo_experiment.py:190
+calendar = pd.DatetimeIndex(pd.to_datetime(panel["date"].unique())).sort_values()
+```
+
+`structural_combo_holdout.py:247` 同样写法。若面板缺一个交易日，前一日的"下一个交易日"会静默变成缺口**之后**那天 —— 先验因此陈旧超过一个 session，**无报错、无告警**。这是权威交易日历缺位的直接后果。
+
+**新缺陷 2：整条 E4 路径零覆盖率仪表。** 没有非空占比、没有行保留计数、没有 join 覆盖断言。具体缺四处：`structural_combo.py:141` 的 `next_date` 映射 + `dropna` 前后无行数对比；`structural_combo_experiment.py:193-198` 的 `VALID_START/VALID_END` 与 `daily_prior["code"].isin(panel["code"].unique())` 两道过滤无保留计数；`structural_combo.py:195-200` 的 Top100 候选闸门后无"是否真的凑到 100 个名字"的检查 —— 而那里是
+
+```python
+merged = candidates.merge(minute, on=["code","date"], how="inner", validate="one_to_one")
+```
+
+`validate="one_to_one"` 只抓重复键，**内连接在宇宙不完全重叠时静默丢行**；以及无"面板日历是否缺日"的断言。
+→ **后果：报出的 E4 数字（−42.87bp、−84.88bp/天）不附带任何"该臂每天实际从多少个名字里选"的证据。**一个从 12 个残存名字里选的退化臂和一个从 100 个里选的健康臂，输出长得一模一样。E4 已被淘汰，所以这没造成假阳性；但**淘汰的量级是不可解释的**，且若将来重测类似先验，这个仪表缺口会立刻变成实质问题。
+
+**新缺陷 3（潜在，尚未发作）：特征安全黑名单对"分数形状"的列名完全无覆盖。** `engineering.py:522-537` `_FORBIDDEN_FEATURE_PREFIXES` 禁的是 `target_ / label_ / adaptive_ / open_ret_ / tradable_ret_ / future_ / forward_ / fwd_ / next_ / realized_ / pnl_ / sell_return_ / exit_return_ / holding_return_`，`:538-552` `_FORBIDDEN_FEATURE_COLUMNS` 覆盖原始 OHLCV 加 `entry_open_next / exit_open_h / buyable_next / buyable_close`，`is_forbidden_feature`（`:555-560`）另抓 `_target`/`_label` 后缀 —— **没有一条匹配 `e4_daily_prior` / `pred` / `score` / `prior`**。分钟侧同样宽松（`features.py:370-380` 只排价格/元数据集加 `target_ / entry_ / exit_ / label_`；`fair_race_pipeline.py:144-151` `_daily_feature_columns` **只**排 `target_` 前缀）。`quant/model.py` 的 `_validate_feature_safety` / `_reject_unsafe_factors` 共用同一张前缀表，所以两个模型家族的缺口一致。
+
+两点必须同时记住：
+1. **现在不发作**，因为 E4 从不作为训练特征进入模型 —— 它只在排序/闸门阶段被事后消费（`shift_daily_prior_to_signal` 的输出流向 `build_e0_e4_staged_scores` 与 `build_daily_execution_filter_scores`，`structural_combo.py:145-216`），从不进 `_fit_four_model_head`（`fair_race_pipeline.py:844-915`）或 `_fit_four_classifier_head`（`:928-980`）。所以黑名单从未被查询过。
+2. **不要用"凡含 `score` 一律禁"来修**：`features.py:328-329` 有合法工程特征 `rule_score` 与 `rule_score_chg_5`。正确做法是加定向前缀（`e4_`、`prior_`、`daily_pred_`），或者更好 —— 在建头边界处改成显式白名单。
+
+**切分口径（供接手者别误以为是 walk-forward）：** `structural_combo_experiment.py:29-33` 是**硬编码单折**，非 walk-forward：`TRAIN_END=2025-08-15`、校准 `2025-08-21→2025-09-12`、验证 `2025-09-18→2025-10-31`，`purge_sessions: 3`（`:230-251`），并有因果守卫 `:36-45`（`train_end > TRAIN_END` 时 raise `"no screening window is causal for train_end=..."`）。报告自标 `"experiment": "e0_e4_staged_structural_combo_v1"`、`"development_only": True`。统计只有配对 bootstrap，无 t 检验（`offline_race.py:126-132`，配对日 <10 返回 `None`）。指标是固定退出执行模拟的日均净收益 bp，**全仓库盘中侧没有 IC**（`offline_race.py:110-123` 只有 `mean_return`/`compound_return`/`win_rate`/`sharpe`/`max_drawdown`）。执行 `ExecutionConfig(top_n=10, roundtrip_cost=0.002, unsellable_return=-0.10)`（`:224`），入场固定 14:50（`offline_race.py:12-41`，`max_exit_sessions=3`）。
+
+**结论（替换原 §4.1 E4 行的依据）：** E4 的淘汰是**被 60 天因果 holdout 支撑的**（`plan:1002-1008`：E0-E4 staged −23.20bp/天、E4 daily −84.88bp/天、H1 −0.41bp/天、H2 −142.80bp/天），**不是只靠**那个功效不足的 26 天运行（`plan:411`ff：E4 −2.89bp/天、E0-E4 −4.20bp/天、差值 −5.52bp/天 CI95 **[−58.65, +47.63]** —— CI 宽度约为点估计的十倍，该比较统计上是空的）。`plan:449` 的"E4日更先验和完整 E0-E4两阶段组合明确淘汰"这句话本身站得住。**但"E4 无用"仍不能上升为"日更分数对盘中无信息"**，因为它本来就只是分钟头已见信息集的一次冗余压缩 —— 这个实验设计上没有能力回答后一个问题。
+
+### 4.2 sentiment 消融为什么不能作为证据（已确认，本节已按 `ad417aa7e0d3b5b26` 展开）
+
+`quant/sentiment_feature_experiment.py` 这条链上**同时**存在下列缺陷。粗粒度的 6 条先列，随后是本次审计新增的 10 条细节 —— 后者才是真正致命的，因为其中两条直接说明**生产环境里 sentiment 的 `enabled` / `blend_weight` 决策建立在一个有泄漏的 IC 上**。
+
+**粗粒度 6 条：**
+
+1. **零成本**：`_portfolio_metrics`（`sentiment_feature_experiment.py:211-215`）硬编码 `cost_roundtrip=0.0` 且 `filter_untradable=False`，与冻结执行标准的 20bp **直接冲突**；`quant/backtest.py:40` 默认也是 0
+2. **无真 holdout**：`quant/` 侧实验的 holdout 边界从数据自身最后日期推导，**随新数据移动**，重跑会静默在旧 holdout 上重新选择
+3. **baseline 在贪心步之间被改写**
+4. 最多 **12 个 arm**，用一个"约 50% 纯噪声都能通过"的门槛筛选
+5. **无多重比较校正、无任何显著性检验**（scipy/statsmodels 不是依赖）
+6. 只有 **2 个模型族、单一固定超参点、TopN=3、无中性化**
+
+**新增细节（按严重度排序）：**
+
+#### S-1（最严重）生产 sentiment 信号本身有发布时间泄漏，而 `enabled` 决策依赖它
+
+- `stock_analyzer/sentiment_signal.py:166` —— **没有任何发布时间截断**。新闻按日期归集，不区分该条新闻是当日 9:00 发的还是 21:00（收盘后）发的。
+- `:147-148` 的 `ret_1d` 是**用 T 日收盘算的**。于是收盘后才发布的新闻进入了 T 日的特征，去解释 T 日的收益。
+- `:213` 的 75/25 切分**没有 purge**。
+- 后果：这条链算出的 IC 是**泄漏膨胀**的，而生产配置里 sentiment 的 `enabled` 与 `blend_weight` 正是由它决定。**这不是"消融测不出来"，这是反方向的问题 —— 生产里那个"有用"的判断本身不可信。**
+
+#### S-2 无新闻股票拿到系统性非零且方向反转的 z 值
+
+`quant/sentiment_feature_experiment.py:178-181`：`fillna(0.0)` 发生在**计算截面 mean/std 之前**。
+
+后果：若当日多数股票有正面舆情（截面均值 > 0），则**无新闻**股票（值被填成 0）在 z-score 后拿到一个**负值**，且这个负值随当日整体舆情强度变化。也就是"没消息"被编码成"消息偏差"，且符号与市场情绪反向。这与 4.4 里已排除的那种"z-score 之后填 0"完全不同 —— **顺序反了**。
+
+#### S-3 消融的 5 组里有 3 组在标注停止后是常量零或重复列，却面对严格 `> 0` 门槛
+
+`docker/scheduler.crontab:41` 记录**标注已于 2026-07-28 停止**。此后：
+
+- `sentiment_ablation_experiment.py:19-34` 的 5 个分组里，3 个变成常量零列或彼此重复
+- 而 `:87` 的晋级门槛是严格 `rank_ic_gain > 0`
+- **常量列的 IC 恒为 0（或 NaN），永远过不了 `> 0`** → 这 3 组的"无贡献"结论是**定义决定的，不是数据决定的**
+
+#### S-4 Ridge 腿被在错误窗口上评分，而晋级要求两条腿同时通过
+
+`quant/model.py:1023-1028`：`valid_end` / `predict_start` **只传给了 boosted tree 腿**。Ridge 腿因此在**包含验证集的窗口**上被评分 → Ridge 的指标偏乐观但窗口口径与 LGBM 不同。
+
+而 `sentiment_feature_experiment.py:212-213` 的 `promote_to_full_a_backfill` 要求**所有模型腿同时 confirmed**（AND 连乘门）→ 两条腿口径不一致时，这个 AND 门的通过概率被无意义地压低。
+
+#### S-5 其余 5 条
+
+| 问题 | 位置 | 后果 |
+|---|---|---|
+| decay 的分子分母共用同一 alpha | `sentiment_signal.py` | 比值在平静期恒定 → 该特征在最该起作用的时候**没有变化** |
+| Sharpe 在重叠观测上误年化 | `watchlist_grid.py:176` | 对着一个硬门槛 `sharpe_gain >= 0.10`（`:622`），而该门槛只有其自身 SE 的 **1/10** |
+| `rank_ic` 是池化相关而非日均 IC | sentiment 链 | 被跨日方差污染；仓库里 `quant/select.py:28-53` **已经实现了正确的日均 IC**，未被复用 |
+| sentiment 列跳过 winsorize 与规模/行业中性化 | 特征构造链 | 与其它特征**预处理口径不对等**（对应 5.5） |
+| `flash` 类别权重是死配置；`_base_features:170-172` 有一份更弱的私有黑名单绕过 `engineering.is_forbidden_feature` | | 配置与实际行为不一致，且**黑名单绕过是潜在泄漏通道** |
+| **零覆盖率埋点** | 全链 | 无法回答"当天有多少股票真的有舆情数据"，因此**无法把"无信号"与"无数据"区分开** |
+
+**综合判定：sentiment 这条链既不能证明舆情特征无用（消融设计有 S-2/S-3 两个机械抹除），也不能证明它有用（生产 IC 有 S-1 泄漏）。它对用户的问题提供的信息量接近零。**
+
+#### 4.2.1（第二轮新增）逐行复核后必须补的 9 条
+
+**(a) 有两套互不共享代码的 sentiment 实现，而且它们对时间对齐的处理相反。**
+
+| | 路径 | 产出 | 生产训练器可达？ |
+|---|---|---|---|
+| A | `quant/sentiment_feature_experiment.py` + `sentiment_ablation_experiment.py` | 20 个 `news_sent_*` 面板列，**仅实验用** | **不可达**（见 (i)） |
+| B | `stock_analyzer/sentiment_signal.py` | 一个标量 `SentimentSignal.score`，融进**规则式咨询复合分** | 不可达 —— 只做咨询 |
+
+A 有 `cutoff_hour`（默认 15），B **完全没有截断**（S-1）。两者从同一个新闻库算不同的公式。**接手者若只读一侧会得出相反判断。**
+
+**(b) 20 个列的确切构造，以及三个原始子信号。** 全部在 `_daily_features` 里产出，前缀 `news_sent_`（`:17`），半衰期硬钉 `(3, 7, 14)`（`:18`，CLI **只**暴露 `--cutoff-hour`，`:316`）：
+
+```python
+local      = _numeric(frame, "sentiment")                          # :64  词典整数 [-2,2]
+impact     = pd.to_numeric(frame.get("llm_impact"), errors="coerce")  # :65
+relevance  = _numeric(frame, "llm_relevance").clip(0, 1)           # :66
+certainty  = _numeric(frame, "llm_certainty").clip(0, 1)           # :67
+novelty    = _numeric(frame, "llm_novelty").clip(0, 1)             # :68
+structured = impact * relevance * certainty * novelty              # :69  手定乘法规则，无拟合权重
+hybrid     = structured.where(structured.notna(), local) * 0.8 + local * 0.2   # :70  硬编码 0.8/0.2
+```
+
+`local` 追溯到**关键词计数**而非模型：`_lexicon_score = pos - neg` 截到 ±2，词典是 30 正 / 29 负（`stock_analyzer/news.py:109-115`，词表 `:20-25`），入库时即写死（`news_store.py:90-92,105`）。
+衰减组 9 列 `news_sent_{local,structured,hybrid}_decay_{3,7,14}d`（`:102-107`）；计数/比率组 11 列（`:112-121`）含 `article_count_{1d,7d}`、`positive/negative_ratio_7d`、`llm_coverage_7d`、`relevance/certainty/novelty_7d`、`announcement/research/stock_news_count_7d`。
+
+**(c) `hybrid_decay_*` 在构造上就是 `local_decay_*` 与 `structured_decay_*` 的精确仿射函数**（由 `:70` 直接得出）→ 把三组一起给模型**不提供任何新信息，只提供共线性**。而消融的 stepwise 搜索可以同时选中多组（`sentiment_ablation_experiment.py:159-181`，`max_groups=3` 默认 `:237`）。**退化情形**：`impact` 全 NaN 时 `structured.where(structured.notna(), local)*0.8 + local*0.2 == local`，于是 `news_sent_hybrid_decay_Nd` 是 `news_sent_local_decay_Nd` 的**逐位重复列** —— 这把 S-3 说的"3 组失效"钉死到了字面等号级别。
+
+**(d) `impact` 从不单独暴露**（`:69` 只给出四元乘积），模型无法把方向与幅度分开；而 `relevance/certainty/novelty` 又另以"仅标注样本的 7 日均值"单独给出（`:117-119`），所以那个乘积是 `impact` 符号的**唯一**载体。
+
+**(e) 真正新的信息只有 LLM 派生量。** 不可由模型已有的价量/基本面导出的，只有 `structured_decay_*`、`relevance_7d`、`certainty_7d`、`novelty_7d`、`llm_coverage_7d`，且仅在标注存在时成立。其余全是标题关键词计数 + 文章条数。
+
+**(f) 未标注文章被当成中性 0 —— 直接违反项目自己写下的规则。** `sentiment_signal.py:69` 明写原则「未标注文章绝不伪造为中性 LLM 样本」，并在 `:104-106`、`:161-164` 丢弃 `llm_impact.isna()` 行来执行它。**实验违反了它**：`:86-95` 的聚合是 `structured_sum=("structured","sum")` 配 `article_count=("local","size")`，而 `groupby.sum()` 跳过 NaN → **未标注文章对分子贡献 0，却对衰减分母（`:104`）贡献 1**，等于按 (1 − 标注覆盖率) 的比例把 `structured_decay_*` 系统性拉向 0。**这与 B 侧用的是两个不同的估计量。**
+
+**(g) 「衰减」特征根本不衰减 —— 且实验侧连缓冲项都没有。** 分子分母都是同一 alpha 的 `ewm(adjust=False)`，静默期把两者同乘 `(1-alpha)^k`，比值**精确不变**。一只股票半年前的最后一条新闻，其 `news_sent_local_decay_3d` 今天仍等于半年前的值。分母上的 `.replace(0, np.nan)`（`:104`）只在浮点精确 0 时触发，首条文章之后不会发生。`sentiment_signal._candidate_daily:178-180` 有同一缺陷，但被 `:182-183` 的 `shrink` 项（用真正的滚动计数）部分掩盖 —— **实验侧的衰减列完全没有 shrink 项**。于是陈旧值原样留存，再被 z 化成很大的截面差异。
+
+**(h) `_available_date` 的两处细节缺陷（这是 A 侧唯一的时间对齐实现）。**
+
+```python
+has_clock     = raw.str.contains(r"\d{1,2}:\d{2}", regex=True)   # :41
+after_cutoff  = has_clock & (ts.dt.hour >= int(cutoff_hour))     # :42
+defer         = (~has_clock) | after_cutoff                      # :44
+return ts.dt.normalize() + pd.to_timedelta(defer.astype(int), unit="D")   # :45
+```
+
+- **无粗前视**：15:00 前有时间戳才归到 T 日，标签从 T 日收盘起算；`test_sentiment_feature_experiment.py:26-39` 有测试（14:30→T、15:01→T+1、纯日期→T+1）。`_purge_boundary_labels`（`:185-193`，用于 `:242`、消融 `:144-147`）也是对的 —— **这是这条链上唯一做对的协议卫生**。
+- **零执行延迟**：14:59 的头条被假设能在 15:00 收盘成交，且零成本（见粗粒度第 1 条）。不是泄漏，但不可执行。
+- **条件性前视（`:41-42`）**：`has_clock` 是对**原始字符串**的正则。任何存成午夜戳（`"2026-07-01 00:00:00"`）的来源会被判成 `has_clock=True, hour=0 < 15` → 归到 T 日，**绕过 `:43` 注释自称的安全默认**。公告是否命中取决于 akshare `公告时间` 的格式，而 `news_ingest.py:56` `str(r.get("公告时间", ""))` 未做校验直接透传；研报侧安全（`news_ingest.py:82` 显式重排成纯日期）。**没有针对午夜戳的测试。**
+- **`:45` 的 +1 天是自然日不是交易日**：叠加 `:122` 的 `result.reindex(dates)`（面板只有交易日），**每一条周五盘后与周末/假日的新闻都被推到非交易日、然后从 `news_sent_article_count_1d` 里静默消失**；但它在 ewm 与 `rolling("7D")` 序列里仍存在（那两个建在 `:96-99` 的自然日索引上）→ **`article_count_1d` 与其余 19 列口径不一致**，系统性少算大约周末那一份。
+
+**(i) 生产可达性为零，且不是因为被黑名单挡住。** `is_forbidden_feature("news_sent_local_decay_3d")` 返回 `False`（`engineering.py:522-560` 无 `news_*`/`sent*` 条目）—— 它们**按名字是合格的，只是从来没被构造出来**。`engineering.build_panel` 全文零处引用 news/sentiment；`news_sent_` 前缀只出现在两个实验模块和它们的两个测试里。即便硬塞进去，还有三道过滤会丢掉它们：① 生产训练器只读 `prepared_monthly/*.parquet`，其列被 `prepare_features` 钉死为 `["code","date",target] + feats`（`engineering.py:698-700`）；② `_selected_factors`（`full_train_batched.py:592-604`）与面板列取交集（`:600`）；③ 滚动 top-30 + 0.85 IC 去重（`:275-329`），且 `:295` 要求 `ic_count >= 20`，而常量零列在 `select.py:36-38`（`x[ok].nunique() < 3`）压根产生不出日 IC 行。
+
+**(j) 结论的可复现性：仓库里没有任何实验产物。** 那个判决只以**三处注释里的散文**存在，无任何数字：`docker/scheduler.crontab:41`、`docker/scheduler_jobs.sh:215-217`、`stock_analyzer/snapshot_batch.py:239-247`（`:245` 强制 `key = ""`，快照零 Qwen 调用）。仓库里 `find` 不到 `ablation_report.json` / `experiment_report.json` / `*_predictions.parquet` / `white_list_sentiment_panel.parquet` / `snapshots/news_data/` 任何一个；`README.md` 与 `quant/RESEARCH_ARCHIVE_20260810.md` 里没有任何数值结果（**那份档案通篇不提 news/sentiment**）；没有任何脚本或 cron 调用这两个实验模块（唯一引用是两个单测 + `README.md:319-320` 的测试清单）。而两个入口都**硬性拒绝复用输出目录**（`:238-239`、`sentiment_ablation_experiment.py:117-118`）→ 那是一次性运行，产物不在仓库里。
+另外 **没有任何机制强制"确认窗口必须晚于选择窗口"**：`confirmation_panel` 用的是**整个**面板（`:146-147`），无 `confirmation_predict_start > selection_end` 检查；**仓库自己的测试就传了一个更早的确认窗口** —— `test_sentiment_ablation_experiment.py:58-63` 确认 train-end `2026-01-31` 早于选择窗口结束 `2026-03-31`。
+
+**(k) 一处潜在崩溃（非泄漏）**：`:65` 的 `frame.get("llm_impact")` 在旧 schema parquet 上返回 `None`，`pd.to_numeric(None, errors="coerce")` 得到标量，于是 `:77` 的 `impact.notna()` 抛 `AttributeError`。实验用 `:135` `pd.read_parquet(path)` 直读，**绕过了会 reindex 到 `NEWS_FIELDS` 的 `news_store.read_store`**（`news_store.py:125`）→ 只对当前 `save_store` 写出的文件是 schema 安全的。
+
+**(l) 逐字门槛常量（供接手者直接比对）。** 选择门（`sentiment_ablation_experiment.py:85-92`）：`rank_ic_gain > 0` and `sharpe_gain >= 0` and `monthly_win_rate >= 0.50` and `drawdown_change >= -0.03`；确认门（`:95-102`）：`> 0` / `>= 0.10` / `>= 0.55` / `>= -0.02`；单次晋级门（`sentiment_feature_experiment.py:287-288`）与确认门**完全相同**。全局晋级要求**所有**模型腿同时通过（`:296`、`:212-213`）。这些阈值镜像生产因子晋级门（`docker/scheduler_jobs.sh:191-193`）。
+运行期门（`sentiment_signal.py:238-240`）：`enabled = n >= 100 and holdout_ic >= 0.01 and direction_1d >= 0.50`，`blend_weight = min(0.15, max(0.0, holdout_ic * 1.5))`。**`n >= 100` 数的是池化的股票-日，不是天数**（`:205`），而 `_metrics` 只需 20 个有效行就给出 IC（`:200-201`）。选择过程是 **3 源 × 4 半衰期 × 3 权重集 = 36 个候选**（`:223-231`）取最大（`:232`）—— 36 路取最大，唯一"校正"是单次切分的 holdout。
+
+**(m) `flash` 权重是彻底的死配置。** `_DEFAULT_CATEGORY_WEIGHTS` 含 `"flash": 0.4`（`sentiment_signal.py:20-25`），3 个权重集里有 2 个给 flash 赋权（`:216-217`）。但 flash 文章存在 code `""` → `_market.parquet`（`news_store.py:61`、`news_ingest.py:181`），而 `_articles(code)` 只读 `{code}.parquet`（`sentiment_signal.py:59`），实验侧同样只读 `news_dir/f"{code}.parquet"`（`:134`）且**没有 flash 类别列**（`:82`）。→ **所有 flash 权重完全惰性，市场级新闻从不进入任何特征。**
+
+**(n) 覆盖率纪律的双标（这是本节最有说服力的一条）。** 同一个仓库在别处强制覆盖率门：`quant/daily_update.py:250-251` `raise RuntimeError(f"intraday snapshot coverage too low: {coverage:.1%}")`；`full_train_batched.py:579-582` 在 `tradable_ret` NaN 率 `> 0.20` 时告警。而整条 sentiment 特征链**没有 `min_coverage`、没有 NaN 率断言、没有一行覆盖率打印**（grep `coverage` 在该链上唯一命中的是**特征** `llm_coverage_7d` 本身）。唯一存在的守卫是"全部为空"：`raise RuntimeError("面板没有舆情特征")`（`:245-246`）、`raise RuntimeError("没有可用的舆情特征组")`（消融 `:125`）。**60 只白名单里只有 1 只有新闻，也会静默通过。**
+
+**→ 强化后的综合判定：** `sentiment-factor-ablation-negative` 这个判决**在本仓库内无法复现、无法审计**；而按 (c)+(f)+(g)+S-3，在标注覆盖率低时，**这条流水线本来就只会输出"负"这一个答案，与舆情是否含信号无关** —— 5 组里 3 组结构性不可能通过严格 `rank_ic_gain > 0`。它被用来关掉一个周期性 Qwen 任务（`scheduler.crontab:41`、`scheduler_jobs.sh:215-217`、`snapshot_batch.py:239-247`），理由写的是「省 LLM token」。
+
+### 4.3 分钟特征侧：8 项方向一致向下的已确认缺陷
+
+#### D1. 单变量线性筛选在任何模型看到特征之前就删掉了"仅有交互效应"的特征 —— **最大的人为削弱源**
+
+`intraday_1400/pipeline.py:678-703`（`_select_features`）与 `:720-760`（`_select_minute_features_grouped`）的**唯一**打分口径是：
+```
+|Pearson corr(z-scored feature, 按日 pct-rank 居中的 label)|
+```
+
+分钟特征的经典价值形态恰恰是**条件性**的：`m5_price_vwap_gap` 只在 `m5_volume_last_30_share` 高时有效；`m5_ret_last_30m` 只在 `m5_amihud` 低时可交易。**这类特征单变量 corr 接近 0，在进模型前被删除。**
+
+**裁剪量（子代理直接解析 `features.py` 并重现 `_minute_family` 得到）：**
+
+| 项 | 数量 | 出处 |
+|---|---|---|
+| `aggregate_symbol` 行字典里的 `m5_*` 键 | 61 | `intraday_1400/features.py` |
+| `add_asof_base_features` 追加 | 2 | `features.py:363-366` |
+| 按 10 个 context 列 × {market_excess, market_rank, industry_excess, industry_rank} 派生 | 40 | `pipeline.py:412-425` |
+| **`m5_` 候选池总计** | **103** | |
+| 入模配额 | `top_base=40 + top_minute=40 = 80` | `pipeline.py:949-950, 964` |
+| **删除比例** | **103→40，删掉 61%，全部按单变量线性相关删** | |
+
+**对比：日线路径有冗余控制，分钟路径没有。**
+
+| | 日线（`full_train_batched.py:275-321`） | 分钟（`pipeline.py:720-760`） |
+|---|---|---|
+| 打分 | `abs_ic_mean × sqrt(ic_count) × (0.5+\|ic_win_rate−0.5\|)` IC 稳定性 | 单变量 `\|corr\|` |
+| 去相关 | **有**，贪心 `max_ic_corr=0.85`（`:308-320`） | **无** |
+| 筛选时机 | **逐窗口**（train-only, horizon-purged） | **一次性全局** |
+| 特征上限 | ≤30 | 40 |
+
+日线 Layer A 静态 manifest（`quant/select.py:142-151`，`abs_ic_mean>=0.02`、`|icir|>=0.15`、top 30）是在**整个 panel** 上拟合的 → 温和的样本内选择泄漏，被每个窗口继承。Layer B `_rolling_factor_selection` 只在 `candidate-upgrade` 模式或 `active_quant_model.json` 记录 `rolling_factor_select: true` 时激活；该 manifest 不在 checkout 里，**日常行为未验证**。
+
+**影响量级**：文档记录的分钟增量只有 `0.41bp/天`（§1.8），而一个被误删的强交互特征在 A 股日内动量上通常值 **3–10bp/天**量级。**这是唯一可能达到"翻转符号"级别的缺陷。**
+
+#### D2. `market_excess` 派生特征在数学上是死代码
+
+`pipeline.py:423-425` 构造 `{col}_market_excess = col − groupby("date").median()` —— 这是一个**按日常数偏移**。而 `pipeline.py:506` 的**按日 z-score 恰好消掉任何按日常数偏移**。
+
+**子代理数值验证（3.6 兼容脚本内联重现 winsorize/zscore）：**
+- `max |z(m5_x) − z(m5_x_market_excess)| = 8.88e-16`
+- 筛选用的 `|corr|` 两者到 6 位小数**完全相同**（0.016281）
+- `market_rank` 是近重复（Pearson 0.940、Spearman 0.999）
+
+**雪上加霜**：唯一非冗余的 `_industry_*` 变体因为 `snapshots/sw_industry_history_pit.parquet` **在本 checkout 不存在**而**从未被构造**。于是 context 族 40 个候选**全是重复品**，却在 `pipeline.py:743-750` 拿着 `quota=5`。
+
+**各族候选池 vs 配额 5：**
+
+| 族 | 候选数 | 配额 | 通过率 |
+|---|---|---|---|
+| speed | 15 | 5 | 1/3 |
+| path | 16 | 5 | ~1/3 |
+| volume_vwap | 14 | 5 | ~1/3 |
+| risk | 13 | 5 | ~1/3 |
+| dependence | 5 | 5 | **100%** |
+| **context** | **40（全重复品）** | **5** | **浪费 12.5% 的分钟名额** |
+
+**可推广的教训：任何"减去当日截面中位数/均值"的特征工程，在后续按日 z-score 下都是 no-op。日线路径是否也有同类死代码，尚未查。**
+
+#### D3. 评估宇宙被标签条件化 —— 恰好抹掉分钟特征的收益通道
+
+- **训练侧干净**：`pipeline.py:836-837`、`fair_race_pipeline.py:405-407` 都**显式** `train_mask_col=None`（注释明确说明 14:50 可买性在 14:00 未知）
+- **评估侧不干净**：三处都限定 `entry_buyable=True`
+  - `pipeline.py:775` `_realized_leg_metrics`：`labels["entry_buyable"].fillna(False)`
+  - `pipeline.py:1257` `rolling_validate.daily_top`
+  - `pipeline.py:651` `_evaluate_close_baseline`
+- 而 `entry_buyable` 由 **14:50 的成交结果字段**构造（`pipeline.py:110-115`）
+
+**文档自述的核心叙事是"分钟特征能预测可买性，但更高可买性没有转化为更好的可执行收益"。在只保留 `entry_buyable=True` 的宇宙上评估，等于先把分钟特征的收益来源（避开买不进的票）从记分板上抹掉，再宣布它没收益。**
+
+**这是"Rank IC 改善但成本后收益仍负"这一叙事的一个纯粹机械解释。影响量级：中到大。**
+
+#### D4. 分族消融的训练配置与主模型不一致 → 已公布的分族表格不可比
+
+| | 主模型 `_fit_variant`（`pipeline.py:836-837`） | 族消融（`:1002`）/ `validate_minute_families`（`:1136`） |
+|---|---|---|
+| `train_mask_col` | **`None`**（无泄漏） | **`"entry_buyable"`**（按标签期结果掩码训练） |
+| `n_estimators` | 200 | 160 |
+| `early_stopping_rounds` | 40 | 30 |
+
+**分族结论建立在一个与主模型不同、且训练集被标签条件化的模型上。**
+
+#### D5. 一次只加一族，功效近似为零，且结构上无法表达跨族交互
+
+- `pipeline.py:1099-1155` `validate_minute_families` 与 `daily_minute_enhancement.py:115-125` `candidate_features` 都只构造 **base + 恰好一族**
+- 文档 §1.8 报告效应 `0.41bp/天`、CI `[−22.14bp, +22.45bp]` → **CI 半宽约为效应的 50 倍**
+- **"某族无贡献"与"该族贡献 20bp"在数据上不可区分**
+- "加一族"与"留一族出"（`pipeline.py:986-1019`）**两种消融都无法表达** speed × volume_vwap 这类"放量确认的走势"交互 —— 而 D1 的单变量筛已经先把交互对手删掉了
+
+#### D6. 两个"分钟"特征其实是日线派生量，且用未复权量能
+
+`features.py:363-366` 的 `m5_volume_vs_20d_median` / `m5_amount_vs_20d_median` 用 `shift(1).rolling(20, min_periods=5).median()` 计算 —— **冠以 `m5_` 前缀但完全来自日频原始 volume/amount**。`_minute_family`（`pipeline.py:706-717`）把它们判为 `volume_vwap` 族，占用该族本已紧张的 5 个配额。
+
+**族分类是 token 顺序依赖的，其它误判**：`m5_max_bar_up`/`m5_max_bar_down` 被判为 risk（实为收益类）、`m5_bars_since_max_drawdown` 被判为 risk（实为路径时序类）。
+
+#### D7（附加）样本选择效应
+
+`pipeline.py:305` 剔除全部 `is_complete=False` 的行 = 剔除**停牌复牌日、半日市、异常竞价日** —— 也就是**波动率最高的那批场景**，恰是分钟特征最可能创造价值的状态区间。**方向同样向下。**
+
+#### D8（本次新增）文档声称的宇宙过滤规则根本没有实现，且真实宇宙来自一个不在仓库里的文件
+
+**三件事同时成立：**
+
+1. **`signal_locked_up_1400` 有实现、零消费者。** `intraday_1400/features.py:339-341` 算出了这个封板标志，但**全仓库无任何一处读它**（grep 确认）。
+2. **真正生效的门是 `signal_eligible`，它没有任何涨幅上限或流动性下限。** `intraday_1400/pipeline.py:317-321` + `features.py:344-348` 只要求：bar 完整 + `volume > 0` + 有前收盘基准。于是 `INTRADAY_ASOF_1400_PLAN.md:231` 声称的"14:00 涨幅低于 4.5% 才入池"这条规则**在代码里不存在**。`fair_race_pipeline.py` grep `0.045|0.098|locked` → **零命中**，说明公平赛跑那条主链路完全没有涨跌停过滤。
+3. **宇宙由一个仓库里没有的外部文件决定。** `intraday_1400/collector.py:284-289` 用正则 `(?<!\d)(\d{6})(?!\d)` 从 `--codes-file` 解析股票代码。**该文件不在 checkout 里** → 全部实验的宇宙构成**不可复核**。
+
+**方向判断：不可复核的宇宙 + 缺失的涨幅上限，两者的偏置方向都是乐观的**（若 codes-file 是事后挑的、或包含了当日封板票，都会让回测好看）。但因为 codes-file 缺失，**连"有多乐观"都无法量化**。这一条是所有结论里最难补救的 —— 它需要生产主机上的那个文件。
+
+> **【第二轮补充：第 3 点已被穷举证实，见 §5.17】** 第二轮对全部 `.sh/.md/.yml/.crontab/Dockerfile*/.toml/.json/.txt` 做了穷举 grep：**`intraday_1400` 在任何部署/cron/shell 文件里零出现**；`--codes-file` 全仓库只有一处程序化传参，而那是给 `quant.daily_update` 的；`intraday_1400/config.py` 通读 40 行无任何码表路径，也没有 `INTRADAY_1400_CODES_FILE` 环境变量；`.gitignore:24-27` 没有任何规则覆盖盘中 codes-file。**仓库内零个提交的 6 位代码清单文件。** 结论从"文件不在 checkout 里"强化为"**这条链的整个调度与宇宙定义都在代码库之外**"。同时注意刺眼的反差：该链对日期有相当严格的登记校验（`direct_return_experiment.py:145-215` 要求恰好 47/10/60 个已登记交易日）—— **日期被逐一断言，池子却来源不明。**
+
+### 4.4 已排除的四条（用户/我原先怀疑但不成立）
+
+| 怀疑 | 判定 | 依据 |
+|---|---|---|
+| **14:00 as-of 截断有未来函数 / 丢信息** | **排除** | `pipeline.py`→`features.py:88` 用 `dt.time <= 13:55`；bar 按**起始时刻**标注（fixture `test_intraday_1400.py:121-122` 生成 `09:30→11:25` + `13:00→14:55`），故 `<=13:55` **恰好覆盖到 14:00 收盘，共 36 根**；`features.py:157` `is_complete` 同时要求 `len(day)>=36` 且末根恰为 `13:55`；标签才用全天（`features.py:169` 用 `full_day`），方向正确 |
+| **集合竞价 / 11:30 尾 bar 漏掉** | **排除** | 数据源本身不产生 09:25 和 11:30 独立 bar，竞价成交被厂商并入 09:30 那根。是数据粒度限制，不是代码缺陷 |
+| **量纲差异导致 Ridge/LGBM 稀释分钟特征** | **排除** | `pipeline.py:504-506` 对 `feature_columns(frame)` 返回的**全部**列统一 winsorize(1%/99%)+zscore，base 与 `m5_*` 无区别；`quant/model.py:388-399` Ridge 作用于已 z-score 特征、同一 `alpha=10`、截距不罚；`quant/model.py:648+` LGBMRanker 是树模型尺度无关。**真正存在的"稀释"是共线性造成的系数分摊（见 D2）** |
+| **NaN 填 0 构成偏置** | **排除** | 全部 `fillna(0.0)` 发生在 z-score **之后**（`quant/model.py:99,111,140,155`），等价于填截面均值。缺失最重的 `dependence` 族（`features.py:61` `_corr` 有效点<3 或零方差返回 NaN）所在的不完整日已在 `pipeline.py:305` 整行剔除；`quality.py:37` 的 `minute_feature_finite_ratio >= 0.95` 门槛把关（实测 99.92%）。**残留小问题**：`engineering.py:608` 把零方差日 std 置 NaN → `m5_new_high_30m`/`m5_jump_count` 这类标志位在平静日整列 NaN 再填 0，**静默失活**，量级 <1bp/天 |
+
+---
+
+## 4.5（第二轮新增，**本轮对用户原始问题最直接的一节**）融合层：Ridge 单列系数不能用来判定特征无用
+
+来源子代理 `a6b7101e5942b4183`（审计集成融合与分数校准）。这一节比 4.3 的 D1（拟合前的单变量 IC 筛选）更关键，因为它作用在**拟合后的系数**上 —— 也就是"看系数很小 → 判定这个特征无用"这条推理链本身。
+
+### 4.5.1 `alpha=10` 在生产行数下数值上等于不做正则
+
+`quant/model.py:371-408`：`alpha: float = 10.0` 固定、无 CV；`reg[0,0] = 0.0`（截距不罚，**这是对的**）；输入已在 `engineering.py:674-703` 走过 winsorize→中性化→z-score。
+
+对 z-score 后的列，`diag(X'X) ≈ n`。生产 n≈200,000 时隐含收缩系数 `n/(n+alpha) = 0.99995`，实测 `max|β_ridge − β_OLS| = 1.79e-06`。
+
+**结论：「我们用了 Ridge，所以共线性已经处理过了」这句话不成立。** 它在数值上就是 OLS，共线性的系数分摊一分不少。
+
+### 4.5.2 系数分摊被定量复现：**列和守恒，单列系数按 1/k 缩小**
+
+用 ρ=0.98 的近重复列做实验（k = 该信号的近重复列数）：
+
+| k | 单列系数范围 | 该族系数**之和** |
+|---|---|---|
+| 1 | 0.01924 | 0.0192 |
+| 2 | 0.00875 / 0.01141 | 0.0202 |
+| 3 | 0.0061 ~ 0.0072 | ~0.0200 |
+| 5 | 0.0038 ~ 0.0046 | ~0.0206 |
+| 8 | 0.0007 ~ 0.0044 | ~0.0203 |
+
+**排序被直接倒置**：一个强信号复制 8 份 vs 一个独立的、强度只有其 1/4 的特征 → 克隆列最大系数 **0.00395 < 独立弱特征 0.00513**。若按系数排序做"谁有用"的判断，会**先淘汰真正强的那一族**。
+
+**单列系数不稳定，族和稳定**：单个克隆列 bootstrap 标准差 0.00145（与系数本身同量级），8 次重抽样中有 2 次某克隆列**符号翻转**；而该族系数**之和**的标准差只有 0.00016（稳定约 10 倍）。
+
+### 4.5.3 必要的边界：**精确线性恒等式不会造成分摊**（避免把这条结论用过头）
+
+这一点必须一起记录，否则接手者会过度外推。用真实管线（逐日 winsorize 1/99 → 逐日 z）跑 `macd_hist = macd_dif − macd_dea`（`engineering.py:175`），真实信号只放在 `macd_hist` 里：
+
+- dif = +0.00037，dea = −0.00051，hist = **+0.01990**（只留 hist 的模型 +0.01997），`cond(X'X) = 3.15e2`
+
+**所以病因不是"线性相关"本身，而是「高相关、同方向的列族」。** 而这种列族在 `engineering.py:145-197` 里成群存在：ret / ma_gap / volatility / volume_ratio / drawdown / range_pos / ret_vol_adj / macd_* / ovn_gap，外加 `rule_score` 与 `rule_score_chg_5`。
+
+### 4.5.4 解药确实存在且有效 —— 但**是否生效取决于一个我读不到的 manifest**（此处更正子代理原判）
+
+`_rolling_factor_selection`（`full_train_batched.py:275-329`，`top_n=30`、`preselect_multiplier=2`、`max_ic_corr=0.85`、`stability_score = abs_ic_mean * sqrt(ic_count) * (0.5 + |ic_win_rate − 0.5|)`）**确实能解决这个问题**：实测原始特征相关度 0.90/0.95/0.98/0.99 映射到**逐日 IC 序列**相关度 0.919/0.949/0.983/0.990，全部高于 0.85 阈值 → 克隆列会被剔除。
+
+子代理据此判定"`--rolling-factor-select` 是 `store_true` 默认关闭（`:1248`），所以生产从没开过"。**这条判定需要更正**，逐行核验后的真实接线是：
+
+```python
+# quant/scheduled_workflow.py:836
+def _uses_rolling_training(args) -> bool:
+    return args.strategy_mode == "candidate-upgrade" or bool(getattr(args, "incumbent_rolling_factor_select", False))
+# :883-884  —— 从 active_quant_model.json 的 params 里闩住
+if bool(params.get("rolling_factor_select")):
+    args.incumbent_rolling_factor_select = True
+# :955-961  —— 为真则同时传 --rolling-factor-select 与 --purge-horizon
+# :1010     —— build_params 又把 _uses_rolling_training(args) 写回 manifest
+```
+
+即：**monthly-factor 一定开**（`scheduler_jobs.sh:182` 是 `--strategy-mode candidate-upgrade`）；`daily_optimization_pipeline.py:354` **无条件传**；日更（`incumbent-refresh`）**开不开，取决于上一次晋级写进 manifest 的那个布尔值** —— 而 `publish_short_champion` 在日更路径只把 3 个 `daily_*` 键 merge 进 `params`（`:628-629, 1200-1209`），**不会覆盖它**，所以它是一个跨月份闩锁。
+
+**因此这条的正确表述是**：解药在探索路径上是开的，在生产日更上**状态未知**，只能在生产主机上读 `quant_data/full_a_2018_wide/active_quant_model.json` 的 `params.rolling_factor_select` 才能定。**这变成了与 S9 并列的、10 分钟即可定案的高性价比待办（记为 S10）。**
+
+**同时更正 §5.14 的附带一条**：我在第二轮写的"`--purge-horizon` 默认关闭且 `scheduled_workflow.py` 未传"是**错的** —— `:958` 就在同一个 `if _uses_rolling_training(args):` 块里传了它。两者同生共死：**开了滚动因子选择就一定有 purge，没开就两个都没有。** 这反而让 S10 的价值更高：那一个布尔值同时决定了共线性解药和 purge 是否存在。
+
+### 4.5.5 对用户原始问题的直接含义
+
+> "分数特征是否真的无用，这个结论是否置信"
+
+在 4.5.1–4.5.4 成立的前提下，**任何基于「Ridge 系数很小」或「单特征 IC 很低」得出的"无用"判断都不可用**，理由是两条互相独立的：
+
+1. **拟合前**：全局 IC manifest + 逐窗 IC 筛选是**单变量**口径（4.3 D1）—— 只在边际上有信息、需要与其他列联合才显现的特征拿不到入场券；
+2. **拟合后**（本节新增）：即使拿到入场券，同方向列族会把系数摊薄到与噪声同量级，甚至**排在真正更弱的独立特征之后**。
+
+**正确的重做方式**（写进 P30）：按**特征族**汇总系数（族和 / grouped importance），或先确认/打开 `--rolling-factor-select` 再看系数，然后才允许对任何特征下"无用"判决。子代理对这条的原话是「**这是本次审计中最可能直接推翻既有结论的一条**」，我同意这个定位。
+
+附带：`_selected_factors`（`:592-604`）在 manifest 选择为空时**静默回退到全部非禁用数值列** —— 也就是"筛选失效"和"筛选正常"在日志上长得一样。
+
+---
+
+## 4.6（第二轮新增）融合层其余 10 条 —— 已逐条独立复核，**其中 4 条推翻子代理原判**
+
+子代理 `a6b7101e5942b4183` 另报 S2–S10。我把每一条都自己拉了代码核对，**四条需要显著缩小或推翻**，另外**发现一条它没报的新缺陷（N1）**。接手者请直接读这一节的判定列，不要读原始子代理报告。
+
+| # | 子代理原判 | 我的复核结论 |
+|---|---|---|
+| S2 | `catboost_z`/`elastic_z` 算出来但从不进 `pred` → "加 CatBoost 的实验结果全是空的" | **推翻**。它们是**有意的影子腿**（`full_train_batched.py:1252` help 原文 "train an ElasticNet shadow leg **without adding it to the live score**"），且**确实被写进 parquet**（`:1120-1121` keep_cols）并在下游被真正使用：`watchlist_grid._score_pred:205-210`、`_fast_combo_metrics:317-322`、`quant_signal.py:613-616`。真正的问题不是"死代码"而是"**网格从不搜索这两个权重**" —— `_base_combos:106-148` 无 `elastic_weight`/`catboost_weight` 列，只有 `run_grid(catboost_weights=...)` 这个显式入口，仅 `shadow_leg_evaluation.py:96,273` 与 `model_expansion_experiment.py:1168` 用过 |
+| S2b | RF 分支 `p["pred"] = ...` **覆盖**而非累加（`full_train_batched.py:1104-1105`） | **降级为潜伏缺陷，当前配置下无害**。唯一传 `--random-forest` 的是 `daily_optimization_pipeline.py:374-380` 的 `open_random_forest` 分支，而该分支 `lgbm_weight=0.0, ic_weight=0.0`（`:65-72`）→ 覆盖前 `pred` 恰好就等于 `ridge_z`，覆盖后 `0.8*ridge_z + 0.2*rf_z` **正是分支描述所说的语义**（"Replace the LightGBM allocation with RandomForest 20%"，措辞诚实）。所以"RF 实验结果无效"**不成立**。它会咬人的条件是：有人把 `random_forest` 与 `lgbm_weight>0` 或 `ic_weight>0` 同时打开 —— 那时 `lgbm_z`/`ic_z` 会被静默丢弃。附带浪费：LightGBM Ranker 在 `:864` **无条件训练**，该分支里训完即弃 |
+| S3 | 日更 `run_short_grid` 在全历史上重选参数并立即发布，无 holdout | **成立，但须补两点**。(a) 它是**邻域受限**的局部搜索：`neighborhood=champion_params`（`:1180`）经 `watchlist_grid.py:715-726` 限制为 `ic_weight ±0.03 / top_n ±1 / 分位 ±0.05 / naive ±0.10 / gross 完全相等`，不是自由重选；(b) 但**没有任何 holdout**，且 `positive_only=True`。方向上仍是每天在同一段历史上做一次小范围过拟合 |
+| S4 | 双重时间衰减（抽样概率 ∝ w **且** `sample_weight=w` → 影响力 ∝ w²） | **成立但适用面被大幅缩小**：`train_ridge`（`model.py:371-408`）与 `train_lightgbm_ranker`（`:640-700`）**都没有行数上限**，因此**生产集成的两条腿完全不受双重衰减影响**。受影响的只有 `train_extra_trees:722-728`、`train_random_forest:778-782`、`train_lightgbm`（需 `enforce_max_train_rows`，`:548-557`）—— 全是影子/候选腿。CatBoost 走的是 group-safe 的"保留最新完整交易日"截断（`:826-843`），无双重衰减但截断更硬 |
+| S5 | `_metrics` 是**池化**而非逐日，且 Ranker 报 test、Ridge 报 valid | **完全成立**。`model.py:184-198` 用池化 Spearman + 池化 80 分位；`:404` `_metrics(yv, valid_pred)`（**valid**）vs `:688` `_metrics(yp_raw, pred)`（**test/predict**）。实测池化 0.0224 vs 逐日均值 IC 0.0267；250 天里 183 天对池化 top-20% 贡献 0 只，前 10 天独占 20% → 它度量的是**选日**而非选股。对 Ranker 最严重（lambdarank 输出无跨日水平约束）。**两条腿的 metrics 不可比，这很可能就是 `lgbm_weight` 被定在 0.85–1.0 的来源** |
+| S6 | `rule_score` 被三重计入 | **成立**，但第三重要限定范围：(1) 特征 —— `engineering.py:192-193` 的 `rule_score` 与 `rule_score_chg_5`，由 `:563-570` 收编；(2) 朴素融合腿 —— `watchlist_grid.py:214-217, 268, 326`（`naive_weight ∈ {0, 0.1, 0.2}` 在网格里）+ 线上 `quant_signal.py:619-623`；(3) 组合阈值 `min_rule_score`/`rule_weight`（`backtest.py:134-142`）**只在离线 `quant/pipeline.py` 链上**，`watchlist_grid` 快路径不走它。`rule_score` 自身是 10 余条人工规则的整数和（`engineering.py:37-106`：MA5>MA10>MA20>MA60、close vs MA20、KDJ、RSI6/12、BIAS6、MACD 交叉/dif/hist 斜率、量比、OBV、换手），既非常数也非简单动量。**后果**：`naive_weight > 0` 时无法把模型 alpha 与规则 alpha 分开；若网格选中 0.1/0.2，正确读法是"**模型低配了人工规则**"，不是"集成有效" |
+| S7 | `_prepare_fast_grid` 在一个线性和里混了两套 z 基准 | **成立**。`watchlist_grid.py:261-283`：`lgbm_z`/`ridge_z`/`rule_z` 由 `_row_z`（`np.nanstd`，**ddof=0**）在**白名单子集**上重算，而 `elastic_z`/`catboost_z`/`extra_trees_z`/`ic` 直接读**全宇宙 ddof=1** 的预存列。偏置子集上预存 z 的均值 2.481 / 标准差 0.322 → 有效权重被压缩 3.1 倍并附带 +2.48 常数偏移。**纯排序下偏移可抵消，但在 `positive_only`（`score > 0`，`:336-338`）与 `pred > 0` 闸门下不可抵消** —— 而日更 `run_short_grid` 正是 `positive_only=True` |
+| S8 | `backtest.walk_forward` 里 Ridge 的预测集退化 | **降级**。`backtest.py:228-231` 确实省了 `valid_end`/`predict_start` → `model.py:69-70` `predict = valid`。但 Ridge **没有 early stopping**，valid 不参与拟合，训练集仍是 `date <= train_end`，**与 Ranker 同一份** → **无拟合泄漏**。真实损害只有一条：Ridge 上报的 `rank_ic` 是在一个**包含了 test 期**的 valid 段上算的 → 指标被污染。且唯一调用方 `quant/pipeline.py:159` **不在任何部署/cron 文件里**（grep `quant.pipeline` 于 `docker/` 与全部 `.sh` 零命中）→ 影响面限于离线研究链 |
+| S9 | `swing_7_15` 从未被训练 | **成立，且比原判更严重**。`TRAIN_STYLE_ORDER = [s for s in FINAL_TRADE_STYLE_ORDER if s not in DERIVE_FROM]`（`scheduled_workflow.py:83`）→ 训练循环（`:898`）**只有 short**，`--swing-horizon 10`（`:1074`）永不进训练。但 `publish_active_models:693` 仍把 `prediction_horizon` 写成 10，而 `quant_signal.py:674` 把它作为 `expected_return_horizon` 与 `expected_return = ridge_pred`（h=1 的 Ridge 输出）一起呈现给用户 → **UI 上标着"10 日预期收益"的数字其实是 1 日模型的输出**。约 10 倍口径错配，且是**面向用户可见的**（`:620` 的注释对"冻结"是诚实的，但没意识到 horizon 标签也被冻结成了错的） |
+| S10 | 0.85 的融合权重无出处、且数值上次优；`lgbm_weight` 从未被搜索过 | **成立**。`FINAL_TRADE_STYLES`（`:40-73`）的 `score_params` 里**没有 `lgbm_weight` 键** → `:911` 落到 CLI 默认 `0.85`（`:1082`）；`_base_combos`（`watchlist_grid.py:106-148`）不含该列 → `_fast_combo_metrics:311-312` 走 `lgbm_weight is None` 分支，直接用**训练时就已把 0.85 烧进去的 `base_pred` 列**。数值上：两条等 IC 腿的最优是 0.5，w=0.85 损失 1.9–7.3% 的混合 IC；IC ≤ 基准腿一半的腿在 0.15 权重上通常**降低**混合 IC（IC=0 且 ρ=0.6 的腿把 1.000 拖到 0.912）。`selection_score`（`:435-459`）不以 IC 为目标，**结构上不可能发现这件事** |
+
+### 4.6.1（**本次复核自己发现的新缺陷 N1**）`run_short_grid` 的失败分支必抛 `UnboundLocalError`，并被伪装成"无法读取 incumbent 参数"
+
+```python
+# quant/scheduled_workflow.py:144-160
+    try:
+        _grid, best = watchlist_grid.run_grid(...)
+    except Exception as e:  # noqa: BLE001
+        print(f"[short_grid] 失败（保留原参数）：{type(e).__name__}: {e}", flush=True)
+    if best is None or best.empty:      # ← best 在异常路径上从未被绑定
+        return None
+```
+
+`best` 只在 `try` 内被赋值。网格一旦抛异常，`except` 打印完就落到 `if best is None` → **`UnboundLocalError: local variable 'best'`**，注释里承诺的「保留原参数」**从未生效过**。
+
+更糟的是它的传播路径：调用点 `:1180` 位于 `:1174` 的大 `try` 内，其 `except`（`:1188-1189`）会把**任何**异常重包成
+
+```python
+raise RuntimeError(f"无法读取 incumbent 参数，拒绝发布以避免策略漂移: {exc}") from exc
+```
+
+→ **网格搜索失败会导致整轮日更拒绝发布，且日志给出的原因完全是误导的**（说读不到 incumbent 参数，实际是网格挂了）。这条可以直接解释"某些天日更莫名不发布/报读不到参数"。修法 10 分钟：`best = None` 提到 `try` 之前，或把 `return None` 移进 `except`。
+
+### 4.6.2 与 §7.1 的对账（防止接手者以为互相矛盾）
+
+该子代理**排除**了"改权重后复用旧窗口缓存"，理由是 `_recipe_signature`（`full_train_batched.py:35-57`）确实覆盖了全部腿权重。**这与 §7.1 的 S1、S8 不矛盾** —— 三者说的是同一个函数的三个不同侧面：
+
+- 本条：**腿权重**在签名里 → 改权重会失效缓存 ✅
+- §7.1 S1：**baseline 分支**有一处缓存豁免（`:720-723`）
+- §7.1 S8：**`universe_codes` 被刻意排除**（`:35-43` 及 `:46-51` 的注释）
+
+### 4.6.3 该报告明确记为"做对了"的部分（避免接手者重复审计）
+
+- **LGBMRanker 的 group 语义完全正确** —— `model.py:116-143` 按 `["date","code"]` 排序、按日期分组、`group.append(len(g))`、逐日 `rank(pct=True)` 分箱；`:680-682` 同时传 `group` 与 `eval_group`。**"Ranker 有严重隐藏 bug"这个假设被明确否证。**
+- Ridge 截距不罚（`:392` `reg[0,0] = 0.0`）；输入已 z-score；日线链**没有** Platt/概率校准（唯一的校准在 `intraday_1400/structural_combo.py:13-54`，且 `structural_combo_experiment.py:57-77` 给了独立校准切片）
+- `_ic_weights` 只在训练段上算（`model.py:330-368`）；`_promotion_gate` 框架本身是全系统最严谨的代码；`evaluate_confidence_gate_shadow`（`model_expansion_experiment.py:485-586`）、`evaluate_market_regime_weights` 的冻结 holdout（`:1507-1566`）、`shadow_leg_evaluation.py:60-140` 拒绝覆盖输出、CatBoost 的 group-safe 截断（`model.py:826-843`）—— 都是对的
+- 各腿差异**不是随机种子噪声**（全局 `random_state=42`，可复现）—— 但"差异大于种子噪声"这件事**也从未被验证过**，因为没做过种子扫描
+
+### 4.6.4 该报告的 3 条疑似（转为 S11–S13，见 §7.1）
+
+CatBoost 的 `group_weight=sample_weight` 是**逐行**传的（`model.py:848`）而正确写法是按 group 取均值（对比 `:905` XGBoost 分支就是对的）；LightGBM 多线程直方图不确定性；`_selected_factors` 的静默全量回退（`:592-604`）。
+
+### 4.6.5 另外两条面向用户可见的口径问题
+
+- `quant_signal.py:673` 把 `expected_return` 显示为 **`ridge_pred`**，而排名用的是 z 混合分 —— `lgbm_weight` 一旦离开 1.0，**展示的收益与排序的依据就是两个不同的东西**
+- `quant_signal.py:258-263` 的 `_direction` 取**横截面 z 的符号** → 约一半标的机械地被标为"看涨"，该字段**不携带任何择时信息**
+- `pipeline.py:189` 与 `quant_signal.py:481,484` 的分位参数在线上展示路径上是**惰性的**；且网格是"先筛后打分"（`watchlist_grid.py:58-72`），线上是"先打分后筛"（`quant_signal.py:637-684`）→ **同一个数字在两处含义不同**
+
+---
+
+## 5. 数据完整性风险（可能专门压制分钟特征）
+
+### 5.1 bar 时间 START/END 语义 —— 一处需要标明的内部分歧
+
+两个子代理给出了**层次不同、并不冲突**的结论：
+
+- `abbe18ec38ded26b2` 判为"**已排除**"，依据是 `test_intraday_1400.py:121-122` 的 fixture 按起始时刻标注，`<=13:55` 恰好覆盖到 14:00 收盘、36 根。
+- `a667537b1c4a293e3` 判为"**假设但从未验证**"，依据是 `INTRADAY_ASOF_1400_PLAN.md:473` 和 `:800` **至今**把"确认 `kline_time` 是 bar 起始还是结束时间"列为**未完成的 Batch 0 交付项**。
+
+**正确表述：代码在 START 假设下自洽，不存在内部 bug；残余风险纯粹在于厂商实际标注是否为 START。** fixture 是写代码的人按同一假设造的，属于**内部一致性，不是外部验证**。
+
+**若实际为 END 的后果**（`a667537b1c4a293e3` 推演）：
+- `13:55` bar 会覆盖 13:50–13:55（无害，损失一根 bar 的信息）
+- 但 `14:50` 入场 bar 会覆盖 **14:45–14:50** → `label_entry_price_1450` / `label_entry_high_1450` / `label_entry_low_1450`（`features.py:165-168`）会取自**实盘买入窗口 14:50–14:55 之前**（实盘见 `realtime/sim_streams.py:1018`）→ **标签有 5 分钟前视**
+- 支持 START 的旁证：48 bars/天（fixture 24+24，与 SDK 实测行数一致，`plan:461-462`）、末根 `14:55`（不是 15:00）、首根 `09:30`（不是 09:35）
+- **但没有任何测试或代码把它对着真实 SDK 输出断言过**
+
+**核对成本约 10 分钟（用一个盘中实时样本），性质从"可能已有前视"降级为"一个尚未核对的外部约定"，但必须做。**
+
+### 5.2 `_normalize_kline` 可静默毁掉全部 bar 时间
+
+`stock_analyzer/amazingdata_source.py:231-245` 是唯一的归一化代码，且**period-agnostic**（daily 和 min5 走完全相同路径）。
+
+- **列映射** `_KL_COLMAP`（`:185-193`）：`date`/`time`/`trade_date`/`kline_time`/`datetime`/`日期` → `"date"`。min5 的 `kline_time` 变成 `date`，下游无独立 `kline_time` 列（消费者两种都处理：`intraday_1400/features.py:75`、`offline_race.py:255`）
+- **索引处理** `:234`：`out = df.reset_index() if df.index.name else df.copy()` → **无名 DatetimeIndex 被静默丢弃** → `:243` 伪造 `out["date"] = pd.RangeIndex(len(out))` → `:244` 变成 1970-01-01 纳秒时间戳。**已验证**：`pd.to_datetime(pd.Series(pd.RangeIndex(2)))` → `1970-01-01 00:00:00`, `…00:00:00.000000001`。**全部 bar 时间被摧毁且无任何异常抛出。**
+- **未传 format** `:244`：`pd.to_datetime(out["date"], errors="coerce")`。字符串 `'202607011355'` 解析正确（已验证），但**同一值以 int 传入会解析成 epoch 纳秒垃圾**（`202607011355` → `1970-01-01 00:03:22`）。`errors="coerce"` 让畸形值静默变 `NaT`，且 **`NaT` 行不被丢弃**
+- 若 SDK 同时返回 `date` 和 `kline_time` 两列，rename 后产生两个 `date` 列，`:244` 抛 `ValueError: cannot assemble with duplicate keys`（已验证）
+- **完全无时区处理**：`amazingdata_source.py`、`collector.py`、`features.py` 里无 `tz_localize`/`tz_convert`/`utc=`。全仓库唯一的 tz 提及是 `quant/scheduled_workflow.py:740` 的注释（容器 TZ 为 Asia/Shanghai）。**所有时间戳都是 naive local。**
+
+### 5.3 复权（`_apply_adjust`）—— 机制正确，但有 5 个残余风险
+
+**数学**（`amazingdata_source.py:297-329`）：
+- 因子是券商**后复权**（hfq）因子；`hfq = raw * factor`（`:324`）；`qfq = raw * factor / base`，其中 `base = float(factor.dropna().iloc[-1])`（`:320-322`）—— **归一到整张因子表的最新日期，不是窗口末端**。测试见 `stock_analyzer/test_amazingdata_adjust.py:34-51`
+- **只缩放 `open/high/low/close`**（`:326-328`）；**volume 和 amount 保持原始值**，由 `test_amazingdata_adjust.py:58-63` 断言
+- 缺因子 → **静默回落到原始价格**（`:311-312, 318-319`；`test_amazingdata_adjust.py:65-68`）
+
+**日内时间戳对齐机制本身是正确的**（`:314-317`）：
+```python
+dates = pd.to_datetime(out["date"])
+aligned = factor.reindex(factor.index.union(dates.values)).ffill().reindex(dates.values)
+```
+因子索引是日频午夜归一化的（`_factor_series` `:332-338`）。union + ffill 把当日每个日内时间戳排在当日午夜戳**之后**，所以除权日 D 的 bar 正确拿到 `factor(D)`。**已验证**：`factor={2024-01-02:1.0, 2024-01-03:2.0}`，bars `01-02 09:35 / 01-02 14:55 / 01-03 09:35 / 01-04 09:35` → aligned `[1,1,2,2]`，qfq scale `[0.5,0.5,1,1]`。**不是差一天。**
+
+**残余风险：**
+
+| # | 风险 | 证据 |
+|---|---|---|
+| 1 | **除权日因子表过期** → ffill 静默把除权前因子用于当日日内 bar，且 `base` 也是除权前值 → **整天未复权且无报错**。已验证：因子表止于 2024-01-02 时四根 bar 全部 scale=1.0。`_get_factor_frame` 用 `is_local=False` 拉新（`:346, 360-362`）可缓解但**不能检测** | `test_amazingdata_adjust.py:70-77` 只测了尾部 ffill |
+| 2 | **部分 NaN 产生 NaN 价格**：`:318` 的守卫只在 `pd.isna(aligned).all()` 时放弃。早于因子序列首日的 bar 得到 NaN scale → **NaN OHLC**。已验证 | `:318` |
+| 3 | **重复时间戳直接抛异常**：`:316` `reindex(dates.values)` 在有任何重复时间戳（含 coerce 失败产生的重复 `NaT`）时抛 `ValueError: cannot reindex from a duplicate axis`。已验证。`_factor_series` 也不对自身索引去重 | `:316` |
+| 4 | **volume/amount 跨拆分保持原始值** → `m5_volume_vs_20d_median` / `m5_amount_vs_20d_median`（`features.py:365-366`）、`risk_volume_vs_median_20`（`features.py:298`）、`m5_amihud`（`features.py:217`）在送转/拆股事件上**全部失真**。`intraday_1400/collector.py:180-187` 只重算了 `bar_vwap_qfq`，volume/amount 仍 raw，`features.py:151-152` 把 raw 值汇总进日行。`adaptive_exit_replay.py:137-141` 同样 | 见左列 |
+| 5 | **`base` 随 wall-clock 移动**：因 `base` 是因子表最新日期，新除权后重采同一历史窗口会得到不同 qfq 数字。分钟侧用 `_factor_fingerprint`（`collector.py:67-77`，按 `values.iloc[-1]` 归一后哈希变点）检测，写 `factor_rebuild_required.json`（`collector.py:254-263`），并在 `quality.py:45-63` 设门 | 见左列 |
+
+### 5.4 日更侧与分钟侧的因子版本机制互不通信（重要）
+
+| | 分钟侧 | 日更侧 |
+|---|---|---|
+| 机制 | per-code fingerprint，持久化到 `CHECKPOINT_DIR/factor_fingerprints.json`（`collector.py:126-152`），逐行打 `factor_version`（`:188-189`），经 `features.py:163` 传递，`quality.py:25,60,73` 要求 100% 填充 | `quant/refresh_qfq.py`：`_factor_changed`（`:44-57`）比较 `window_days` 截点前的因子值与最新值，`_rebuild_one`（`:82-91`）重拉 2018→今并**覆盖**存储价格序列。默认 `--window-days 35`，**月度**运行（`docker/scheduler_jobs.sh:197-208`） |
+| `factor_version` 列 | **有** | **完全没有**（grep 仅命中 `intraday_1400/`；`quant/warehouse.py` 和 `quant/build_dataset.py` 无任何 `factor_version`/`qfq` 引用） |
+
+`refresh_qfq.py:1-8` 的模块 docstring 自陈它要修的正是：增量日更（`--lookback-days 5`）只重写近期行，除权股的旧行保留除权前 base、新行用除权后 base。
+
+**后果：两条腿的因子版本可以分歧且不可检测。** 日更腿的 qfq base 是 `refresh_qfq` 上次扫到的（最多 ~35 天漂移，窗口外的股票更久）+ `_merge_time_series` 增量合并漂移（`quant/daily_update.py:126-133, 167-181, 375-382`）；分钟腿的 base 是 collector 最新指纹快照。
+
+**两条腿在 `intraday_1400/fair_race_pipeline.py:241-256` `load_joined_prepared` 处被 join 用于建模**（日线 prepared 目录 `:114-119`），被 `daily_minute_enhancement.py:136` 和 `:207` 使用。**join key 只有 `(code, date)`，无任何因子版本一致性检查。**
+
+日更源内部还有一个小号同类问题：单票路径的 `@lru_cache(maxsize=8192)` `_backward_factor`（`amazingdata_source.py:370-373`，快照被冻结在进程生命周期内）与批量路径的 per-chunk 新鲜 `_get_factor_frame`（`:281`）**在同一个长驻进程里可能对同一只股票产生不同的 `base`**。
+
+### 5.5 预处理口径不对等（日线中性化，分钟不中性化）
+
+- **日线**（生产路径 `quant/full_train_batched.py:443-456` → `engineering.prepare_features` → `engineering.py:674-703`）：winsorize → **neutralize_cross_section** → zscore
+- **分钟**（`intraday_1400/pipeline.py:504-506`）：winsorize → zscore，**无中性化**
+
+`neutralize_cross_section`（`engineering.py:613-641`）默认 `neutral_cols=["log_mv_total"]`（`:615`），且 **`build_panel` 从未产出 `industry` 列，无上游写入者** → **生产中性化是"仅市值、非行业"，docstring 里的行业腿是死代码**。
+
+**并且它把 `log_mv_total` 对自己回归**（纯 numpy 已验证）：
+
+| 特征 | 原 std | 残差 std |
+|---|---|---|
+| `log_mv_total` | 1.2008 | **2.170e-15** ← 自我消灭 |
+| `pb` | 1.1317 | 1.121（正常） |
+
+残差 std ≈ 0 → z-score 时除零 → NaN → 后续 `fillna(0.0)`。**该特征被彻底消灭。**
+
+**这个不对称正好落在两类特征混合处**：`fair_race_pipeline.py:155-237` `merge_prepared_frames` 把 `daily__*`（市值残差）与 `minute__*`（未中性化）1:1 join；`daily_minute_enhancement.py:195-230` 的赛跑面板就建在这个 join 上；`pipeline.py:378-409` 还把已中性化+z-score 的日线基本面列并入后**再次** winsorize+z-score。
+
+**双向影响**：一个实质是市值代理的分钟特征会在单变量筛中得高分并占名额（向下压真实分钟信号），同时又给混合模型注入基线没有的市值 beta（**可能虚高 Rank IC 增量**）。**这解释了"Rank IC 改善但成本后收益不改善"的一种非信号性可能。**
+
+### 5.6 两处轻微前视
+
+| # | 问题 | 位置 | 量级 |
+|---|---|---|---|
+| 1 | `rolling_validate` 用 `end_date=max(spec[3] for spec in window_specs)` + `max_rows=400_000` 一次性加载**一个**筛选面板，随后才按 `train_end` 过滤。`_select_features` 的 `train.iloc[::step].head(max_rows)` 等距抽样 step 取决于**全跨度**行数 → **早期窗口的抽样构成受未来数据影响** | `pipeline.py:1192-1197`；`:686, 729` | 小，方向不明（同时作用于 base 与 minute） |
+| 2 | `align_control_feature_selections` 把 `daily_close_control`（**用了收盘价的前视变体**）的选择复制给两个 as-of causal 变体，并把 `daily_close_plus_minute_control["minute"]` 复制给 `daily_asof_plus_minute_control["minute"]`。设计意图是控变量对齐，代价是**"合法的 14:00 因果变体"用的特征集不是它自己能合法得到的** | `fair_race_pipeline.py:605-632` | 小到中；as-of 支线的分钟结论**不能解释为纯因果结果** |
+
+### 5.7 赛跑里的"日线基线"不是生产日线模型
+
+| | 生产日线 | 赛跑里的日线基线 |
+|---|---|---|
+| 目标 | `train_target_mode="baseline"`（`full_train_batched.py:1275`），无掩码，朴素 close-to-close `target_ret_1d` | **penalty-aware** 目标（`pipeline.py:565-570, 895-897`，未成交填 `-0.10`） |
+| 特征 | ≤30，带 IC 稳定性 + 去相关筛选 | 40，单变量筛 |
+
+两侧一致（都用同一 harness），所以**赛跑内部是公平的**，但"基线"**并非生产口径** → 限制外部有效性。
+
+### 5.8 涨跌停口径：板块差异基本缺失
+
+**唯一真正从行情构造 `entry_buyable` 的两处：**
+
+1. `intraday_1400/pipeline.py:107-115`：平 bar spread ≤ 0.005 **且** `entry_return >= 0.045` 判为封板；buyable 要求 bar 存在、volume > 0、非封板、且 `entry_return < 0.098`。卖侧镜像 `:140-142`（`<= -0.045`），`-10%` 惩罚 `:184-193`
+2. `intraday_1400/offline_race.py:298-307` `_locked_bar`：volume ≤ 0 → 阻塞；否则 `|high-low| > flat_bar_tolerance`(0.005) → 非封板；否则买侧 `bar_return >= limit_return_threshold`（默认 **0.045**，`:25`）。用于 `:466`(False)/`:487`(True)，并经同一 helper 用于 `adaptive_exit_replay.py:192,221`
+
+**其余全是 passthrough 或合成常量**：`offline_race.py:222,230`（拷贝标签列）、`adaptive_label_pipeline.py:66-68`（读 parquet）、`structural_combo_holdout.py:130`（合成现金行 False）、以及 `fair_race_pipeline.py:994-1003`、`evaluation.py:87`、`pipeline.py:651,775`、`direct_return_experiment.py:367`、`dual_paper_evaluation.py:162,295`、`forward_evaluation.py:259`（纯消费者）。`adaptive_entry_buyable`（`adaptive_label_pipeline.py:95`、`target_redesign.py:281`）是同一 replay 结果的 float 重铸。
+
+**`intraday_1400` 之外的涨跌停过滤：**
+- `quant/tradability.py:102-103`：`limit_up_seal = (close==high) & (ret1 >= 0.095)`；`limit_down_seal = (close==low) & (ret1 <= -0.095)` → `buyable_close`（`:131`）、一字板 `buyable_next`（`:125-126`）；`rolled_sell_close()` 顺延至 `cap` 天后在窗口末强平。消费者：`quant/watchlist_grid.py:250-256`、`quant/full_train_batched.py:549-569,653-655`、`quant/daily_optimization_pipeline.py:225-259`
+- `intraday_1400/features.py:275-276` `risk_near_limit_up/down` 计数器 ±0.045；`:339` `signal_locked` = spread≤0.005 & return≥0.045
+- `realtime/rerank.py:214-219`、`rankboard.py:158-164`、`v2.py:219`：`drop_limit_up=True` via `snapshot.is_limit_up`
+- `stock_analyzer/candidate_eval.py:133-136`：仅文本清洗
+
+**板块差异问题：**
+
+| 板块 | 真实限幅 | 代码处理 |
+|---|---|---|
+| 主板 | ±10% | 用 0.045 触发 + 0.098 硬顶（`intraday_1400`）/ 0.095（`quant/tradability.py`） |
+| **ST** | **±5%** | **已知盲区，代码里明说**：`quant/tradability.py:7` "口径（主板 ±10%，一字板是其子集；**ST ±5% 为已知盲区，不在此处理**）"，`:94` 重复。`intraday_1400` **无等价说明** |
+| **科创板 688 / 创业板 300** | **±20%** | **完全无处理，任何注释都未提及** |
+
+后果双向：688/300 涨 5% 离 20% 限幅很远，但只要其 5 分钟 bar 恰好平（spread≤0.005）就会触发 0.045 的"封板"判定；而真正的 688 涨停(+20%)与主板 +10% 板**无法区分**。0.045 触发器有平 bar 条件护着，**限制但不消除**误判。
+
+**全仓库唯一的板块感知阈值**是 `stock_analyzer/candidate_eval.py:133` `threshold = 4.8 if "ST" in str(name).upper() else 9.5` —— 而它管的是 **LLM 叙事清洗，不管任何交易或标签**。（`intraday_1400/` 和 `quant/` 里 grep 前缀逻辑：`688`/`300`/`8xx`/`ST` **零命中**。）
+
+realtime 层因为用交易所发布的限幅而**碰巧正确**：`realtime/snapshot.py:29-30,82-92` 从行情读 `high_limited`/`low_limited`。mock feed 硬编码 ±10%（`realtime/feed.py:71-72`，`sim_streams.py:387-389` 同）。
+
+---
+
+### 5.9（第二轮新增）上游 active 产物是**可变的**，且只有文件级发布时间 —— 任何哈希都无法追认因果性
+
+这是 E4/H1/H2 全部四个日更依赖变体的**根因**，也是 §3.2-B4 与 P17 更正后的落点。
+
+```python
+# quant/scheduled_workflow.py:232-240  merge_active_predictions
+fresh_keys = set(zip(fresh["code"], fresh["date"]))
+keep = old[~old.set_index(["code", "date"]).index.isin(fresh_keys)]
+...
+.drop_duplicates(subset=["code", "date"], keep="last")
+```
+
+**每次重训都就地改写历史**：过往日期的 `pred` 会被后来的模型覆盖（`keep="last"`）。而 `publish_short_champion`（`:530-647`）只记录一个**文件级** `"published_at"`（`:635`），**从不落行级发布时间**。
+
+后果链条：
+1. `structural_combo_holdout.py` 的六个 SHA 哈希（`:41-60`）只能冻结"claim 时刻文件里是什么"，**不能证明那些行就是当日实际发布的行**；
+2. 所以报告 `:313-333` 自己写 `"daily_history_causal": False` + `daily_history_caveat`；
+3. 所以 `auto_research.py:63-68` + `:201-208` 把 4 个日更依赖变体排除在分支选择之外；
+4. 所以 `plan:980` 明写 `"现有 active 日更历史没有行级发布时间；依赖它的 E4/H1/H2 结果只允许指导下一轮开发，不具备 shadow 晋级资格"`，`plan:983` 还记录了一次因 `train_end=2026-05-11` 被误选而**作废先前 E0-E4 结果**的因果审计。
+
+**前向补救已经写好了，只是还没积累数据**：`intraday_1400/dual_paper_evaluation.py` 把每日发布快照进不可变账本，`published_at` 对 14:50 截止做硬校验（`:60-65` 越线 `raise RuntimeError(f"daily publication for {signal_date.date()} occurred after {ENTRY_CUTOFF}")`），并拒绝改写（`:89` `"daily publication snapshot is immutable for ..."`）；`run_retrospective_bootstrap` 的报告带同一句诚实声明（`:325-328`）。
+
+**给接手者的判读规则：** 凡是数字来自 E4 / E0-E4 staged / H1 / H2，一律读作"量级参考"，**不可读作"已被证伪"**，直到 `dual_paper_evaluation` 攒够 60 个交易日。
+
+### 5.10（第二轮新增）融合分数里的**跨目标量纲混用**，以及被当成幅度用却没 z 化的 `raw_pred`
+
+`h1_causal` 训练在 `daily_target_ret_1d` 上（`fair_race_pipeline.py:1079`、`:1867`）—— 那是**原始收盘到收盘收益，无成本、无惩罚**（`tradability.py:107`、`engineering.py:482`）；而 `exec_e0` 训练在**扣成本 + 带 −10% 惩罚**的净标签上。两者数值量纲完全不同。
+
+融合前有 z 化（`:1123`、`:1667`），**排序层面因此没问题**。真正的问题是 `raw_pred` **没有被 z 化，却被当作幅度直接乘**：
+
+```python
+# intraday_1400/fair_race_pipeline.py:1107-1108
+e2["fill_probability"] = e2["fill_probability"].clip(0.0, 1.0)
+e2["expected_value"] = e2["fill_probability"] * e2["conditional_return"]
+```
+
+而 `fill_probability` 本身是**一个回归头**打在 0/1 目标上（`:1078`），**事后**才 clip 到 [0,1]。所以这个"期望值"是"一个未校准的伪概率 × 一个另一量纲的收益"。这与 §3.2-B4 的分母问题是两件独立的事，但方向一致：**结构组合的幅度层不可信，只有排序层可信。**
+
+### 5.11（第二轮新增）成本口径的两个独立旋钮，与被钉死的惩罚项
+
+三项，都属"静默假设两个数相等"：
+
+| 位置 | 问题 |
+|---|---|
+| `offline_race.py:17` `ExecutionConfig.roundtrip_cost=0.002` vs 环境变量 `INTRADAY_1400_ROUNDTRIP_COST`（烘进标签） | **两个独立旋钮，代码静默假设它们相等**。改一个不改另一个 → 标签与评测口径分裂，无任何断言 |
+| `evaluation.py:43` `fillna(unsellable_return + cost)` | 惩罚被写成"惩罚 + 成本"，于是在**整个成本敏感性扫描过程中，−10% 惩罚始终被钉在 −0.10**，扫不动 → `evaluation.py:143-144` 那张 cost×topN 表的成本维度是残缺的 |
+| `offline_race.py:136` `compare_execution_records` | 只校验 4 个列，却在后面解引用 `outcome_observed` / `entry_buyable` / `exit_sellable` → **列缺失时抛 KeyError 而非给出可读报错** |
+
+另附一条本环境已验证的事实：收益路径上**任何地方都没有 `/ float(top_n)`** —— 固定分母是靠"把不可买行写成 `0.0` 而不是删掉"（`offline_race.py:246`）以及显式插入现金行（`structural_combo_holdout.py:109-137`）实现的。这与 §3.2-B4 的判断一致。
+
+（P18 已覆盖前两条的修法。）
+
+### 5.12（第二轮新增，本轮最大发现）生产股票池是"今天仍在上市"的快照，被回溯施加到 2018 年起的全部窗口
+
+**这条把 §7.1 S6"生存者偏差不可量化"从疑似升级为已确认，并给出了完整机制。**
+
+`quant/config.py:13,18-25` 定义 5 个池，生产只用 `mainboard_active`（`docker/scheduler_jobs.sh:106,131,154,206` 四个 cron 作业全部 `--universe mainboard_active`）。唯一写入者 `quant/datafeed.py:154-175` **每次运行覆盖写**，数据源是"今天"的码表：
+
+```python
+records = _akshare_subprocess_records()
+codes = sorted({code for code, _ in records})
+path = config.MAINBOARD_UNIVERSE_FILE
+with open(path, "w", encoding="utf-8") as f:
+    f.writelines(f"{code} {name}\n" for code, name in sorted(set(records)))
+```
+
+**退市的唯一排除手段是"当前名称里含『退』"**（`quant/datafeed.py:149`）：
+
+```python
+if code.isdigit() and code.startswith(_MAINBOARD_PREFIXES) and "退" not in name:
+```
+
+这份快照随后被**逐窗口施加到历史面板**：`full_train_batched.py:659-664` 读入，`:799-800` 施加到每个训练/测试窗口，`:775-776` **连缓存命中的历史预测也重新过滤**：
+
+```python
+if universe_codes is not None and not window.empty:
+    window = window[window["code"].astype(str).isin(universe_codes)].copy()
+```
+
+同一份文件还进调参路径：`scheduled_workflow.py:92,94-100` `_optimization_universe` → `watchlist_grid.py:26-39,55-70`（用它过滤预测），以及 `scheduled_workflow.py:929`、`daily_optimization_pipeline.py:326-327`、`target_ab_experiment.py:69` 的 `--universe-file`。
+
+**方向：乐观。** 退市票在退市前 1–2 年典型累计 −50%~−80%，被整体抹除。审计者的量级估计（**基于常识、本机无法核实**）：摊到全池约高估 0.3–0.8pp/年；但生产是 `top_n=2~3` 的极集中组合（`target_ab_experiment.py:70`），单次踩雷实际拖累 −30%~−60%，若这类票本会被反转/低估值因子选中，**集中组合的年化高估量级可达数个百分点**。
+
+**作者本人已写明正确做法，只针对指数成分、且从未实现** —— `quant/build_dataset.py:18-22`：
+
+```
+- 指数成分随时间变化，训练时点成分需从现在起按月落盘积累（历史无法回补，避免幸存者偏差）。
+```
+
+**最刺眼的一处：文档声明与实现直接矛盾。** `RESEARCH_ARCHIVE_20260810.md:15` 声明结果基于 "A-share point-in-time data"、`:71` 声明 "stable universe hashes"；`daily_optimization_pipeline.py:137-151` 也确实把 universe 文件哈希进 `_input_snapshot`。**但哈希稳定 ≠ 时点正确** —— 那两处只保证"同一份快照可复现"，恰恰掩盖了快照本身随时间被覆盖重写这一事实。（与 §5.9 的 `merge_active_predictions` 是同一类问题：SHA 冻结的是"读的时候文件里是什么"，不是"当时真实是什么"。）
+
+#### 5.12a 退市股的暴跌**永不进入训练**
+
+`quant/tradability.py` 全文 137 行**无退市概念**；`rolled_sell_close`（`:29-48`）只在 `limit_down_seal` 时顺延，"末日强制平仓"的触发条件是滚动上限，不是最后交易日。即便某票 parquet 留在盘上（`warehouse.py` 无任何删除路径），其尾部 `horizon` 行的 `target_ret` 因 `shift(-horizon)` 越界为 NaN（`engineering.py:482`），随后被 `prepare_features` 的 `out.dropna(subset=[target])`（`:700`）丢掉。→ **退市/摘牌那段暴跌既不在标签里，也不在收益序列里。** 全仓库 grep `delist_date|end_date|last_trade|终止` 无任何按股票存储的退市日期；退市整理期（30 交易日、首日不设涨跌幅）零处理。
+
+#### 5.12b `min_price_rows=1000` 是 look-ahead 型准入
+
+`engineering.py:339-352`：
+
+```python
+for code in codes:
+    p = os.path.join(config.PRICE_DIR, f"{code}.parquet")
+    ...
+        if len(pd.read_parquet(p, columns=["date"])) >= min_price_rows:
+            kept.append(code)
+```
+
+生产默认 `1000`（约 4 年，`full_train_batched.py:1218`，`docker/scheduler_jobs.sh` 无覆盖；对照 `quant/pipeline.py:189` 默认 0）。两个后果叠加：
+- **它不防次新股** —— 2019 年上市的票因为到 2026 年已攒够行数，在其 2019 年的窗口里以"上市第 3 个月"的身份被纳入；
+- **它选存活者** —— 2019 上市、2021 退市的票行数不足被剔，2019 上市存活到今天的被纳入。**"一只股票能否进入 2019 年的窗口，取决于它到 2026 年攒了多少行"** —— 这是纯粹的未来信息准入。
+
+#### 5.12c "active" 名不副实
+
+`datafeed.py:58,120-151,154-175` 通读确认：`mainboard_active` 的判据仅 = 主板前缀 + 当前在册 + 名称无「退」。**没有成交额、换手、上市天数、ST 任何一项筛选。** 券商路径本有 `IS_LISTED` 字段（`:110-116`），但 `:162-164` 注释说明该路径已为省 ~24s 弃用 —— 且即便启用，那也只是"今天"的在册标志，不是历史状态序列。
+
+顺带：`full_a` 池（`datafeed.py:183`）连「退」都不过滤，还含北交所 4xx/8xx，与 `mainboard_active` 口径不一致（生产不用，但任何 `--universe full_a` 的研究会把退市整理期个股当正常样本）。指数池（`:40-55`）用 `ak.index_stock_cons` / `index_stock_cons_csindex`，**两条路径都没有日期参数** → 返回调用当日成分，用今天的沪深300 成分回测 2018 年等价于"用已知的赢家名单"；降级理由是生产 cron 无一使用 hs300/zz500/zz1000。
+
+### 5.13（第二轮新增）全仓库没有真实交易日历
+
+`realtime/reference.py:286-312` 是唯一试图读日历的地方。`TRADING_CALENDAR_FILE` 在全仓库**仅出现在这一处 `getattr` 里**，`trading_calendar.parquet` **没有任何写入者** → 因此**永远走兜底**：
+
+```python
+n, cur = 0, start
+while cur < end:
+    cur = cur + _dt.timedelta(days=1)
+    if cur.weekday() < 5:      # 节假日被算成交易日
+        n += 1
+```
+
+该函数供 `realtime/paper_trader.py:420`、`realtime/v2.py:118`、`realtime/v3.py:341` 计算持仓天数 → **跨春节/国庆的持仓被高估约 5–7 个交易日，触发最大持有期提前平仓。** `requirements.txt` / `requirements-scheduler.txt` 无任何 exchange-calendar 依赖。
+
+盘中链稍好但同源：`adaptive_exit_replay.py:41-49` `load_trading_calendar` = prepared parquet 里出现过的日期取并集；`intraday_1400/pipeline.py:50-72,100-118` 的 `next_trade_date` 由**连续下标**构造 —— 这是全市场并集日历，比逐票下标安全，但仍以"本地数据覆盖"为真源，**某天整体采集失败即静默从日历消失**。（与 §4.1.1 新缺陷 1 的 `structural_combo_experiment.py:190` 完全同构 —— 这是全仓库性的模式，不是 E4 一处的疏漏。）
+
+### 5.14（第二轮新增）所有按"天"的 shift/rolling 都是**行位移**，停牌被无代价跳过
+
+逐条确认（均在单票内按行号）：`engineering.py:482` 目标 `groupby("code")["close"].shift(-horizon)`；`:487-497` 成交口径 `g["open"].shift(-1)` / `shift(-(1+horizon))`、`buyable_next`；`:156-192` 全部技术因子 `rolling(n)` / `pct_change(n)`；`:480` 事件计数；`tradability.py:29-48` `rolled_sell_close` 按数组下标顺延、`:99` `close.shift(1)`。
+
+**后果：某票停牌 10 个交易日，`shift(-5)` 实际跨越 15 个日历交易日。** 标签的持有期与名义 horizon 不符，且**停牌期间的下跌被跳过**（复牌首日补跌被并入一根"5 日"收益，但中间的不可交易性完全没有代价）。日线链**无任何按日期差的校验** —— `.dt.days` 在 `quant/` 下仅出现在 `model.py:173`（时间衰减权重，用途正确）。
+
+**对照：这条防线只存在于盘中链** —— `intraday_1400/features.py:274-281` 确实算了 `risk_trading_gap_days` 并做 `>3` 的事件计数，**未移植到日线链**。方向乐观（≈ 假设停牌期间零损失且可自由进出）。
+
+附带一条：`_purged_end`（`full_train_batched.py:226-236`）的 `unique()` 是**全窗口所有股票的日期并集**，对停牌票其个体的第 h 个后续交易日可能晚于面板的第 h 个日期 → purge 天数不足。
+
+> **⚠️ 本条已在第三轮自查中更正（原文说「`--purge-horizon` 默认关闭且 `scheduled_workflow.py` 未传」，这是错的）**：`:958` 就在 `if _uses_rolling_training(args):` 块内传了 `--purge-horizon`，与 `--rolling-factor-select` **同生共死**。因此 purge 是否存在，与共线性解药是否存在，由**同一个** manifest 布尔值 `params.rolling_factor_select` 决定。详见 §4.5.4，待办 S10。
+
+### 5.15（第二轮新增）数据完备性闸门的四个漏洞
+
+**(a) 正常退出时完全不检查覆盖率。** `scheduled_workflow.py:751-753`：
+
+```python
+rc = subprocess.run(cmd, cwd=PROJECT_ROOT, env=env).returncode
+if rc == 0:
+    return
+```
+
+`_price_freshness`（`:287-311`，唯一按全池逐票算覆盖率的函数）只在 `:764`、`:806` 被调用，**两处都在 `rc in (-SIGSEGV, 139)` 分支内**。→ **只有券商库段错误时才验证数据完备性；`daily_update` 正常返回 0 但实际大量票停在旧交易日时，训练直接开跑，无任何闸门。**
+
+**(b) 达标线只要 0.85。** `:768` `MIN_COVERAGE = 0.85` —— 即使走到检查分支，**允许 15%（约 450 只）停留在旧交易日仍继续训练**。
+
+**(c) `check_daily_update.py` 结构上无法发现"某些票从没拉过"。** `:51-53` `sample_codes = codes[:args.sample]`，而 `datafeed.universe` 返回 `sorted(...)`（`datafeed.py:184`），`--sample` 默认 20 → **永远是同样的最小 20 个代码**（000001、000002…），不是随机抽样。**剩余约 3000 只从不被检查。**
+
+**(d) 段错误后的缺口恢复机制从未生效过。** 写端与读端各有一个转义 bug（审计者用 `cat -A` 验证为字面反斜杠，非显示假象）：
+
+```python
+# quant/scheduled_workflow.py:319  —— 写出的是字面 "\n" 两个字符
+path.write_text("".join(f"{code}\\n" for code in codes), encoding="utf-8")
+# quant/daily_update.py:530  —— 匹配的是字面字符串 "\d{6}"，永不匹配任何股票代码
+codes = sorted({line.strip() for line in fh if re.fullmatch(r"\\d{6}", line.strip())})
+```
+
+净效果：恢复路径解析出 0 个代码 → `daily_update.py:536-539` 以 `codes=[]` 继续，打印 `codes=0` 后什么都不做、返回 0 → `scheduled_workflow.py:806` 重算覆盖率发现没变化，抛错拒绝训练。对照 `refresh_qfq.py:111-121` 同名逻辑写法正确（`r"\d{6}"`），说明是笔误而非约定。
+
+### 5.16（第二轮新增）`universe_codes` 被故意排除出缓存键 —— 换池后复用旧池算出的模型
+
+`_recipe_signature`（`full_train_batched.py:35-43`，注释 `:46-51`）**故意把 `universe_codes` 排除出缓存键**，依赖"月度面板文件签名会捕获实际输入行变化"。但面板按月分区，`--refresh-months` 默认只重建最近 1 月（`scheduled_workflow.py:1075`），**历史月份分区的文件签名永不变化**。
+
+→ **池子换了以后，历史窗口读的是旧池算出的缓存预测，再按新池做一次成员过滤（`:775-776`）。** 这与"重算"不等价：模型参数、因子 IC、截面 z-score 都仍是旧池的。**这是 §7.1 S1（baseline 缓存豁免）的姊妹问题**，且机制更清楚。列为疑似 S8，需实测两份缓存对比。
+
+### 5.17（第二轮新增）盘中链股票池完全在代码库之外 —— 已确认，并给出穷举证据
+
+这是 §4.3 D8 / §7.1 S6 的完整版。`intraday_1400/collector.py:284-294` `_read_codes` 用正则从任意文本里抓 6 位数字，`required=True`，同样必填于 `benchmark.py:57` 和 `repair.py:14`。`intraday_1400/config.py` 通读 40 行**无任何码表/池路径**，无 `INTRADAY_1400_CODES_FILE` 环境变量。
+
+穷举 grep 全部 `.sh/.md/.yml/.crontab/Dockerfile*/.toml/.json/.txt`：**`intraday_1400` 在任何部署/cron/shell 文件里零出现**；`--codes-file` 在全仓库只有一处程序化传参，而那是给 `quant.daily_update` 的（`scheduled_workflow.py:781-789`）。`intraday_1400/` 内 grep `MAINBOARD_UNIVERSE_FILE|universe_file` 零命中。
+
+代码列表的**全部**写入路径（穷举 `write_text` / `open(...,"w")` / `to_csv` / `writelines` + 所有 shell 重定向）只有三条：`datafeed.py:170-175`（唯一真生成器）、`scheduled_workflow.py:315-320`（临时恢复文件，`:804` unlink）、`stock_analyzer/top10_eval.py:63-92`（`mobile_snapshot.json`）。`snapshots/watchlist.txt` 与 `logs/realtime/realtime_holdings.txt` **无写入者，纯手工维护**。仓库内**零个**提交的 6 位代码清单文件；`.gitignore:24-27` 忽略 `quant_data/`/`snapshots/`/`logs/`，且**没有任何 ignore 规则覆盖盘中 codes-file** —— 与"它完全在树外"一致。
+
+**刺眼的反差**：该链本身有相当严格的日历登记校验（`direct_return_experiment.py:145-215` 要求恰好 47/10/60 个已登记交易日）—— **日期被逐一断言，池子却来源不明。**
+
+### 5.18（第二轮新增）情绪因子按**日历日**衰减，与全部其他因子口径不一致
+
+`sentiment_feature_experiment.py:96-122`：`calendar = pd.date_range(start, end, freq="D")` + `daily.reindex(calendar, fill_value=0.0)` + `rolling("7D", min_periods=1).sum()`。`freq="D"` 含周末与节假日 → **名义 7 天窗口实际只含约 5 个交易日，半衰期被稀释约 40%**（周末占 2/7）。与其余全部按交易日行位移的因子（§5.14）**口径分裂**。这与 §4.2.1 (h) 的"+1 自然日"是同一根源。
+
+### 5.19（第二轮新增，第三份独立审计交叉确认）ST 与新股：不是"处理得差"，是**完全不存在**
+
+第三个子代理（`a88088146e128d9e1`）独立复核了退市/ST/新股/停牌/流动性五类过滤，**与 §5.12 的结论逐条吻合**，并补上三块此前完全空白的内容。
+
+**(a) ST：仓库自己在注释里承认这是盲区。** `quant/tradability.py:7` 与 `:94` 两处注释：
+
+```python
+口径（主板 ±10%，一字板是其子集；ST ±5% 为已知盲区，不在此处理）：
+```
+
+阈值硬编码在 ±9.5%（`tradability.py:102-103`）：
+
+```python
+limit_up_seal = (close_arr == high_arr) & (ret1 >= 0.095)
+limit_down_seal = (close_arr == low_arr) & (ret1 <= -0.095)
+```
+
+→ **ST 股在 +5% 封板时被当作可自由买入，−5% 跌停时被当作可自由卖出。** 全仓库无 `is_st` / `风险警示` / `特别处理` 字段的抓取或存储。唯一一处 ST 相关逻辑是 UI 展示用的 `stock_analyzer/candidate_eval.py:132`（`threshold = 4.8 if "ST" in name else 9.5`），**在 `quant/` 下没有对应实现**。
+
+配合 §5.12 的今日快照：**今天是 ST 的票在全部历史里都被纳入，历史上曾是 ST 而现已恢复的票则完全无标记。**
+
+**(b) 上市日期：全仓库不存在。** grep `list_date|listed_days|ipo_date|上市日期` 零命中；`stock_analyzer/stock_meta.py`、`all_a_meta.py` 只带 name/industry/concept/board。**唯一的上市年龄代理就是 §5.12b 的 `min_price_rows` 行数计数**，而它是全历史行数、且是 look-ahead 型准入。上市首日 / 无涨跌幅限制日**零处理** —— `tradability.py:102-103` 的 ±9.5% 判定在这些日子上直接是错的。`INTRADAY_ASOF_1400_PLAN.md:509, 774, 796` 有"应显式标注半日停牌/全天停牌/缺失 bar/上市首日/异常成交量"的计划文字，**日线链未实现**。
+
+**(c) 停牌：日线链无门，盘中链有门 —— 且盘中链连模拟器都建模了。** 日线侧 `tradability.py` 无零成交量/停牌概念，`rolled_sell_close` 只在 `limit_down_seal` 顺延，**停牌日的卖出被按陈旧收盘价成交而不是顺延**；缺行被 `engineering.py:674-703` 结尾的 `dropna(subset=[target])` 静默丢掉。对照盘中侧 `intraday_1400/features.py:344-348` 是真正的逐日门：
+
+```python
+data["signal_eligible"] = (
+    complete.fillna(False).astype(bool)
+    & (pd.to_numeric(total_volume, errors="coerce").fillna(0.0) > 0)
+    & previous_close.notna()
+)
+```
+
+且 `offline_race.py:362, 369` 会产出 `"suspended_t1_blocked"` / `"suspended_t1_roll"` 两种退出原因。**这些一条都没有移植到日线回测。**（与 §5.14 的 `risk_trading_gap_days` 同一模式：盘中链的防线系统性地没有回流到日线链。）
+
+**(d) 流动性：不存在任何绝对阈值。** 全仓库无 ADV / 成交额下限 / 均额门用于构建股票池。唯一的池收窄是 `quant/backtest.py:122-133` 的**逐日截面分位**（`pred_quantile` / `volatility_quantile` / `turnover_quantile`）。判定：**逐日、但不是仅用过去** —— `groupby("date")` 保证不用全样本均值（**这一点是对的，无跨期泄漏**），但 `turnover` 与 `volatility_10` 含当日自身 bar，且**分位数本身是在已经被生存者过滤过的池子上算的**（与 §5.12 叠加）。
+
+滚动流动性**特征**则是干净的：`intraday_1400/features.py:363-366` 显式 `shift(1).rolling(20)`。**但有一处兄弟实现不一致** —— `intraday_1400/features.py:295-299` 的 `risk_amount_vs_median_20` 用 `rolling(20, min_periods=5).median()` **没有 `shift(1)`**，当前 bar 在自己的基准里。量级小（自归一化，非未来数据），但**使这两族特征不可并列比较**。
+
+### 5.20（第二轮新增）盘中 codes-file 的最终定论：**无默认值、无写入方、无调用方**
+
+第四份独立审计（`a9867dc6c13402e97`）把 §5.17 推到了穷举级别，三点值得单独记录：
+
+1. **`required=True` 且三处消费者都没有默认值**：`collector.py:294`、`benchmark.py:57,62`、`repair.py:14,31`。`intraday_1400/config.py` 全文 40 行只定义 `DATA_ROOT` 与 7 个子目录、`LOCK_PATH`、recipe 版本、batch 大小 —— **无任何码表路径，也没有 `INTRADAY_1400_CODES_FILE` 环境变量**。
+2. **`intraday_1400` 在任何部署/cron/shell 文件里零出现。** 唯一的 shell 相邻提及是两份 `quant/*.md` 里的散文，且只出现 `python -m intraday_1400.forward_evaluation run|status`（`INTRADAY_ASOF_1400_PLAN.md:345-346`）—— **没有 collector，没有 `--codes-file`**。→ **这条链的调度方式本身在代码库之外，不只是股票池。**
+3. **盘中链与 `quant/` 的全部耦合只有两个 parquet/json**：`active_quant_short_predictions.parquet` 与 `active_quant_model.json`（`auto_research.py:447`、`dual_paper_evaluation.py:109-112,368-372`、`structural_combo_experiment.py:187`、`structural_combo_holdout.py:175`、`fair_race_pipeline.py:116`）。grep `MAINBOARD_UNIVERSE_FILE|universe_file` 于 `intraday_1400/` 下**零命中** → **盘中链从不使用日线链的股票池**，两条链在宇宙定义上完全无关。
+
+附带修正一处：`realtime` 的自选池**其实是有生成方的** —— `snapshots/mobile_snapshot.json` 由 `stock_analyzer/top10_eval.py:63-92` `_write_mobile_snapshot` 写出，经 cron 作业 `top10-eval`（`docker/scheduler_jobs.sh:246-255`）运行，分组为 白名单10 / 全A30 / 创新药10（`top10_eval.py:20-21, 138-156`）。但**那个「白名单」分组自身来自 `snapshots/watchlist.txt`，而它才是真正没有写入方、纯手工维护的那个文件**（读它的地方有 8 处：`quant_signal.py:235-236`、`stock_meta.py:25-28`、`snapshot_batch.py:287-297`、`news_ingest.py:23`、`sentiment_signal.py:261-271,277`、`realtime/names.py:42-43`、`daily_update.py:473-478`、`check_daily_update.py:23-28`）。`logs/realtime/realtime_holdings.txt` 同样无写入方。
+
+**`\n` bug 的完整因果链（比 §5.15(d) 更精确）**：`scheduled_workflow.py:319` 的 `f"{code}\\n"` 是全仓库**唯一**一处 `\\n`（grep 计数 = 1，说明是笔误非约定）。它写出的单行文本**对盘中 collector 的正则恰好仍然有效**（那个正则扫的是自由文本），**但对它真正被喂给的消费者 `quant/daily_update.py:530` 完全失效** —— 那里的 `re.fullmatch(r"\\d{6}", ...)` 同样双重转义，匹配的是字面串 `\d{6}`。兄弟实现 `quant/refresh_qfq.py:115` 写法正确。
+
+---
+
+### 5.21（第二轮新增）日线标签定义与 shift 方向专项：**公式本身全部正确，off-by-one 被明确排除**，问题全在"可见时点"上
+
+第五份独立审计（`ac9ff3fdb75a3c4e5`）把日线标签逐字复核了一遍。**先说清白的部分，因为它排除了一个很容易被怀疑的方向**：
+
+三处独立的标签实现（`tradability.py:107-133`、`engineering.py:482-500`、`select.py:133`）公式全部核对无误，**off-by-one 被明确排除** —— `open_ret_1d = open[t+2]/open[t+1] − 1`，语义是"次日开盘买、再次日开盘卖"，与命名一致。特征侧**无任何 `shift(-n)` / `center=True` / `bfill`**；`ovn_gap = open[t]/close[t−1]` 正确；`merge_asof` 方向正确；标签列不可能变成特征（`_FORBIDDEN_FEATURE_PREFIXES` + 两道硬校验）；`_apply_train_mask` 与 `_purged_end` 的偏移算术在启用时是对的；`rolled_sell_close` 的**顺延决策本身不前视**（已用 numpy 复现：`close=[10..15]`、`blocked=[F,T,T,T,F,F]`、h=1、cap=3 → `[13,14,14,14,15,nan]`）。
+
+**真正的问题按严重度排列，前三条都便宜且方向乐观：**
+
+1. **`ann_date` 缺失时静默退化为 `report_date`**（`engineering.py:227-229`、`:296-298`，上游 `datafeed.py:246-251`）→ 财报数据提前 **1–4 个月**可见，影响 **20+ 个基本面特征**，**方向明确乐观**。注意这与 §7 E16 不矛盾：E16 排除的是"有 `ann_date` 时对齐错了"，这里说的是"`ann_date` 缺失时的兜底路径"。修法：缺 `ann_date` 直接丢弃该行，而不是拿报告期当公告日。
+2. **训练缓存不因 qfq 重建而失效** → 在位 baseline 腿的 recipe **故意省掉 `price_source_signature`**（`full_train_batched.py:721-723`），窗口键只哈希已准备好的月度 parquet（`:60-74`），而 `--refresh-months` 默认 1（`scheduled_workflow.py:1075`）→ **历史标签被冻结在首次构建时的复权基准上**。这是 §7.1 S1/S8 的第三个侧面，同一个 `_recipe_signature` 的又一个缺口。
+3. **每月最后 `horizon` 个交易日的标签永久 NaN**（`:355-358`、`:429-431`、`:173-196`）→ h=1 时约 **4.8% 的行**被丢，且是**系统性的月末**。最便宜的修法：`--refresh-months ≥ 2`，**一个旗标**。
+4. **盘中快照被写成当日 OHLC**（`daily_update.py:141-162`；cron 在 10:30/13:30 带 `--intraday-spot`，`scheduler_jobs.sh:101-110`）→ 最新价被当作收盘价，污染最新窗口的标签与封板判定。通常由 15:05 的 `--force-latest`（`scheduled_workflow.py:743-745`）自愈，但**那一趟失败则永久残留**。
+5. **全部日线 shift 都是行位移**（已枚举 9 处）→ 与 §5.14 同因；`rolled_sell_close` 的持有上限退化为"行数"而非"交易日数"。
+6. **当日龙虎榜 / 大宗交易计数进特征**（`engineering.py:285`、`:477-480`）—— 这两类数据约 **18:00** 才披露，**方向乐观**。
+7. **复权因子拉取失败时静默写入未复权价**（`amazingdata_source.py:288-291`、`:309-311`、`:363-365`）—— 无告警、无标记。
+8. **OHLC 缺失时 `buyable_*` 默认 True**（`tradability.py:127-133`）→ `backtest.py:110-112` 退回乐观的 `target_ret`。
+9. ST 的 ±5% 永不被识别（与 §5.19 (a) 同一条）。
+10. **买入掩码的降级替换在两处不一致**（`backtest.py:115-116` / `watchlist_grid.py:253-255`，`buyable_close` → `buyable_next`）—— 与 §7.1 S2 同一条。
+11. `rolled_sell_close` 的尾部上限被静默截断（`tradability.py:40`，已 numpy 验证）。
+12. （疑似）券商批量重写窗口 = 池内最大缺口 + lookback，**最长可达 45 天**（`daily_update.py:335-343`、`:261-265`）。
+
+---
+
+### 5.22（第二轮新增）walk-forward 切分与 purge 专项：**打开时实现最紧、默认关闭；但真正伤人的那条腿恰好从不训练**
+
+第六份独立审计（`abc556ccf17b8024f`，跑了 109 分钟、140 次工具调用，本轮耗时最长）。它**独立证实了我上一轮的自我更正**，并把 purge 的危害量级第一次算清楚了。
+
+#### (a) 先说清白的部分 —— purge 打开时是数学上最紧的正确实现
+
+`_purged_end`（`full_train_batched.py:232-238`）取 `dates < boundary` 去重排序后的 `eligible[-h-1]`。手写数值复现（40 个连续交易日、boundary=30）：
+
+| horizon | train_end | 标签结束于 | 与 boundary 间隔 |
+|---|---|---|---|
+| 1 | 28 | 29 | 恰好 1 个交易日 |
+| 5 | 24 | 29 | 恰好 5 个交易日 |
+| 10 | 19 | 29 | 恰好 10 个交易日 |
+
+即 `train_end + h` 恰好落在 `valid_start` 前最后一个交易日 → **标签窗口与验证段零重叠，一天不多一天不少**。`valid_end ↔ predict_start` 用同一函数同一 span（`:809`），同样正确。三件事因此被排除：
+
+1. **它走真实交易日**（`:234` 用面板 `unique()` 日期），不是日历日 → 「节假日导致 purge 不足」**不成立**。
+2. **`open-label` / `open-buyin-mask` 的 `span = h+1`**（`:228-229`）与 `open_ret` 的 `shift(-(1+h))`（`engineering.py:489-493`）精确匹配，h=1 时用到索引 29 < 30，恰好不越界。
+3. **被 purge 的日期在 `model_window` 里被物理删除**（`:841-845`）→ `model.py:_split_time` 的 `valid = df[date > train_end]` 不会把 gap 日期误当验证集。
+
+#### (b) `--purge-horizon` 默认关闭，且无法单独启用 —— 这正是 §7.1 S10
+
+`full_train_batched.py:618` 默认 `False`、`:1251` 是 `action="store_true"`；`scheduled_workflow.py:955-961` 只在 `if _uses_rolling_training(args):` 里追加，与 `--rolling-factor-select` 打包在**同一个 `cmd.extend`**。默认 `--strategy-mode incumbent-refresh`（`:1046-1048`）→ 只要现役 manifest 没开滚动选择，`:808-809` 走 `valid_start - 1 day` / `current - 1 day`，**两个边界 purge 都是 0**，且 CLI 上**做不到只开 purge 不开滚动选择**。
+
+> ⚠️ **这独立证实了我上一轮的自我更正**（原 §5.14 曾说 `--purge-horizon` 从未被传）：它是传的，但被绑在同一个布尔上。
+
+**但危害量级必须说清，别高估** —— 这是本份报告最有价值的一条，因为它**给 S10 减压**：
+
+- **h=1（短线腿，生产唯一实际训练的腿）**：train 里只有 1 个日期（≈499 个中的 1 个，**0.2%**）的标签伸进验证段。Ridge 是闭式解无早停，几乎无影响。**实际危害很小。**
+- **h=10（波段腿）**：验证段 21 天里有 **10 天（48%）**的标签伸入测试段，而 LightGBM Ranker 正拿这个验证段做早停（`model.py:679-682`）→ 早停轮数被测试期收益直接影响，方向乐观、量级中等。
+
+**关键交叉引用（子代理没有的信息）**：h=10 的波段腿**从来没有被训练过** —— `TRAIN_STYLE_ORDER`（`scheduled_workflow.py:83`）把 swing 排除，`--swing-horizon 10` 永不进训练（§4.6 S9）。→ **"无 purge 真正伤人"的那条腿，恰好就是那条从不存在的腿。** 所以：
+
+> **S10 的重要性要重新分配：它对"标签 purge"几乎不重要（h=1 只污染 0.2% 的行），对"共线性解药 `max_ic_corr=0.85`"才是决定性的（§4.5.4）。** 之前我把两者并列，这个权重是错的。
+
+另有两个可绕过 manifest 的答法：`params.purge_horizon` 也被写进 manifest（`:1011`），且 `full_train_batched.py:1179` 把 `purge_horizon` 写进训练 summary → **查训练 summary 即可，不必读 manifest**。附带发现：`:1011` 写了 `purge_horizon` 但 `:883-884` 的回读**只读 `rolling_factor_select`，从不读 `purge_horizon`** → 这个键是只写不读的，若被手工改过会被静默忽略。
+
+#### (c) 新缺陷：`tradable-label` 腿的 purge 短 2 个交易日
+
+`_purge_span("tradable-label", h)` 只返回 `h`（`:228-229`，且 `test_model_expansion_experiment.py:1398` 把这个行为写进了断言），但该腿标签由 `rolled_sell_close`（`tradability.py:29-48`）生成，跌停封板时卖出日可顺延到 `i + h + cap - 1`，`cap = QUANT_BT_SELL_ROLL_MAX_DAYS` 默认 **3**（`backtest.py:31-33`）→ 最坏卖出日比 purge 假设的晚 **2 个交易日**。h=1、boundary=30 时 train_end=28、最坏卖出索引 31 ≥ 30，越界确凿。占训练集 2/499≈0.4%、占 1 个月验证段 **2/21≈10%**。方向乐观。该腿在 `target_ab_experiment.py:84-86` 带 `--purge-horizon` 实跑过。
+
+同根因的另一面：**`QUANT_BT_SELL_ROLL_MAX_DAYS` 改变标签却不进任何哈希** —— `recipe_params`（`:698-723`）无此项，`_price_source_signature`（`:77-86`）只哈希 price parquet 的 name/size/mtime。改这个环境变量后重跑会**静默命中旧缓存**。
+
+#### (d) 新缺陷：purge 按面板日期而非个股交易日，停牌股穿透边界
+
+标签是 `panel.groupby("code")["close"].shift(-horizon)`（`engineering.py:482`）—— **按该股自己的行数**前移；而 `_purged_end` 只按全市场日期并集剔除。某股在边界前停牌 10 个交易日时，它 t 日的标签可能落在 `valid_start` 之后很远。方向乐观，估计每窗 <0.5% 样本。与 §5.14 的行位移问题同根。
+
+#### (e) 全仓库零 embargo
+
+`grep -rni "embargo"` **0 命中**（我复核确认）。purge 只做到"标签不越界"的最小间隔，边界后不留缓冲。**评级低危**：train 始终在 valid 之前、标签零重叠已消除主要泄漏路径；embargo 的剩余价值是抵御特征端滚动窗口重叠（`ret_20d`、EWM 类因子在 `valid_start` 处仍回看 train 期）与收益自相关，这些是向后看的、不构成严格泄漏，但会让早停轮数偏乐观。属设计缺失而非 bug。
+
+#### (f) 每窗样本量（用档案实测值反标定，可信）
+
+以 `RESEARCH_ARCHIVE_20260810.md:233-235` 的"12 个近窗共 675,682 条预测"反解出 **56,307 预测/窗 ÷ ~21 交易日 ≈ 2,680 只/日**，与主板池经 `min_price_rows=1000` 过滤后的规模吻合：
+
+| 入口 | 参数 | 训练日数 | 训练行 | 验证日数 | 验证行 |
+|---|---|---|---|---|---|
+| `daily_optimization_pipeline` | h=1, train 36m, purge on | 748 | ≈2.00M | 20 | ≈54k |
+| `scheduled_workflow` 短线 | h=1, train 24m | 498 | ≈1.33M | 20 | ≈54k |
+| （假设的）波段腿 | h=10, train 24m | 489 | ≈1.31M | **11** | ≈29k |
+
+窗口总数：train 24+valid 1、test 1m → **79 窗**；train 36m → 67 窗。生产 `recent_windows` 默认 24 → 只跑最后 24 窗。
+
+**由此暴露的一条**：h≥10 时 purge 吃掉验证段近半且**无任何告警**（唯一兜底是整窗跳过，`:810-814`）；h=15 时验证段只剩约 6 个交易日，早停轮数基本是噪声。当前不发作（波段腿不训练），但 P00 一旦把 horizon 扫到 {3,5,10} **就会立刻发作** —— 必须同时把 `validation_months` 提到 2–3。**这是 P00 的一个前置条件，之前漏了。**
+
+#### (g) 最重要的一条新发现：滚动因子选择被钉死在**全样本**挑出的候选集里，而那份清单在仓库里**没有生产者**
+
+`_selected_factors`（`:592-604`）从 `warehouse.load(selection_name)` 读**静态清单**，生产名是 `factor_selection_lh1000_cont`（`:1214`、`daily_optimization_pipeline.py:319`）。每窗的滚动选择只在这个清单的子集内重挑（`:805` → `:817-826`），**无法逃出它**。→ 每个窗口（包括最早的窗口）的**特征宇宙**都由全历史 IC 筛出，是"CV 外做特征选择"的经典乐观偏差。
+
+> **我在子代理结论之上的推进（N2，本轮我自己的第二个发现）**：子代理说这份清单产自 `select.select_factors` 经 `pipeline.py:91`。**这不对，或者说不完整** —— `pipeline.py` 保存的名字来自 `selection_name` 参数，默认是 `"factor_selection"`（`pipeline.py:72`），`select.py:159` 的 CLI 默认也是 `"factor_selection"`。全仓库 grep `lh1000` **只有 3 处命中，全部是消费者**（`daily_optimization_pipeline.py:146,319`、`full_train_batched.py:1214`），**没有任何一处写它**。
+>
+> → **`factor_selection_lh1000_cont.parquet` 是第三个"存在于代码库之外的关键产物"**，与盘中 `--codes-file`（§5.20）和 `snapshots/watchlist.txt`（§5.20）并列。名字暗示它是某次手工 `python -m quant.select --output factor_selection_lh1000_cont` 的产物（`lh1000` ≈ `min_price_rows=1000`）。后果比子代理说的更重：**它不仅是全样本筛的，而且是一份来源不可审计、时间不明、无人重建的冻结清单** —— 而 `daily_optimization_pipeline.py:146` 还把它的 `_file_identity` 哈希进实验签名，于是"可复现"被再一次与"正确"混为一谈（同 §7 E19）。
+>
+> **这给 S9/S10 加了第三个 10 分钟待办 S14**：在生产主机上看这个 parquet 的 mtime 与行数。若 mtime 远早于当前、行数是 50 → 证实它是一次性手工产物。
+
+#### (h) `train_all` 只给树腿传 `valid_end`/`predict_start` —— 生产路径不受影响，但 `pipeline.py` 是真早停泄漏
+
+`model.py:1024-1031` 的 `kwargs` 只对 `{lightgbm, xgboost, lightgbm_ranker, xgboost_ranker}` 注入 `valid_end`/`predict_start`；`ridge`/`ic_weighted`/`lstm` 拿不到。**但 `train_ridge` 自身是健全的**（`:371-381` 接收并转发），生产 batched 路径在 `full_train_batched.py:849-1021` 给每条腿都显式传了三者 → **`train_all` 的缺陷触不到日常训练**（这与 §4.6 S8 的结论一致，互相印证）。
+
+受害者只有 `pipeline.py:149-152`（连 `train_end` 都不传 → 落 70/30 切点）和两个 sentiment 实验脚本。其中 **`pipeline.py` 的树腿是教科书式早停泄漏**：`predict_start=None` → `predict = valid`（`model.py:69-70`），早停的 `eval_set` 与最终评估集**是同一批数据**。方向乐观、量级可观。所幸 `pipeline.py` 不在调度链上（`scheduled_workflow.py:923-924` 直接调 `full_train_batched`），但**任何据 `pipeline.py` 得出的历史结论都不可信**。
+
+#### (i) 选择目标与训练目标不一致（口径问题，非泄漏）
+
+`select.daily_ic` 通过 `_target_col`（`select.py:21-25`）**硬编码** `target_ret_{h}d`，且 `_rolling_factor_selection`（`:284-286`）调它时不传任何 label 参数 → `open-label` / `tradable-label` 腿的因子选择仍按**收盘-收盘**标签挑因子。同类硬编码还有 `model.train_catboost_ranker:814`（`target = f"target_ret_{horizon}d"`，函数签名根本没有 `label_col`，`:803-809`；`full_train_batched.py:990-1004` 也确实没传）→ **CatBoost 腿在任何 A/B 变体下都在训练 baseline 标签**。会稀释 A/B 结论。
+
+#### (j) 该报告排除的其余各项（避免重复劳动）
+
+窗口缓存 key 对 **purge 规则闭合**（`purge_horizon` 在 `recipe_params:715` 内，我已复核）→ **不存在"命中旧 purge 规则缓存"**；test 段按 `current = test_end` 无缝铺瓦、预测行按 `[current, test_end)` 二次裁剪（`:1027-1028`）；全部截面变换逐日且**按月独立**（`prepare_month:443-455`）；`_ic_weights` / `time_decay_weights` / `_daily_feature_zscore` 仅作用于训练段或逐日，衰减锚点在训练段末尾；`portfolio_from_predictions` 的分位数全在 `groupby("date")` 内；财务 `merge_asof(direction="backward")` 正确；`_rolling_factor_selection` 的输入是 **purge 后**的训练段（`:816`）；`DailyICCache` 的 key 虽只含 `(horizon, factors)` 但缓存量窗口无关；`sentiment_feature_experiment._purge_boundary_labels:185-193` 的训练侧 purge 实现正确且是交易日制。
+
+---
+
+## 6. 已存在但被忽视的同口径对比（重要发现）
+
+**必须撤回"从来没有过任何同口径对比"这个说法。** `intraday_1400/` 里确实有一套把日更真实产出放上严格尺子的模块：
+
+- `intraday_1400/dual_paper_evaluation.py:23-27`：协议 `daily_actual_vs_intraday_e3_forward_v1`，`TOP_N=10`、`ROUNDTRIP_COST=0.002`、`UNSELLABLE_RETURN=-0.10`、入场 `14:50`
+- `:43-93` `capture_daily_publication`：强制 active manifest 的 `published_at` 不得晚于信号日 14:50（`:61-65` 否则 `RuntimeError`），SHA256 不可覆盖固化（`:78-79,83-90`）
+- 尺子本体 `intraday_1400/offline_race.py:222-246` + `:135-191` 配对 bootstrap 95% CI
+
+**结果（记录于 `INTRADAY_ASOF_1400_PLAN.md`）：见本文 3.2 B1 的表格。**
+
+**结论：这些证据已经存在，而且与"日更没有 alpha"这个判断一致。用户的直觉（日更最好很反直觉）是对的 —— 日更并没有更好。**
+
+### 6.1 仍然缺失的那一格（精确表述）
+
+已有的同尺对比是"**日更 active vs 分钟 E0–E4 候选**"，入场时点统一到 14:50。**仍然没有的是：**
+
+> 把 `RESEARCH_ARCHIVE_20260810.md:313-318` 那四个纯日线严格候选（open-buyin Ridge、+LGBM 20%、+ExtraTrees 20%、+RandomForest 20%）与**在位 baseline 腿**，放在同一日期窗口、同 TopN、同 20bp 成本、同"不可买持现金不回填"、同涨跌停约束下跑一次。
+
+**最接近的现成工具**：`quant/target_ab_experiment.py`
+- `_evaluate_leg`（`:101-120`）为三条腿**统一从 price 重 join** 可交易列，注释 `:103-104` 写明"保证评测口径完全一致（差异只来自训练目标口径，不来自评测口径）"
+- `:121-125` 以 `filter_untradable=True, cost_roundtrip=cost` 严格评测
+- 其中一条腿就是 `baseline`（`:29`）
+
+**两个缺口：**
+1. 训练超参（`:63-88`：`--ridge-quantile 0.7`、`--ic-weight 0.15`、`--lgbm-weight 0.85`、`--rolling-factor-select`）与在位冠军 `score_params` 不一致（`quant/scheduled_workflow.py:40-56`：`ridge_quantile=0.55`、`ic_weight=0.03`、`top_n=2`）→ 它测的是"某个**非冠军**配置下的目标口径差异"
+2. 仓库内没有存任何运行结果
+
+**补齐方式很轻**：用在位 manifest 的 `champion_score_params` 覆盖 `_train_cmd`，跑 `--eval-only` 或全量三腿。
+
+---
+
+## 7. 已排除项汇总（避免接手者重复劳动）
+
+| # | 假设 | 判定 | 依据 |
+|---|---|---|---|
+| E1 | 在位模型正在使用黑名单特征 | **就新训练而言排除** | 三处强制点覆盖全链路且**抛异常**而非静默丢弃：`quant/factors/engineering.py:554-560,563`（`:522-537` 前缀、`:538-551` 整列名含 `entry_open_next`/`exit_open_h`/`buyable_next`/`buyable_close`）+ `quant/full_train_batched.py:586-589`（调用于 `:603, 806, 827`）+ `quant/model.py:90-91`（`:97, 105, 117` 三入口）。**残余风险只剩 S1 旧缓存复用** |
+| E2 | +1.62%/日 是特征污染造成的 | **排除为主因** | `RESEARCH_ARCHIVE_20260810.md:50`：无泄漏重训**复现了**同样离谱的 native 分数。主因是执行语义（收盘成交 + 无摩擦 + 零成本 + 丢弃空仓日） |
+| E3 | Sharpe 264 纯粹是年化缩放错误 | **排除** | 定义只贡献约 14 倍；剥离后常规 Sharpe 仍 ≈19，日均 +1.62% 本身不成立 |
+| E4 | 晋升闸门是虚高数字的来源 | **排除** | `_promotion_gate`（`scheduled_workflow.py:387-527`）设计合理，见本文 3.3 C4 的辩护段。虚高数字**不出自这里** |
+| E5 | 下游消费层在读未来标签 | **排除** | `stock_analyzer/prediction.py` 全文无 `target_ret`/`tradable_ret`/`open_ret`/`buyable` 引用；`stock_analyzer/quant_signal.py:299` `entry = float(df["close"].iloc[-1])` 只用当前收盘。唯一读未来标签的是 `realtime/reference.py:334,343,347` `_build_calibration`（读 `target_ret_{h}d`/`tradable_ret_{h}d`/`open_ret_{h}d`），**仅用于展示校准曲线，不进买入闸门** |
+| E6 | 从来没有过任何同口径对比 | **需撤回** | 见第 6 节 |
+| E7 | 14:00 as-of 截断有前视 | **排除** | 见 4.4 |
+| E8 | 集合竞价/11:30 bar 漏掉 | **排除** | 见 4.4 |
+| E9 | 量纲差异稀释分钟特征 | **排除** | 见 4.4 |
+| E10 | NaN 填 0 构成偏置 | **排除** | 见 4.4 |
+| E11 | `_apply_adjust` 的日频索引 vs 日内时间戳对齐差一天 | **排除** | 已数值验证，union+ffill 机制正确，见 5.3 |
+| E12 | **成本被重复扣减** | **排除** | `intraday_1400/pipeline.py:180-183` 只扣一次（`INTRADAY_1400_ROUNDTRIP_COST` 默认 0.002）；`offline_race.py:241-247` 是**把成本加回来做披露**（`gross_return = net_return + cost`）；`evaluation.py:43-44` 的 `fillna(... + cost)` 与随后的 `.mean() - cost` **代数上相互抵消**。三处一起看是自洽的 |
+| E13 | **符号 / 单位错误** | **排除** | 全程小数制；`offline_race.py:102` `ascending=False` 排序方向正确；`evaluation.py:219` `/10000.0` 转 bp 正确；复利自检 `−0.291%/天 × 240 → −50.3%` vs 报告 `−53.26%`（差额是方差拖累，方向正确）；Sharpe `−2.06` 反解出 2.24% 日波动，量级合理 |
+| E14 | **入场/退出标签错位或除权错位** | **主要排除** | 退出帧是入场帧按 `next_trade_date` **自连接**（`pipeline.py:122-139`），`label_entry_price_1450` 被重命名为 `label_exit_price_t1` → **入场与退出共用同一个 14:50 bar 时钟与同一价格定义**；分子分母都是 qfq → **无除权错位**。残余见 7.1 S5 |
+| E15 | **核算层有算术 bug 导致负号** | **排除** | 两次独立的逐位分解都闭合（见 3.6）。负号 = 真实成本 + `−10%` 尾部假设，**毛收益为正** |
+| E16 | 财报数据有前视（用了未来才公布的财报） | **排除（第二轮）** | `quant/factors/engineering.py:253-272` `_merge_asof_panel` 用 `direction="backward"`，且**先把公告日 +1 天**再 asof（`:246-251`），基本面因子的时点性正确 |
+| E17 | 盘中链的逐日 PIT 门控也不可信 | **排除（第二轮，且盘中链此处优于日线链）** | `intraday_1400/collector.py` / `pipeline.py` 的逐日门控是**真正按日期**做的，比日线链的行位移（§5.14）更严格。日线链才是薄弱侧 |
+| E18 | `intraday_1400/features.py:157` 的 `len(day) >= 36` 是半日市 bug | **排除（第二轮）** | A 股自 2018 年起**不存在半日交易**（除夕休市而非半日），该阈值在样本期内不会误杀 |
+| E19 | `RESEARCH_ARCHIVE_20260810.md` 的 "stable universe hashes" 说明宇宙是时点正确的 | **排除 —— 恰恰相反（第二轮）** | `daily_optimization_pipeline.py:137-151` 确实哈希了 universe 文件，但那只保证"同一份快照可复现"。**哈希稳定 ≠ 时点正确**，而快照本身被 `datafeed.py:154-175` 覆盖重写。详见 §5.12 |
+| E20 | 退市股暴跌被计入了训练标签，所以偏差已部分体现 | **排除（第二轮）** | `tradability.py` 全文无退市概念；尾部 `horizon` 行的 target 因 `shift(-horizon)` 越界为 NaN（`engineering.py:482`）后被 `:700` 的 `dropna` 丢弃。→ **暴跌既不在标签也不在收益序列里** |
+| E21 | `backtest.py` 的分位数过滤用了全样本统计量（跨期泄漏） | **排除（第二轮，这一点实现是对的）** | `backtest.py:122-133` 是 `groupby("date")` 逐日截面重算，**不存在全样本均值**。残余问题只有两点且都不是跨期泄漏：输入含当日自身 bar；分位数算在已被生存者过滤的池上（§5.19 (d)） |
+| E22 | `realtime` 的自选池也是手工维护、无生成方 | **部分排除（第二轮修正）** | `mobile_snapshot.json` **有生成方** —— `top10_eval.py:63-92`，经 cron `top10-eval`（`scheduler_jobs.sh:246-255`）。真正无写入方的是它上游的 `snapshots/watchlist.txt`（8 读 / 0 写）与 `logs/realtime/realtime_holdings.txt` | §5.20 |
+| E23 | 盘中 `--codes-file` 只是"文件不在 checkout 里" | **排除 —— 比这更彻底（第二轮）** | 无默认值、无写入方、无任何调用方，`intraday_1400` 在**任何**部署/cron/shell 文件里零出现 → **整条链的调度方式都在代码库之外**。§5.20 |
+| E24 | **LGBMRanker 的 group 语义写错了（"隐藏的 Ranker bug"）** | **排除（第二轮，这是本轮最值得记住的一条"清白"判定）** | `model.py:116-143` 先按 `["date","code"]` 排序，再按 date 分组、`group.append(len(g))`，标签用**逐日** `rank(pct=True)`；`:680-682` 同时传 `group` 与 `eval_group`。lambdarank 的三要素（排序、分组长度、组内相对标签）全部正确。→ "Ranker 权重 0.85 是因为它有 bug 所以碰巧看起来好"**不成立**；真正的原因是 `_metrics` 池化（§4.6 S5），指标层而非模型层 |
+| E25 | Ridge 的截距被惩罚了 → 系数有偏 | **排除** | `model.py` 的正则矩阵 `reg[0,0] = 0.0`，截距不受惩罚，实现正确 |
+| E26 | 日线链某处做了 Platt/概率校准，把分数压平了 | **排除** | 全仓库唯一的校准实现在 `intraday_1400/structural_combo.py:13-54`，且其拟合切片在 `structural_combo_experiment.py:57-77` 是干净的。**日线发布链上没有任何校准** |
+| E27 | 改了融合权重后会复用旧窗口缓存（权重不进缓存键） | **排除（权重确实进了键）** | `_recipe_signature` 覆盖各腿权重。缓存问题只在另外两个面：baseline 豁免（S1）与 `universe_codes` 被故意排除（S8）。三者是同一函数的**不同侧面**，详见 §4.6.2 |
+| E28 | 精确线性恒等式也会造成系数稀释，所以"看系数"在任何情况下都不可用 | **排除（这是 §4.5 结论的必要边界）** | 已在真实管线（逐日 1/99 winsorize → 逐日 z）上数值验证 `macd_hist = macd_dif − macd_dea`：信号只在 hist 时，dif=+0.00037 / dea=−0.00051 / **hist=+0.01990**（单独跑 hist 是 +0.01997），`cond(X'X)=3.15e2`。→ 稀释的成因是**高相关同向特征族**，不是任意共线性。详见 §4.5.3 |
+| E29 | 候选间的差异只是随机种子噪声 | **排除机制，但未验证量级** | `random_state=42` 在所有模型入口硬编码，同配置可复现 → 差异不来自种子。**但"差异 > 种子噪声"这件事本身也从未被验证过**（无重复种子实验），所以这条只排除了一个解释，没有建立另一个 |
+| E30 | 时间衰减抽样会整段丢弃早期时期 | **排除** | 抽样是逐行伯努利/概率抽样，不是按期截断；早期时期只是**权重更低**，不会整段消失。真正的截断只在 CatBoost 分支（`model.py:826-843`，group-safe 保留最新完整交易日） |
+| E31 | **日线标签有 off-by-one（差一天）** | **排除（第二轮，逐字复核 + 数值复现）** | 三处独立实现（`tradability.py:107-133`、`engineering.py:482-500`、`select.py:133`）公式全部正确；`open_ret_1d = open[t+2]/open[t+1] − 1` 与命名一致；`ovn_gap = open[t]/close[t−1]` 正确。**残余问题全在"可见时点"而非"位移量"上**，见 §5.21 |
+| E32 | 特征侧存在未来函数（`shift(-n)` / `center=True` / `bfill`） | **排除（第二轮）** | 特征侧**零命中**。标签列也不可能反向变成特征（`_FORBIDDEN_FEATURE_PREFIXES` `:520-549` + 两道硬校验）。`merge_asof` 方向正确 |
+| E33 | `rolled_sell_close` 的顺延决策用了未来的封板信息 | **排除（第二轮，numpy 复现）** | `close=[10,11,12,13,14,15]`、`blocked=[F,T,T,T,F,F]`、h=1、cap=3 → `[13,14,14,14,15,nan]`，每一步只用当日及之前的封板状态。**残余问题是尾部上限被静默截断**（`tradability.py:40`），不是前视 |
+| E34 | 月度分区会破坏截面变换（逐日 z / winsorize 跨月失真） | **排除（第二轮）** | 所有截面变换都在 `groupby("date")` 内完成，与分区无关。分区真正造成的损害是**每月末 `horizon` 天标签永久 NaN**（§5.21 第 3 条），可用 `--refresh-months 2` 一个旗标修掉 |
+| E35 | purge 打开时间隔不足 / 有标签重叠 | **排除（第二轮，h=1/5/10 手工数值复现）** | `_purged_end`（`:232-238`）取 `eligible[-h-1]`，`train_end + h` 恰好落在 boundary 前最后一个交易日 → **零重叠、一天不多不少，是数学上最紧的正确实现**。`valid_end↔predict_start` 同函数同 span（`:809`）|
+| E36 | 节假日/长假导致 purge 天数不足 | **排除（第二轮）** | purge 走**真实交易日**（`:234` 用面板 `unique()` 日期并集），不是日历日。注意这与 §5.14「日线 shift 是行位移」不矛盾：purge 的日历是对的，标签的日历是错的 |
+| E37 | `open-label` 腿的 purge span 与其标签位移不匹配 | **排除（第二轮）** | `_purge_span` 对 `{open-label, open-buyin-mask}` 返回 `h+1`（`:228-229`），与 `open_ret` 的 `shift(-(1+h))`（`engineering.py:489-493`）精确匹配 |
+| E38 | 被 purge 的日期可能被 `_split_time` 误当成验证集 | **排除（第二轮）** | `model_window`（`:841-845`）把 gap 日期**物理删除**后才交给 `model.py`，`valid = df[date > train_end]` 取不到它们 |
+| E39 | 窗口缓存可能命中"旧 purge 规则"算出的结果 | **排除（第二轮，我独立复核）** | `purge_horizon` 在 `recipe_params`（`:715`）内参与哈希，`train_end_ts`/`valid_end_ts` 由它与面板日期完全决定；月份签名含 `mtime_ns`。→ **purge 规则对缓存 key 是闭合的** |
+| E40 | test 段之间可能有缝或重叠 | **排除（第二轮）** | `current = test_end` 无缝铺瓦（`:807`），预测行再按 `[current, test_end)` 二次裁剪（`:1027-1028`）→ 每个交易日恰好被预测一次 |
+| E41 | 逐日截面变换会因"按月分区"跨月失真 | **排除（第二轮，与 E34 同源，独立第二次确认）** | `prepare_month:443-455` 每月独立，且所有 z/winsorize 都在 `groupby("date")` 内 |
+| E42 | 样本权重（IC 权重 / 时间衰减）泄漏验证段信息 | **排除（第二轮）** | `_ic_weights` / `time_decay_weights` 只作用于训练段，衰减锚点在**训练段末尾**而非全样本末尾 |
+| E43 | 回测组合构建的分位数阈值用了全样本 | **排除（第二轮，与 §5.20 独立确认一致）** | `portfolio_from_predictions` 的全部分位数都在 `groupby("date")` 内 |
+| E44 | 财务数据 `merge_asof` 方向错误 | **排除（第二轮）** | `direction="backward"` 正确。**残余问题是 `ann_date` 缺失时退化为 `report_date`**（§5.21 第 1 条），不是 asof 方向 |
+| E45 | 滚动因子选择的输入包含了未 purge 的边界样本 | **排除（第二轮）** | `selection_train = window[date >= train_start & date <= train_end_ts]`（`:816`）用的是 purge **之后**的 `train_end_ts`。**残余问题是候选集来自全样本静态清单**（S15），不是这一步 |
+| E46 | Ridge 腿因 `train_all` 不传 `valid_end` 而系数被污染 | **排除（第二轮）** | Ridge 是闭式解、**无早停**，`valid_end` 对它只影响返回哪段预测不影响系数；且生产 batched 路径（`:849-1021`）给每条腿都显式传了 `train_end`/`valid_end`/`predict_start`，`train_all` 的缺陷触不到日常训练（与 §4.6 S8 结论互证）|
+| E47 | `sentiment_feature_experiment` 的训练侧 purge 实现有误 | **排除（第二轮）** | `_purge_boundary_labels:185-193` 实现正确且是交易日制。该实验的问题在别处（仓库内无任何产物，§1.1）|
+| E48 | 全仓库存在 embargo 但配置错误 | **排除 —— 它根本不存在**（`grep -rni embargo` 零命中，我复核确认）| 这是**设计缺失**而非 bug，评级低危：标签零重叠已消除主要泄漏路径，embargo 的剩余价值只在抵御特征端滚动窗口重叠（`ret_20d`/EWM 在 `valid_start` 处仍回看训练期）与收益自相关，这些向后看、不构成严格泄漏，但会让早停轮数偏乐观 |
+
+### 7.1 疑似项（有机制与动机，本环境无法证实）
+
+#### S1（最值得警惕）在位产物可能仍在复用"黑名单之前"算出的窗口预测缓存
+
+`quant/full_train_batched.py:720-723` 是一个**刻意设计的 baseline 缓存豁免**：
+
+```python
+# 仅当非 baseline 时才注入 A/B 字段，保证 baseline 腿 recipe 哈希与现役完全一致（复用既有缓存）。
+if train_target_mode != "baseline":
+    recipe_params["train_target_mode"] = train_target_mode
+    recipe_params["price_source_signature"] = _price_source_signature()
+```
+
+- 在位腿的 recipe 哈希被**固定为改动前的值**，好让它继续命中旧缓存
+- 再加 `:755-776` 的 legacy-key 提升逻辑：命中旧 key 就 `cached.to_parquet(cache_path)` 把旧结果**改写成新 key**，此后旧缓存以"新"身份继续被使用
+- `WINDOW_CACHE_VERSION = 2`（`:32`，参与哈希于 `:35-36`）确实存在，`RESEARCH_ARCHIVE_20260810.md:48` 也称改动后 bump 过，但 **baseline 豁免让这个 bump 对在位腿的保护力打折**
+
+**如何结案**：容器内**只读**列出 `window_cache/` 下 parquet 的 mtime 与 key 分布，与黑名单代码变更时间对比。**这是唯一还需在容器内实测才能结案的问题**（见 P8）。
+
+#### 其余疑似项
+
+| # | 疑似 | 机制 | 如何结案 |
+|---|---|---|---|
+| S2 | `buyable_next` 的降级替换可能悄悄放宽收盘口径 | `quant/backtest.py:114-116`：收盘口径本应看 `buyable_close`，但若该列缺失而 `buyable_next` 存在，就**替换成后者**。`quant/watchlist_grid.py:252-259` 同。两者语义不同（当日封板 vs 次日一字）。在位 baseline 因两列都没有而不受影响，但对**带部分列的候选**可能有偏 | 构造带 `buyable_next` 无 `buyable_close` 的样本对比 |
+| S3 | 严格候选普遍为负，可能有一部分是"成交口径过严"而非模型没 alpha | `INTRADAY_ASOF_1400_PLAN.md:405` 自陈固定标签判不可卖的 6 笔日更持仓**在 T+2/T+3 全部恢复**，统一 `-10%` "对大多数暂时阻塞持仓确实过重"；`:407` 又发现把 37 笔实际有量可成交的持仓误判为不可买。**方向上这不能救回日更**（同批修正在 §1.16 做过，日更成交笔均 +45.73bp 但只有 180 笔），但意味着"候选全负"也不该照价采信 | 见 P2 敏感性表 |
+| S4 | 跨面板复权口径可能不同 → 赛跑在两个价格空间之间进行 | 见 5.4。`quality.py:25` 只检查 `factor_version` 非空，从不校验与日线一致；`fair_race_pipeline.py:219-224` 的 inner join 无对账 | 见 P7。**这是唯一未闭环、且有能力从根本上改变结论的通道** |
+| S5 | `previous_close` 用行序 shift，且基准不是官方前收盘 | `intraday_1400/pipeline.py:104` 用 `groupby("code")["label_close_1455"].shift(1)` —— 按**行序**取上一行，**跨停牌缺口时会拿到几天前的价格**；而且它取的是**上一交易日 14:55 最后一根 bar 的收盘**，不是交易所公布的官方前收盘价。后果：`:114` 那个 9.8% 涨幅上限本身就是有偏的基准算出来的 | 与官方前收盘对账一天的样本即可 |
+| S6 | ~~**宇宙存在无法量化的生存者偏置**~~ → **第二轮已升级为已确认，见 §5.12 / §5.17** | 盘中侧：`intraday_1400/collector.py:284-289` 从一个**不在仓库里**的 `--codes-file` 解析宇宙（见 4.3 D8，第二轮穷举证据见 §5.17）。日线侧：机制已完全查清 —— `quant/datafeed.py:149,154-175` 覆盖写今日快照 + 仅按名称含「退」排除 + `full_train_batched.py:775-776,799-800` 回溯施加（§5.12）。方向偏乐观，集中组合下量级可达年化数个百分点 | 已无需再查机制；量化需生产主机上的历史码表快照（不存在）或外部退市名单 |
+| S7 | **pandas 1.1.5 下的浅拷贝跨变体污染**（非收益类缺陷，但会污染训练） | `intraday_1400/fair_race_pipeline.py:343-362` 先 `panel.copy(deep=False)` 再赋值新列 → 在本环境**实际安装的 pandas 1.1.5** 上，写入会**回传到父 panel**，于是 `:476-477` 的变体循环里，前一个变体的训练标签会污染后一个变体。`requirements.txt` 钉的是 pandas>=2.0（在 2.x 上不会发生）。回归测试在 `test_intraday_1400.py:931-943` | 在容器内确认实际 pandas 版本；若是 1.x，**所有变体赛跑结果都需重跑** |
+| S8（第二轮新增） | **换池后历史窗口复用旧池算出的缓存模型** | `_recipe_signature`（`full_train_batched.py:35-43`，注释 `:46-51`）**故意把 `universe_codes` 排除出缓存键**，理由是"月度面板文件签名会捕获输入变化"；但 `--refresh-months` 默认只重建最近 1 月（`scheduled_workflow.py:1075`），**历史月份分区签名永不变化**。于是历史窗口读旧池缓存，再按新池做一次成员过滤（`:775-776`）—— 模型参数 / 因子 IC / 截面 z-score 全是旧池的。**这是 S1 的姊妹问题，机制更清楚**（详见 §5.16） | 容器内只读对比 `window_cache/` 的 key 与 mtime，并入 P8 |
+| S9（第二轮新增） | 若 `price/` 保留了已退市个股的 parquet，则**不指定 universe 文件的研究路径反而比生产路径更少生存者偏差** | `engineering.py:109-113`：未提供 universe 文件时直接扫 `PRICE_DIR` 全部 parquet；而 `warehouse.py` 无任何删除路径。→ 研究口径可能含退市票，生产口径一定不含。**这意味着"研究跑不出生产的分数"里，可能有一部分是研究口径更诚实**，与 §3 的整体方向相反，值得优先证实 | 生产主机上比对 `quant_data/price/` 的 parquet 数量与 universe 文件行数，只读 |
+| S10（第二轮新增，**与 S9 并列为两个 10 分钟即可结案的最高性价比待办**） | **日更刷新到底有没有开 `--rolling-factor-select`（以及随它绑定的 `--purge-horizon`），取决于一个本环境读不到的 manifest 布尔值** | `scheduled_workflow.py:836` `_uses_rolling_training(args)` = `strategy_mode == "candidate-upgrade" or args.incumbent_rolling_factor_select`；`:883-884` 从 `active_quant_model.json` 的 `params.rolling_factor_select` **闩住**这个布尔；`:955-961` 为真时**同时**传 `--rolling-factor-select` 与 `--purge-horizon`；`:1010` `build_params` 又把它写回 manifest → 一个**跨月自锁**。而 `publish_short_champion`（`:628-629, 1200-1209`）只把 3 个 `daily_*` 键并回 `params`，不会清掉它。后果：**共线性解药与标签 purge 同生共死于同一个布尔**。monthly-factor 恒开（`scheduler_jobs.sh:182`）、`daily_optimization_pipeline.py:354` 无条件开，唯独日更未知 | 生产主机 `cat quant_data/full_a_2018_wide/active_quant_model.json` 读 `params.rolling_factor_select`，只读，10 分钟 |
+| S11（第二轮新增） | CatBoost 的 `group_weight` 按**行**传入，而非按组 | `model.py:848` 把逐行的 `sample_weight` 直接当 `group_weight` 传；同文件 `:905`（XGBoost 分支）用的才是正确的 groupby 组均值。CatBoost 若不报错则语义已被静默改变 | 装 catboost 后跑一次对比；影子腿，优先级低 |
+| S12（第二轮新增） | LightGBM 多线程直方图导致同配置不完全可复现 | `random_state=42` 只固定抽样与初始化，不固定多线程直方图归约顺序 → 微小非确定性。与"候选间差异 16bp/天"相比量级未知，但它进一步侵蚀 §2 的判决力 | 同配置连跑 3 次比对 `rank_ic` 位数 |
+| S13（第二轮新增） | `_selected_factors` 在 manifest 缺失时**静默回退到全部非黑名单数值列** | `full_train_batched.py:592-604`：拿不到全局 IC 清单就用全列，不告警。→ 某些历史窗口的特征集可能与 manifest 声称的不同，而没人知道 | 训练日志里比对实际列数与 manifest 列数 |
+| S14（第二轮新增，**新的 10 分钟待办，与 S9/S10 并列**） | `factor_selection_lh1000_cont.parquet` 在仓库里**没有生产者** | 全仓库 grep `lh1000` 仅 3 处命中，**全部是消费者**（`daily_optimization_pipeline.py:146,319`、`full_train_batched.py:1214`）；`select.py:159` 与 `pipeline.py:72` 的默认名都是裸 `"factor_selection"`。→ 这是第三个"存在于代码库之外的关键产物"（另两个是盘中 `--codes-file` 与 `snapshots/watchlist.txt`，§5.20）。名字暗示是某次手工 `python -m quant.select`（`lh1000` ≈ `min_price_rows=1000`）的一次性产物 | 生产主机 `ls -l` 看该 parquet 的 mtime 与行数：mtime 远早于今天、行数=50 → 证实是冻结的手工产物 |
+| S15（第二轮新增） | 滚动因子选择**逃不出全样本挑出的候选集** | `_selected_factors`（`:592-604`）读静态清单，每窗滚动选择只在其子集内重挑（`:805`→`:817-826`）→ 每个窗口（含最早窗口）的**特征宇宙**都由全历史 IC 筛出，是"CV 外做特征选择"的经典乐观偏差。与 S14 是同一件事的两面 | 用一段早期数据自建清单重跑，比较 IC 落差 |
+| S16（第二轮新增） | `tradable-label` 腿的 purge **短 2 个交易日** | `_purge_span` 只给 `h`（`:228-229`，且 `test_model_expansion_experiment.py:1398` 把该行为写进断言），但 `rolled_sell_close`（`tradability.py:29-48`）跌停顺延可到 `i+h+cap-1`，`cap` 默认 3（`backtest.py:31-33`）。h=1/boundary=30 时 train_end=28、最坏卖出索引 31 ≥ 30。占训练集 0.4%、占 1 个月验证段 **10%**。该腿在 `target_ab_experiment.py:84-86` 带 purge 实跑过 | 改 `_purge_span` 为 `h + cap - 1` 后重跑该腿 A/B |
+| S17（第二轮新增） | `QUANT_BT_SELL_ROLL_MAX_DAYS` **改变标签却不进任何哈希** | `recipe_params`（`:698-723`）无此项，`_price_source_signature`（`:77-86`）只哈希 price parquet 的 name/size/mtime → 改这个环境变量后重跑会**静默命中旧缓存** | 改环境变量后看缓存是否重算 |
+| S18（第二轮新增） | purge 按**面板日期**剔除，标签按**个股行位移**生成 → 停牌股穿透边界 | 标签是 `panel.groupby("code")["close"].shift(-horizon)`（`engineering.py:482`），按该股自己的行前移；`_purged_end` 只按全市场日期并集。某股边界前停牌 10 天时，其 t 日标签可落在 `valid_start` 之后很远。估计每窗 <0.5% 样本，方向乐观。与 §5.14 行位移问题同根 | 按 (code, date) 逐股 purge，或改用交易日历对齐 |
+| S19（第二轮新增） | h≥10 时 purge 吃掉近半验证段且**零告警** | h=10 → 21 天验证段只剩 11 天（**48% 被吃**）；h=15 → 约 6 天，早停轮数基本是噪声。唯一兜底是整窗跳过（`:810-814`），不是缩窗告警。**当前不发作**（波段腿从不训练，§4.6 S9），但 **P00 一旦把 horizon 扫到 {3,5,10} 就立刻发作** | **这是 P00 的前置条件**：扫 horizon 时必须同时把 `validation_months` 提到 2–3 |
+| S20（第二轮新增） | 因子选择目标与训练目标不一致 | `select.daily_ic` 经 `_target_col`（`select.py:21-25`）**硬编码** `target_ret_{h}d`，`_rolling_factor_selection`（`:284-286`）不传 label → `open-label`/`tradable-label` 腿仍按收盘-收盘标签挑因子。同类：`model.train_catboost_ranker:814` 硬编码同一列、签名（`:803-809`）根本没有 `label_col`、`full_train_batched.py:990-1004` 也没传 → **CatBoost 腿在任何 A/B 变体下都在训练 baseline 标签**。会稀释 A/B 结论（口径问题，非泄漏）| 加 `label_col` 参数后重跑 A/B |
+| S21（第二轮新增） | `pipeline.py` 的树腿是**教科书式早停泄漏**，历史结论不可信 | `pipeline.py:149-152` 连 `train_end` 都不传 → `model.py:46-48` 落 70/30 切点；`predict_start=None` → `predict = valid`（`model.py:69-70`）→ 早停的 `eval_set` 与最终评估集**是同一批数据**。所幸不在调度链上（`scheduled_workflow.py:923-924` 直接调 `full_train_batched`）。**但任何据 `pipeline.py` 得出的历史结论都要作废** | 检查 `RESEARCH_ARCHIVE` 里哪些结论出自 `pipeline.py` |
+| S22（第二轮新增） | `params["purge_horizon"]` **只写不读** | `scheduled_workflow.py:1011` 写它，但 `:883-884` 的回读只查 `rolling_factor_select` → 手工改这个键会被静默忽略。**顺带：这给 S10 提供了第二、第三条更便宜的答法**（读 manifest 的 `params.purge_horizon`，或读训练 summary 的 `purge_horizon`，`full_train_batched.py:1179`）| 见 §12.4 |
+
+> **命名警告**：本小节的 S 编号（S1–S13）与 §4.6 表格的 S 编号（S2–S10）是**两套独立编号**，不要交叉引用。§4.6 的编号沿用子代理报告原文，本节沿用第一轮交接文档原文。
+
+---
+
+## 8. 代码库结构速查（接手者定位用）
+
+### 8.1 整体架构
+
+- Streamlit UI（8501 桌面 / 8502 移动）+ 容器 cron `scheduler` + `realtime/` 盘中层，Docker Compose，共享 `quant_data/` 卷
+- 仓库树是**纯源码**：`/home/work/A_test/a-share-quant-system-main` 只有 8 个包目录 + `quant/` 下两个 `__pycache__`
+
+### 8.2 日更主链路（生产路径是 `full_train_batched`，不是 `pipeline.py`）
+
+```
+quant/scheduled_workflow.py                 总调度
+  :33-34   ACTIVE_STYLE_FILES = {"short_1_3": "active_quant_short_predictions.parquet",
+                                 "swing_7_15": "active_quant_swing_predictions.parquet"}
+  :39-73   FINAL_TRADE_STYLES —— short_1_3: horizons [1,2], top_n 2, gross_exposure 0.30
+                                 swing 复用 short 模型的预测
+  :40-56   在位冠军 score_params: ridge_quantile=0.55, ic_weight=0.03, top_n=2
+  :107-128 _daily_short_neighbor()   日更只在月度冠军微小邻域搜索
+  :336-354 assert_active_is_latest   唯一硬时效门，--allow-stale-active 可绕过
+  :387-527 _promotion_gate()         top20 候选 vs 在位，无多重校正
+  :530-645 merge active，keep="last" → active 历史可变
+  :640-720 publish_active_models     原子拷贝
+  :924-945 训练调用（不传任何执行口径参数）
+      ↓
+quant/full_train_batched.py                 生产训练器
+  :32,35-36   WINDOW_CACHE_VERSION = 2（参与 recipe 哈希）
+  :228-229    purge
+  :275-321    _rolling_factor_selection（Layer B，train-only，≤30，max_ic_corr=0.85，:308-320 贪心去相关）
+  :443-456    engineering.prepare_features（winsorize→neutralize→zscore）
+  :549-569, 653-655  tradability 消费
+  :586-589    黑名单强制点（调用于 :603/:806/:827）
+  :645-658    baseline 的 ab_label_col=None / ab_mask_col=None
+  :720-723    ★ baseline 缓存豁免（见 S1）
+  :755-776    legacy-key 提升（旧缓存改写成新 key）
+  :803-804    ★ baseline 跳过 _join_tradability
+  :1104-1115  ab_cols 条件 merge
+  :1155-1164  ★ 产出 +1.62%/日 Sharpe 264 的那次回测调用
+  :1275       train_target_mode 默认 "baseline"
+      ↓
+quant/backtest.py                           回测核心（★ 主要 bug 集中地）
+  :16-18   注释声称含可交易性摩擦（对 baseline 腿不成立）
+  :23-24   QUANT_BT_FILL 默认 "close"
+  :38-42   bt_cost_roundtrip() 默认 0
+  :53-66   ★ Sharpe = 复利年化收益 / 算术年化波动
+  :99-104  参数为 None 时回落环境变量
+  :108-113 ret_col 逐级回落到 target_ret_{h}d
+  :114-116 buyable_close 缺失时降级用 buyable_next（S2）
+  :124-125 ★ filter_untradable 在列缺失时静默 no-op
+  :143-149 排序前过滤 → 回填 + 权重重归一；空日整天丢弃
+      ↓
+quant/watchlist_grid.py
+  :90-103   _ensure_targets（从 price 补回可交易列）
+  :161-179  第二处错误 Sharpe
+  :250-259  tradability 消费 + S2 降级
+  :565-655  ★ stability_decision / promotion_decision（无 SE 无 p 值）
+```
+
+**旁路（不发布）**：
+- `quant/daily_optimization_pipeline.py` —— **唯一有绝对门槛 + 唯一真正的模型族扫描**。`BRANCHES` `:34-77`：open_buyin_ridge、open_ridge、open_regularized_lgbm、open_extratrees、open_random_forest。`:30-32` `TOP_N=2, COST=0.002, MIN_FILLED=1.0`；`:157-159` 强制严格环境变量；`:225-228` 硬性要求 `open_ret_1d`+`buyable_next`；`:257-261` 现金归一；`:281-286` 绝对门槛；`:298,304` 对在位只贴标签
+- `quant/target_ab_experiment.py` —— `:29` 三腿含 baseline，`:101-120` 统一重 join，`:121-125` 严格评测，`:63-88` 训练超参非冠军。**零程序化门槛，"显著"是纯文本**
+- `quant/sentiment_feature_experiment.py` —— 硬编码 `cost_roundtrip=0.0`
+- `quant/model_expansion_experiment.py` —— ~58 arm 无校正。`quant/test_model_expansion_experiment.py:124-128` 调 `fetch_daily_batch(..., progress_offset=1, progress_total=4)`，而当前签名（`stock_analyzer/amazingdata_source.py:248-249`）只接受 `(symbols, start_date, end_date, adjust)` → **该测试必然 TypeError**
+- `quant/refresh_qfq.py` —— `:44-57` `_factor_changed`、`:68/:74` 调 adjust、`:82-91` `_rebuild_one` 覆盖存储。默认 `--window-days 35`，月度（`docker/scheduler_jobs.sh:197-208`）
+
+**其它日更文件**：
+- `quant/tradability.py` —— 单一真值源。`:7`/`:94` ST 盲区声明；`:102-103` seal 定义；`:115-133` `buyable_close`/`buyable_next`/`rolled_sell_close`
+- `quant/factors/engineering.py` —— `:522-560` 黑名单；`:608` 零方差 std→NaN；`:613-641` `neutralize_cross_section`（`:615` 默认 `["log_mv_total"]`）；`:674-705` `prepare_features`
+- `quant/select.py:142-151` —— Layer A 静态 manifest（全 panel 拟合）
+- `quant/model.py` —— `:90-91` 黑名单强制；`:99,111,140,155` `fillna(0.0)`（z-score 之后）；`:268,549,723,779` 训练行下采样 RNG；`:388-399` Ridge alpha=10；`:648+` LGBMRanker
+- `quant/daily_update.py` —— `:126-133,167-181,375-382` `_merge_time_series`；`:141` `_update_one_intraday_spot`；`:197,356` 调 datafeed；`:233-258` `update_intraday_spot`；`:520-570` `run()`（`:542` 条件调用）
+- `quant/warehouse.py:67-88` `load_price_tail`
+- `quant/datafeed.py:366-367` → `daily_update`
+- `quant/config.py:21` —— `000300` 仅作为**universe 成员定义**
+
+### 8.3 盘中 14:00 as-of 子系统（`intraday_1400/`）
+
+```
+config.py:7,14,21          DATA_ROOT（相对 CWD）、REPORT_DIR、cutoff 13:55
+collector.py:67-77         _factor_fingerprint
+          :126-152         per-code fingerprint 状态
+          :139,145,171,177 调 _apply_adjust
+          :180-187         bar_vwap_qfq 重算（volume/amount 仍 raw）
+          :188-189         打 factor_version
+          :254-263         factor_rebuild_required.json
+features.py:61             _corr（有效点<3 或零方差 → NaN）
+          :75              兼容 date/kline_time
+          :79-80,125-128   entry_start==entry_end=="14:50"
+          :88              ★ cutoff 截断 dt.time <= 13:55
+          :151-152         raw volume/amount 汇总进日行
+          :156-157         is_complete（>=36 根 且 末根 13:55）
+          :163             factor_version 传递
+          :165-168         label_entry_price/high/low_1450
+          :169             标签用 full_day
+          :217             m5_amihud
+          :275-276         risk_near_limit_up/down ±0.045
+          :298             risk_volume_vs_median_20
+          :339             signal_locked
+          :363-366         ★ 两个伪分钟特征（日频派生）
+pipeline.py:107-115        ★ entry_buyable 构造（0.045 / 0.098）
+          :140-142         卖侧镜像
+          :184-193         -10% 惩罚
+          :305             ★ 剔除 is_complete=False（丢高波动场景）
+          :378-409         日线基本面列并入后二次 winsorize+zscore
+          :412-425         ★ 40 个 context 派生（market_excess 是死代码）
+          :504-506         全列统一 winsorize+zscore（无中性化）
+          :549-562         target_excess_ret_t1（减截面均值，仅作训练标签）
+          :565-570         penalty-aware 目标
+          :625-675         _evaluate_close_baseline（读生产日更分数）
+          :651,775,1257    ★ 三处 entry_buyable 评估限定
+          :678-703         _select_features（单变量 |corr|）
+          :706-717         _minute_family（token 顺序依赖）
+          :720-760         ★ _select_minute_features_grouped（:743-750 quota=5）
+          :836-837         _fit_variant（mask=None, 200, 40）
+          :895-897         penalty 目标
+          :949-950,964     top_base=40 + top_minute=40
+          :986-1019        留一族出消融
+          :1002            族消融（mask=entry_buyable, 160, 30）
+          :1099-1155       validate_minute_families
+          :1136            同上不一致配置
+          :1192-1197       ★ rolling_validate 单一筛选面板（轻微前视）
+evaluation.py:28-33        _bootstrap_ci（iid）
+          :36-61           指标函数（无控制腿钩子）
+          :53              正确 Sharpe
+          :87              entry_buyable 消费
+offline_race.py:24-25      flat_bar_tolerance 0.005 / limit_return_threshold 0.045
+          :107-121         指标（:121 正确 Sharpe）
+          :126-131         _paired_bootstrap（samples=2000）
+          :135-191         配对 bootstrap CI
+          :142-144         ★ 一只 NaN 作废整天
+          :218-247         ★ 填充约定（0.0 / -0.10 / NaN）
+          :255             兼容 date/kline_time
+          :298-307         _locked_bar
+          :466,487         entry_buyable 赋值
+quality.py:25,37,45-63,60,73   factor_version 非空、finite_ratio>=0.95、rebuild 门
+fair_race_pipeline.py:34-89     角色定义（causal_control / lookahead_diagnostic）
+          :114-119         日线 prepared 目录
+          :155-237         merge_prepared_frames（:219-224 inner join 无对账）
+          :241-256         ★ load_joined_prepared（key 只有 code,date）
+          :405-407         train_mask_col=None
+          :605-632         ★ align_control_feature_selections（前视变体的选择被复制）
+          :994-1003        entry_buyable 消费
+structural_combo_holdout.py:109-137  ★ 现金补位固定分母
+          :130             合成现金行 entry_buyable=False
+          :332-333         ★ 硬编码 daily_history_causal=False
+          :345-372         main() 绕过 holdout 账本
+dual_paper_evaluation.py:23-27,43-93,162,295   ★ 真正的同口径协议
+daily_minute_enhancement.py:115-125,136,195-230,207
+adaptive_exit_replay.py:106,115,118,122,137-141,192,221
+adaptive_label_pipeline.py:66-68,95
+benchmark.py:18-20,25-30,33-42,51   ★ 这是数据厂商延迟/吞吐基准，与策略绩效无关
+target_redesign.py:281
+direct_return_experiment.py:367
+forward_evaluation.py:259
+test_intraday_1400.py:121-123      fixture 48 根/天（24+24），首 09:30 末 14:55
+          :162-166         断言 bar_count==36, cutoff_bar_time=="13:55", is_complete
+          :365-374         _factor_fingerprint 测试
+          :792-793         sample(frac=1.0, random_state=7/8) 行序不变性
+          :1546-1550,1578-1581,1606-1611  09:30/09:35/14:50/14:55 字面量
+```
+
+**`benchmark.py` 澄清**：它登录 SDK 一次（`:18-20`），对每个 batch size（默认 `20,50,100,200`）在**同一个交易日**上计时两个 SDK 调用 —— `_get_factor_frame` 和 `_query_min5`（`:25-30`），报告 `factor_seconds`/`kline_seconds`/`total_seconds`/`returned`/`coverage`/`bars`/`factor_ok`（`:33-42`），写 `REPORT_DIR/benchmark_{trade_date}.json`（`:51`）。历史结果引于 `INTRADAY_ASOF_1400_PLAN.md:39-50`（20 股 26.3s … 800 股 66.9s），据此选定请求 batch size 800。**不要把它当成绩效基准。**
+
+### 8.4 数据源（`stock_analyzer/amazingdata_source.py`）
+
+```
+:185-193   _KL_COLMAP（kline_time → date）
+:231-245   ★ _normalize_kline（period-agnostic，:234 索引、:243 RangeIndex、:244 to_datetime）
+:248-249   fetch_daily_batch 签名（只 4 参）
+:281,290,291  批量路径：_get_factor_frame / _factor_series / _apply_adjust
+:297-329   ★ _apply_adjust（:311-312,318-319 静默回落；:314-317 对齐；:320-322 base；:324 hfq；:326-328 只缩放 OHLC）
+:332-338   _factor_series（日频午夜归一，不去重）
+:346,360-362  _get_factor_frame（is_local=False）
+:370-373   ★ _backward_factor（@lru_cache(maxsize=8192)，进程内冻结）
+:385-386   fetch_daily 单票路径
+```
+
+`test_amazingdata_adjust.py:34-51`（qfq/hfq 数学）、`:58-63`（volume/amount 不缩放）、`:65-68`（缺因子回落）、`:70-77`（尾部 ffill）
+
+**日更数据入口**：`stock_analyzer/data.py:114-116`（调 `fetch_daily`）、`:145`（1800s 磁盘缓存 `dcache.kline_ttl`）、`:171-172`（优先源）
+
+### 8.5 realtime 层（V1–V5 纸交易）—— 架构可信，但无聚合
+
+**账本结构：**
+- 基础 `Ledger` **不是账户账本，是无盈亏的信号日志**：`realtime/ledger.py:22-24` → `<ledger_dir>/signals_YYYYMMDD.jsonl`，`:26-36` 只写 `{ts, time, code, kind, level, reason, metrics, notified}`
+- 真实账户状态在 `PaperTrader`，每版本四个文件（`paper_trader.py:114-122`）：`paper_state.json`、`paper_trades.jsonl`、`paper_buy_decisions.jsonl`、`paper_sell_counterfactuals.jsonl`
+- 版本隔离：`paper_trader.py:66-74` `_suffixed`、`v2.py:36` `_v2`、`v3.py`/`v4.py:13-18`/`v5.py:13-18`
+- 目录：`realtime/config.py:318-320` `ledger_dir` → `:58-66` `_realtime_dir()` = `<root>/logs/realtime`；枚举于 `:361-373` `paper_state_files()`
+- **格式：JSON（state）+ append-only JSONL（trail）。无 parquet、无 sqlite**
+
+**已实现前向盈亏是真的：**
+- state schema `paper_trader.py:134-154`：`cash`、`positions[]`、`start_equity`、`realized_pnl`、`last_buy_date`、`buy_attempt_date`、`buy_attempt_stages`
+- 持仓字段 `:597-608`：`position_id, code, buy_date, buy_time, buy_price, shares, peak, cost_basis, exp`
+- realized P&L 累加 `:437`；NAV `:315-327` `_equity`；每次卖出打 `equity_after`（`:451`、`v2.py:192`、`v3.py:367`）
+- 持久性：原子 `os.replace`（`:156-165`）、`fcntl.flock` + fsync + 幂等逻辑键 upsert（`:194-219`）
+- **缺口：没有存储的净值时间序列。NAV 只按需计算，无人追加日度 NAV 点**
+
+**V1–V5 确实消费日更发布的预测，完整链条：**
+1. `quant/scheduled_workflow.py:33-34` `ACTIVE_STYLE_FILES`，由 `publish_active_models` 原子拷贝发布（~`:640-720`）
+2. `realtime/config.py:113-115` `predictions_file` = `QUANT_DIR/active_quant_short_predictions.parquet`
+3. 唯一读取：`realtime/reference.py:165` → `:174` `pd.read_parquet(path, columns=requested)`，`requested = ["code","date","pred","ridge_pred","elastic_pred","extra_trees_pred"]`（`:114`）；取最新日期，`pred` → `rank(pct=True)`
+4. 第二次读同一 parquet 做历史分桶校准（**仅展示/审计**）：`:324` `_build_calibration`
+5. 注入：`realtime/engine.py:283-284` `ref = ref_mod.build(cfg, codes)` → `StrategyContext(ref=ref)`
+6. 五个账户经同一 scorer 消费：`realtime/rerank.py:131` `ref = self._ctx.all_refs()`，门 `:192`，池/百分位排序 `:197-205`，打分 `:224-227`；调用于 `paper_trader.py:573` 和 `v2.py:218-219`
+7. V3+ 额外要求**当日**预测：`realtime/v3.py:46-49` `_prediction_date`、`:75-76` 拒绝 `prediction_date != _today()`
+8. 预测文件 mtime 变化时 engine 重载/execv 重启：`engine.py:208-216, 233, 243-258`
+
+**成交与估值是纯实时的（这是独立前向证据）：**
+- V1/V2 用最新成交价：`paper_trader.py:279-287` `_price_of` = `ctx.snapshot_of(code).last`
+- V3/V4/V5 用可执行盘口：`v3.py:66-70` `_quote` 返回 `bid_price1`/`ask_price1`；`:71-74` `_price_of` 返回 bid；`:180` `fill_price = quote["ask"]`；`:211` `"buy_fill_source": "ask1"`；`:377` `"sell_fill_source": "bid1"`；新鲜度门 `:40` `paper_v3_quote_max_age_sec`（90s）
+- 版本矩阵：`realtime/README.md:187-195`（V1/V2 `last/last`，V3–V5 `ask1/bid1`）
+- 唯一的历史数据路径是反事实 markout，**从不触碰成交、现金、净值**：`paper_trader.py:227-276` `_refresh_counterfactuals` → `:236` `warehouse.load_price_tail(...)`；调用于 `:125`（构造时）和 `:461`/`v2.py:163`（卖出后）；只写 `paper_sell_counterfactuals.jsonl`。grep `load_price_tail|warehouse|read_parquet` 在 `v2.py`/`v3.py` **零命中**
+- ATR（追踪止损/风险 sizing 用）来自历史日线 parquet，但**仅启动时**：`reference.py:90-100` `_load_atr_map`
+
+**成本假设：**
+- 单一 round-trip 常量：`realtime/config.py:177` `paper_cost` = env `REALTIME_PAPER_COST`，默认 `0.002`；绑定于 `paper_trader.py:92`
+- 按边各半。买：`:597` `shares = int(budget / (px*(1+cost/2)) // 100) * 100`；`:601` `cost_basis = px*shares*(1+cost/2)`。卖：`:432` `proceeds = px*shares*(1-cost/2)`（`v2.py:171` 镜像）
+- 100 股整手是唯一其它摩擦；`rerank.py:62-65` 复用同一 `paper_cost` 作收益门，`rank_raw_safety_margin` 默认 0.001
+- **无显式滑点模型**。V1/V2 按 `last` 成交（乐观，不穿价）；V3–V5 用真实 `ask1`/`bid1`，spread 被隐式支付而非建模
+- 无市场冲击、队列位置、成交概率建模；`README.md:427-435` 明确列为限制
+
+**★ 两个对审计致命的缺口：**
+1. **没有任何代码把 `paper_trades.jsonl` 聚合成已实现前向统计** —— 无平均收益、无胜率、无累计盈亏。`paper_trades.jsonl` 的**唯一读者**是 `paper_trader.py:230`（在 `_refresh_counterfactuals` 内），只回填 markout，不算聚合。`app.py`/`mobile_app.py` 完全不引用纸账户。`restart.sh:105-108` 调用的 `check_paper.sh` **在仓库里不存在**
+2. **账本不入库** → 已实现前向绩效的符号和量级**无法从本仓库确定**，只在运行主机的 `logs/realtime` 下
+
+最接近的东西只是逐版本、逐记录、逐通知级别：`paper_trader.py:315-327` `summary()` → `净值¥X（±%）持仓N只`（瞬时 NAV，不是统计量）；逐笔字段 `:440-451` `pnl, return, held_days, exit_reason, peak, equity_after`；反事实 markout `:262-268` `close_vs_sell, high_vs_sell, hold_close_return, hold_close_pnl, opportunity_pnl`（D0..D+3）
+
+**`weight_shadow.py` 的"前向"是标签based，不是成交回执：**
+- `:27-29` `MODEL_COLUMNS`、`BASELINE_WEIGHTS = [0.30, 0.20, 0.50]`、`TARGET_COLUMN = "target_ret_1d"`
+- `:88` `rng.dirichlet`/`rng.normal` 进化搜索
+- `:121-136` 日收益 = Top10 等权 − cost
+- `:153-166` 指标 `{days, mean_return, hit_rate, sharpe, max_drawdown}`；`:164` 又换了一套 Sharpe 定义（常规）
+- `:169-232` `walk_forward` OOS 评估
+- `:235-307` `evaluate` 写 `output/versions/<version>.json` + `manifest.json`（`config.py:285-290` `weight_shadow_dir` = `logs/realtime/weight_shadow`）
+- `:381-390` `_forward_returns`（`date > cutoff`）、`:393-435` `_maybe_rollback`、`:438-501` `run_routine` 写 `active_weights.json` + `promotion_history.jsonl`
+- 排程 18:30 工作日（`docker/scheduler.crontab` job `realtime-weight-shadow`）；描述于 `README.md:364-372`（≥40 OOS 天、10 天前向回滚、不写 `active_quant_model.json`）
+- **它从不读 `paper_trades.jsonl` 或任何纸交易状态**，且无任何输出入库
+
+**`realtime/sim_streams.py`**：`:1-14` 明示"不依赖券商连接、不触网、不碰 quant_data"；`:47-58` 是 PASS/FAIL 计数器；脚本化喂 `target_ret_1d`（`:1355,1362,1484,1539`）且 `cost=0.0`（`:1367,1488,1490`）；`:259,265` 的 `000300` 是明确标注"无模型分，池外"的仿真夹具；`:387-389` 硬编码 ±10%。**`realtime/README.md:413` 的 "126 PASS / 0 FAIL" 是回归测试通过数，不是收益。**
+
+### 8.6 产品面（已发布选股无前向记录）
+
+- `top10_eval.py` / `candidate_eval.py` 输出按**组名**覆盖，**从不按日期**，**无已实现收益列**
+- `stock_analyzer/quant_signal.py` **完全没有时效守卫**；`:299` 入场价是 price parquet 里的最后收盘 —— 在 10:30/13:30 可能是**被当作收盘写入的实时盘中报价**
+- `quant/pipeline.py` 的回测是 close-fill 零成本，可交易性摩擦静默失效
+- `README.md` **不引用任何回测绩效数字**，且**从不提及 `intraday_1400`**（该字符串零命中）。无成本假设章节、无 −10% 惩罚讨论。相关行只有 `:13` 免责声明、`:24` 特征表格 "成本口径回测"、`:108` `tradability.py # 可交易性过滤（涨跌停/停牌）`、`:139` 说明 `quant_data/` 是运行时生成不入 git。**14:00 系统在 README 里完全无文档**
+
+### 8.7 全仓库 RNG 调用清单（穷举，证明无负对照）
+
+| 位置 | 用途 |
+|---|---|
+| `intraday_1400/evaluation.py:28-33` | `_bootstrap_ci`，对**已算出的**日收益 `rng.choice` |
+| `intraday_1400/offline_race.py:126-131` | `_paired_bootstrap`，同上，`samples=2000` |
+| `quant/model.py:268, 549, 723, 779` | `rng.choice(len(y), size=max_train_rows, replace=False, p=...)` 训练行下采样上限 |
+| `realtime/weight_shadow.py:88` | `rng.dirichlet`/`rng.normal` 权重进化搜索 |
+| `realtime/feed.py:64,74,75` | 合成 mock 报价（`:71-72` 硬编码 ±10%） |
+| `stock_analyzer/net.py:59`、`llm.py:133,140` | 代理池 / LLM 轮询洗牌 |
+| `tests/test_target_ab.py:22`、`quant/test_model_expansion_experiment.py:892,989,1126,1234,1321`、`intraday_1400/test_intraday_1400.py:792-793` | 合成夹具；最后一个是 `sample(frac=1.0, random_state=7/8)` 仅证明 `_build_safety_constrained_frame` 行序不变性 |
+
+**没有 random TopN、没有 score shuffle/permutation、没有 placebo、没有等权全域腿、没有指数基准腿走过收益核算。**
+
+不是替代品的东西：
+- `fair_race_pipeline.py:34-89` 的 `daily_asof_control`/`daily_close_control` 及 `_plus_minute` 变体 —— 是**训练过的模型**的特征集消融腿（`causal_control` / `lookahead_diagnostic`），不是随机对照
+- `pipeline.py:625-675` `_evaluate_close_baseline` —— 读 `quant_data/active_quant_short_predictions.parquet`，把**生产日更模型的分数**过同一套 `entry_buyable` + `-10%` 核算。最接近外部参照腿，但仍是训练过的模型，不是 null
+- `structural_combo_holdout.py:122-134` 现金填充行 —— 零收益记账约定，不是基准腿
+- `pipeline.py:549-562` `target_excess_ret_t1`（减截面日均）和 `:412-425` 的 `*_market_excess`/`*_market_rank` —— **只作训练标签和特征，从不作为组合收益报告**
+- `intraday_1400` 里**不使用任何** csi300/000300/hs300 指数收益
+
+**需要托管控制腿的指标函数**（`evaluation.py:36-61`、`offline_race.py:107-121`）只接受单个 `selected` 帧 + 一个分数列，**没有无排序或随机排序腿的钩子** → 加负对照需要小改这两个函数的签名。
+
+---
+
+## 9. 实验优先级清单（接手者直接照这个做）
+
+按"每单位工作量能排除多少不确定性"排序。**前置条件：先解决第 2 节的环境阻塞（Python 3.12 + pandas，以及从运行主机取回数据）。**
+
+**一个重要的框架性提醒（本次审计新增）：P0–P12 大多是"把现有结论修正确"。但 3.6 的分解说明，即使全部修完，当前配置在结构上也不可能产生正净收益 —— Top2/Top10、每日全换手、纯多头、不做基准中性，光成本就是 20bp/天（年化 50.4%）。因此下面把 P00 放在最前面：它不是修 bug，而是换到一个成本量级不同的配置空间去搜索。**
+
+### P00 — 延长持有期 + 放宽 TopN（零建模工作量，预期收益最高）
+
+**唯一能改变数量级的杠杆。** 当前设计要求毛 edge ≥ 20bp/天（年化 50%）才能过零；h=10 时同样的年化换手成本降到约 5%。而基线的毛收益已经是 **+10.8bp/天**（`−9.21` 净 + 20bp 成本，见 10 节），只是被成本吃光。
+
+具体改动（**全部是现成参数，无需新代码**）：
+- `quant/daily_optimization_pipeline.py:322-323` 硬编码的 `--horizon 1` → 扫 h ∈ {3, 5, 10}
+- 同文件 `:30` 的 `TOP_N=2` → 扫 {5, 10, 20}
+- `quant/full_train_batched.py:1216, 1227` 已经支持这两个参数
+- 把 `intraday_1400/evaluation.py:143-144` **已经存在**的 `top_values=(5,10,20,30) × costs=(0.0,0.001,0.002,0.003)` 扫描接进判决（目前只写进诊断报告，从不设门槛）
+
+**为什么 Top2 特别糟**：Top2 在全主板上意味着**极端小市值、极端高波动的尾部**，同时把组合日波动推到 ~234bp/天，使单样本 MDE 高达 44bp/天（见 P00b）。
+
+### P00b — 把绝对门槛改成配对相对检验，并把已算好的 CI 接进判决（第二优先，解锁后续一切比较）
+
+**问题的精确形态：`quant/daily_optimization_pipeline.py:279` 的 `choose_next_branch(current, result)` 函数签名里根本没有 baseline 参数**，整个模块也从不加载基线指标 → 这个控制器**在代码层面无法表达"优于现有版本"**，只能表达"绝对达标"。而绝对门槛 `mean_return > 0`（`:282`）连在位冠军自己都过不去（`RESEARCH_ARCHIVE_20260810.md:315` 记录基线 `−9.21bp/天`，"Failed return"）。
+
+**四个门槛里只有两个是活的**（收益 > 0、回撤 ≥ −60%）：`mean_filled_names ≥ 1` 和 `positive_months ≥ 3` 在 225 天（≈10.7 个月）上是空门 —— 纯随机游走的期望正月数是 5.4，实测四个候选全部是 4，全部通过。
+
+**统计功效（解析估算，数据不在本机，用文档自报 CI 反标定）：**
+
+| 量 | 值 | 推导 |
+|---|---|---|
+| Top2 等权组合日波动 σ_p | **≈234bp/天** | σ_单票≈2.8%、ρ≈0.4、N=2 → `σ·√((1+(N−1)ρ)/N)` |
+| 单样本 SE（n=225 天） | **15.6bp/天** | 234/√225 |
+| 基线 `−9.21bp` 距零 | **0.59 SE** | **与 0 统计上不可区分** |
+| 单样本 MDE（80% 功效, α=0.05 双侧） | **≈44bp/天 ≈ 年化 110%** | 2.8×SE |
+| 配对差分波动 σ_diff | **≈152bp/天** | 由 `PLAN.md:239` 的 ±22bp CI（Top10, 180 天）反解：`22.3/1.96·√180` |
+| 配对 MDE（n=225） | **≈28bp/天** | |
+| 实测最大候选间差异 | **16bp/天**（基线 −9.21 vs 最好挑战者 −25.20） | **落在 MDE 之内 → 无法分辨** |
+| 检测 5bp/天 所需样本 | **≈7,020 交易日 ≈ 28 年** | |
+| 检测 20bp/天 所需样本 | **≈441 天** | |
+
+**`mean_return > 0` 作为统计判据，只能可靠识别年化 110% 以上的 edge；对任何现实幅度它就是抛硬币。用户"什么探索都超不过现有版本"的观察，在统计上等价于"什么探索都分辨不出差别"。**
+
+**基础设施已经存在且未被使用：**
+- `intraday_1400/offline_race.py:174-190` `compare_execution_records` **已经算出全部 21 对 pairwise 差分与 CI**（`right_minus_left_ci95`），**没有任何 `if` 读它**
+- `intraday_1400/shadow_leg_evaluation.py:130-135` 已经算出逐日成对 gain，`:154-155` 算出均值/正比率，**只缺 SE**，且该函数自标 `diagnostic_only: True`（`:200-202`）
+- 全仓 grep `ci95` / `"paired"` 只有 3 处命中（`evaluation.py:56`、`offline_race.py:183`、`:190`），**全是写进 JSON 的字段，无一被读**
+
+**要做的三件事：**
+1. `choose_next_branch` 接收 baseline 指标，判 `paired_mean_gain` 的 **CI 下界 > 0**，而不是判绝对 `mean_return > 0`
+2. iid bootstrap → **block / stationary bootstrap**（日收益有自相关和波动聚集，iid 会**低估** CI 宽度，真实 CI 比 ±22bp 更宽）
+3. `quant/scheduled_workflow.py:510` 的 `decision["promote"] = passed_count > 0` 必须改成 **BH 校正后**的判据 —— 见 P00c
+
+### P00c — 多重比较校正（当前为零，且晋级路径的族错误率约 64%）
+
+**搜索规模（代码可数的）：**
+
+| 来源 | 组合数 | 位置 |
+|---|---|---|
+| 短线网格 | ic(5)×top_n(5)×gross(3)×ridge_q(6)×pred_q(6)×naive(3) = **8100** | `watchlist_grid.py:120-138` |
+| 波段网格 | 4×4×4×3 = **192** | `watchlist_grid.py:139-144` |
+| 网格后 holdout 复测 | **top 20 各测一次，任一过即晋级** | `scheduled_workflow.py:472, 510` |
+| model_expansion 6 个评估器 | **31 臂** | `:490, 595, 764, 939, 1185-1187, 1513` |
+| 结构组合 holdout | 7 变体 → **21 对** pairwise | `structural_combo_holdout.py:271-279` |
+| 嵌套安全网格 | 3 h1 权重 × 3 风险剔除 × 3 窗口 | `fair_race_pipeline.py:1610-1622` |
+| 声明但从未评估的网格点 | **33** | `auto_research.py:21-61` |
+| 文档记录的实验轮次 | **17 轮**（1.2–1.18） | `INTRADAY_ASOF_1400_PLAN.md:58-450` |
+
+**校正：全仓为零。** 词边界全仓扫描（排除测试）全部 0 命中：
+```
+bonferroni  holm  benjamini  false_discovery  deflated  newey
+ttest  t_stat  p_value  pvalue  scipy
+block_bootstrap  stationary_bootstrap  reality_check
+```
+
+**最严重的漏洞在生产晋级路径**：`scheduled_workflow.py:440-452` 先在选择期跑 8100 组 → `:472` 取 `selection_best.head(20)` → 每一个都在**同一个 holdout** 上测 → `_select_promotion_trial`（`:372-384`）取**第一个通过**的 → `:510` `promote = passed_count > 0`。**20 次同 holdout 测试、任一通过即晋级、零校正。单次假阳性率 5% 时，族错误率 = 1 − 0.95²⁰ = 64%。** 而且 `:490` 把 `min_improved_horizons` 从库默认 2 **放松到 1**，`:1066` 把月胜率从库默认 2/3 **放松到 0.40**。
+
+**这一条与 P00b 合起来解释了一个表面矛盾：晋级门槛同时"太松"（族错误率 64%）和"太严"（绝对收益门槛连基线都过不去）。松的是相对晋级路径，严的是绝对研究门槛 —— 两套标准从不见面（见 3.3 C2）。**
+
+### P00d — 引入基准相对收益 / 市场中性评估（信息价值极高、实现成本极低）
+
+全仓词边界扫描，以下**全部 0 命中**：
+```
+hedge  benchmark_relative  alpha_vs_index  short_sell  index_future
+beta_neutral  market_neutral  vol_target  kelly  position_size
+covariance  risk_model  optimizer  cvxpy  scipy_optimize
+```
+
+**所有评估都是绝对多头收益，没有任何一处减去指数或行业收益。** 在一个 2018 年起、全程带 beta 的 A 股样本上，这意味着评估**主要在量测市场方向，而不是 alpha**。
+
+加一列指数收益、把评估改成超额收益，是**一次性数据工作**。**若超额为正而绝对为负，当前"全部为负"的结论完全改写。** 这与 P0 的市场等权腿是同一件事的两个层次（P0 是盘中 14:50→14:50，这里是日频），建议一起做。
+
+注：`quant/model_expansion_experiment.py:20-77` 的 `neutralize_target_cross_section` 是全仓**唯一**的中性化实现，`:270` 用它中性化**标签**（不是中性化组合），而这整条 shadow 路径**没有任何生产调用者**（6 个评估器 `:485, 589, 757, 931, 1179, 1507` 只被测试文件调用；只有 `_load_industry_metadata` / `_pit_industry_for_frame` 被 `intraday_1400/pipeline.py:430` 用于造特征）。
+
+### P00e — 打开从未被采样过的搜索维度（已有实现，零新代码）
+
+**被搜索过的维度（穷举）**：模型家族、模型融合权重、特征集合、分数阈值、TopN 与槽位权重。**只有这五个，且都是低产维度 —— 它们的 CI 全部跨零。**
+
+**有实现但从未在研究中变动过一次的维度：**
+
+| 维度 | 有实现的位置 | 为什么没被搜 |
+|---|---|---|
+| **股票池** | `quant/config.py:18-25` 定义了 `full_a / mainboard_active / hs300 / zz500 / zz1000` **五个池** | **每一条研究路径都硬编码 `MAINBOARD_UNIVERSE_FILE`**：`daily_optimization_pipeline.py:145, 327`、`target_ab_experiment.py:69`、`watchlist_grid.py:787`、`scheduled_workflow.py:92, 929`。`config.UNIVERSES[...]` 只被数据维护路径用 |
+| **流动性 / 波动率筛选** | `quant/backtest.py:130-133` 有 `turnover_quantile` 和 `volatility_quantile` | `_base_combos` 的网格（`watchlist_grid.py:118-144`）**不含这两个参数**，`_fast_combo_metrics`（`:304-392`）也不读它们 |
+| **持有期** | `full_train_batched.py:1216` 支持 | `daily_optimization_pipeline.py:322-323` 硬编码 `--horizon 1`；`promotion_decision`（`watchlist_grid.py:639`）对各 horizon 的 sharpe_gain **取平均** → 持有期是报告轴，不是决策变量 |
+| **换手预算** | `avg_turnover` 在 `watchlist_grid.py:388` 算出 | 只作报告字段和 `:457` `selection_score` 里 −0.05 的软权重，**从不作为约束** |
+| **调仓频率** | — | **无。永远每日重选** |
+| **组合构建** | — | **永远等权 TopN**（`daily_optimization_pipeline.py:261` `.mul(1.0/TOP_N)`；`backtest.py:147-152` `w = min(1/len(pick), max_weight)`）。无协方差矩阵、无优化器、无风险模型 |
+| **进出场时点 / 止损参数** | `ExecutionConfig`（`offline_race.py:13-26`） | `stop_loss=0.05 / take_profit=0.09 / trailing_arm=0.03 / trailing_drawdown=0.02` **全是硬编码常量，从未被网格化** |
+
+**建议**：把 8100 组的模型融合权重网格**砍掉 90%**（那些维度的 CI 全部跨零，纯属浪费搜索预算），换成 `universe ∈ {mainboard, hs300, zz500, zz1000} × liquidity_quantile × holding_period` 的小网格 —— **同样的计算量，搜索一个从未被采样过的空间。** Top2 在全主板上等于押注极端小市值尾部，切到 hs300/zz500 会**同时**改变成本、可买性和波动结构。
+
+### P0 — 负对照 + 市场基准腿（约 1 天，价值最高）
+
+**这一项的定位在本次审计后进一步收窄了：3.6 已经算出被选组合的毛收益是 `+3.4 ~ +10.2bp/笔`。缺的不是"策略是正还是负"，而是"同期市场是多少"。**
+
+要跑的三条腿，全部走完整 `selection → entry_buyable → −10% 填充 → 成本扣减 → evaluation`：
+
+1. **市场等权腿（最重要，也最便宜）**：同期全市场（或同一 codes-file 宇宙）**14:50 → 次日 14:50 等权毛收益**。这一个数字就能把 `+10.2bp/笔` 变成可解释的量。若市场同期 ≈ `+10bp`，则毛 alpha ≈ 0；若市场 ≈ `−10bp`，模型确有正 alpha。
+2. **random Top10**：200 次种子拿分布。
+3. **score-shuffle**：打乱分数但保留截面分布，200 次种子。
+
+需要小改的位置：`intraday_1400/evaluation.py:36-61` 和 `offline_race.py:107-121` 加一个"无排序/随机排序腿"的钩子（现在这两个函数只接受单个 `selected` 帧 + 一个分数列名，**没有任何位置能挂无排序腿**）。
+
+**判据：**
+- 若 null 的均值也是 −13 ~ −30bp/天 → **全部既有负面结论都是核算框架的输出，与特征无关，所有结论作废重来**
+- 若 null ≈ −20bp（纯成本）而策略 −30bp → 才说明模型真的在负向选股
+- 若市场等权毛收益 ≥ 策略毛收益 → **"分钟特征无增量"第一次拿到真正的支撑**
+
+### P0b — 去掉评估侧的 `entry_buyable` 限定（约 0.5 天，与 P0 并列）
+
+不改任何模型，只把三处限定去掉：`intraday_1400/pipeline.py:775`、`:1257`、`:651`。未成交槽位按 **0% 现金**记账（不用 `−0.10` 惩罚、也不整行剔除）。
+
+**这样"预测到买不进从而避开"第一次被诚实计入收益。** 文档自述分钟特征能预测可买性，此实验直接检验该能力有没有经济价值。
+
+### P1 — 统一尺子（约 0.5 天）
+
+1. 统一 Sharpe 为 `mean/std*sqrt(252)`，**删掉 `quant/backtest.py:53-66` 那个版本**，并**重跑所有历史结论**（`watchlist_grid.py:161-179` 同）
+2. 给 R2 加 `no_refill` 开关，让日更 grid 在**不回填 + 20bp 成本 + 不丢空仓日**下重测。**这一条很可能直接解释掉"日更最好"**
+3. `quant/backtest.py:38-42` `bt_cost_roundtrip()` 默认值从 0 改成 0.002
+4. 给 `quant/full_train_batched.py:1156-1163` 加一条**并列**的严格口径诊断，native 数只作历史对照并标注 invalid —— **native 数不该再出现在任何比较表里**
+
+### P2 — 重定价 −10% 惩罚（约 0.5 天）
+
+用仓库自己的 T+2/T+3 恢复证据（6/6、26/28，`INTRADAY_ASOF_1400_PLAN.md:405-409`）替换 −10%，改成滚动卖出（`quant/tradability.rolled_sell_close` **已实现**这个逻辑，日更侧在用，**盘中侧没用**）。
+
+对全部结论做敏感性表：惩罚 = {−10%, 实际 T+3 出清, rolled}。
+
+### P3 — 重做特征消融（约 1 天）
+
+**攻 D1+D2。** 冻结其它一切（同窗口、同成本 0.002、同 `_fit_variant` 超参、同标签），只改两处：
+
+1. 把 `intraday_1400/pipeline.py:720-760` 的单变量 `|corr|` 打分换成**模型内筛**（LightGBM gain 或 L1 路径），在**完整 103 个候选池**上选 40
+2. 把 `market_excess`/`market_rank` **从候选中剔除**（z-score 后与源特征等价，8.88e-16）
+
+**判据**：若增量从 `0.41bp/天` 跳到十几 bp 量级 → "无增量"是筛选伪影，需重开；若仍在噪声内 → "无增量"**第一次**拿到可信支撑。
+
+**分数特征侧同理**：同一次实验里同时满足 20bp 成本 + 固定日期的真 holdout + 配对 bootstrap + 关掉单变量 IC 筛选（或加一条"强制保留待测特征"的通道）+ 相同中性化口径。**只有这样跑出来的"无用"才值得信。**
+
+### P4 — 验证 bar 语义（约 10 分钟，但必须做）
+
+用一个盘中实时样本确认 `kline_time` 是起始还是结束。若是 END，14:50 标签有 5 分钟前视，**所有盘中结论都要重算**。这是 `INTRADAY_ASOF_1400_PLAN.md:473, :800` 自己列的未完成 Batch 0 项。
+
+### P5 — 修确定性 bug（约 0.5 天）
+
+1. `quant/factors/engineering.py:613-641` `neutralize_cross_section` 从回归自变量里**排除被回归的列本身**，停止自我消灭 `log_mv_total`
+2. 日更仓库加 `factor_version` 列，`fair_race_pipeline.py:219-224` join 时校验
+3. `quant/test_model_expansion_experiment.py:124-128` 的 `fetch_daily_batch(..., progress_offset=1, progress_total=4)` 与当前签名（`amazingdata_source.py:248-249`）不符，**必然 TypeError**
+4. `amazingdata_source.py:234` 加显式索引名检查 + `:244` 传显式 `format` + `NaT` 行显式处理 + 重复时间戳去重（`:316` 会抛异常）
+5. `engineering.py:608` 零方差日的处理（当前 std→NaN→fillna(0) 导致标志位静默失活）
+
+### P6 — 不完整日作为独立分层（约 0.5 天）
+
+把 `intraday_1400/pipeline.py:305` 剔除的 `is_complete=False` 行（停牌复牌日、半日市、异常竞价日）作为**独立分层**保留评估（而非并入主池），验证这个剔除是不是正在丢掉分钟特征唯一有效的状态区间。
+
+### P7 — 跨面板复权对账（约 0.5 天，唯一能从根本上改变结论的未闭环通道）
+
+在同一 `(code, date)` 上比较日线 prepared 面板与 `intraday_1400` 面板的 **qfq 价格与 `factor_version`**，确认赛跑不是在**两个不同价格空间**之间进行。
+
+背景：`quality.py:25` 只检查 `factor_version` 非空，**从不校验与日线一致**；`fair_race_pipeline.py:219-224` 的 inner join **无任何对账**。
+
+### P8 — 结掉 S1（约 10 分钟，只读）
+
+容器内列出 `window_cache/` 下 parquet 的 **mtime 与 key 分布**，与黑名单代码变更时间对比，确认在位腿是否仍在吃"黑名单之前"的缓存（见 7.1 S1）。
+
+### P9 — 补齐"在位配置 · 严格尺子"这一格（约 0.5 天）
+
+用在位 manifest 的 `champion_score_params`（`quant/scheduled_workflow.py:40-56`：`ridge_quantile=0.55, ic_weight=0.03, top_n=2`）覆盖 `quant/target_ab_experiment.py:63-88` 的 `_train_cmd`，跑 `--eval-only` 或全量三腿。见 6.1。
+
+### P10 — 写 `paper_trades.jsonl` 聚合器（约 0.5 天）
+
+把 V1–V5 的**真实成交**变成可用前向证据。目前这份数据在采集但**没人读**（`realtime/paper_trader.py:227-276` 是唯一读者且只算 markout；`restart.sh:105-108` 引用的 `check_paper.sh` 不存在）。
+
+**这是最有说服力的证据类型 —— 比任何回测重跑都强。**
+
+### P11 — 板块限幅（约 0.5 天）
+
+按代码前缀分流阈值：主板 ±10%、科创 688/创业 300 ±20%、ST ±5%。当前**全部路径用单一硬编码阈值**，前缀逻辑零命中。
+
+### P12 — 检查日线路径是否也有 `market_excess` 类死代码
+
+D2 的教训可推广：**任何"减去当日截面中位数/均值"的特征工程，在后续按日 z-score 下都是 no-op。** 日线路径尚未查。
+
+### P13 — 修 4 处未加成熟度门的 `fillna(-0.10)`（约 1 小时，量级极大）
+
+`intraday_1400/pipeline.py:660`（`_evaluate_close_baseline`）、`:790`（`_realized_leg_metrics`）、`:1269`（`rolling_validate`）、`evaluation.py:43`（主指标函数）把**未成熟标签**当成 `−10%`；`evaluation.py:87` 只按 `entry_buyable` 过滤、**无成熟度门**。
+
+正确参照就在同仓库：`offline_race.py:218-247` 的三分支（不可买→0 / 可买不可卖→−10% / 可买未成熟→NaN）。**这 4 条路径系统性偏低，单笔偏差量级 −10%，是全仓最大的单点记账错误。** 修完必须重跑所有经过这些函数的历史结论。
+
+### P14 — 把 `0.005` 平板容差改成比例（约 30 分钟）
+
+`intraday_1400/pipeline.py:108`、`:141`、`features.py:339`、`offline_race.py:301` 的 `abs(high−low) <= 0.005` 是**绝对元值**。改成 `<= 0.0005 * previous_close` 之类的比例口径（或直接用 tick size 的整数倍）。见 3.6 末段的股价对照表 —— **低价股被系统性误判为不可买，方向向下。**
+
+### P15 — 接上 `signal_locked_up_1400`，或删掉它（约 1 小时）
+
+`features.py:339-341` 算出来，**全仓零消费者**。真正生效的 `signal_eligible`（`pipeline.py:317-321`、`features.py:344-348`）**没有涨幅上限也没有流动性下限**，所以 `INTRADAY_ASOF_1400_PLAN.md:231` 声称的"14:00 涨幅低于 4.5%"规则**根本不存在**。二选一：接进 `signal_eligible`，或把文档里那条声明删掉。**当前状态是文档与代码不一致，会误导所有后续读者。**
+
+### P16 — 确认容器内 pandas 版本，若是 1.x 则所有变体赛跑作废（约 10 分钟检查）
+
+`intraday_1400/fair_race_pipeline.py:343-362` 先 `panel.copy(deep=False)` 再赋列 → 在 **pandas 1.1.5**（本环境实际安装版本）上写入**回传父 panel**，于是 `:476-477` 的变体循环里训练标签**跨变体互相污染**。`requirements.txt` 钉 pandas>=2.0（2.x 上不会发生）。回归测试 `test_intraday_1400.py:931-943`。
+
+**先查生产容器的实际版本。若是 1.x → 所有分钟变体赛跑结果都必须重跑。这是能让"分族消融表格"整张作废的开关。**
+
+### P17 — 给 E4/H1/H2 补上行级发布时间，而不是去改那个硬编码（约 30 分钟 + 一段等待期）
+
+**本条已按第二轮审计整体重写（原版判为"结构性死锁 / bug"，判错了）。**
+
+`structural_combo_holdout.py:332-333` 的 `"daily_history_causal": False` 是**刻意的诚实标记**，配套 `:313-333` 的 `daily_history_caveat` 字符串明说"日更依赖变体仅供诊断"。`auto_research.py:63-68` + `:201-208` 据此**只**排除 `DAILY_HISTORY_DEPENDENT_VARIANTS = {e4_daily_top10, e0_e4_staged_combo, h1_daily_top100_structural_rerank, h2_daily_top100_buy_filter}`；三个纯分钟变体（`e0_direct` / `e1_e3_structural` / `e0_e3_minute_block`）不受影响，可正常竞选。**所以不要去把它改成 `True`——那会把一个已知不可信的输入洗白。**
+
+正确动作是消除根因（见 §5.9）：`dual_paper_evaluation.py` 已经实现了带 14:50 截止校验的不可变发布快照（`:60-65` 越线即 `raise`、`:89` 拒绝改写），只需让它开始逐日落账，积累 60 个交易日后，E4/H1/H2 才第一次具备可审计的因果历史。在那之前这四个变体的数字（`plan:1002-1008` 的 E4 −84.88bp/天等）只能读作"量级参考"，不能读作"已被证伪"。
+
+顺带仍应清理三处惰性字符串（**从不被任何代码读取**，纯装饰）：`structural_combo_holdout.py:407` `"consumed_for": "branch_selection_only"`、`:418` `"holdout_reuse_forbidden": True`。
+
+以及：`auto_research.py` 的 manifest **没有 state_hash 自校验**（对比 `direct_return_experiment.py:646-656` 和 `daily_minute_enhancement.py:527-528` 都有）→ 手改 `manifest.json` 删掉 `consumed_holdouts` 条目**不会被发现**；删除或迁移 `--state-dir` **静默重置整个账本**（`:138-156`）。
+
+### P18 — 统一成本口径到单一真源（约 1 小时）
+
+三处不一致，任何一处都能让"冠军参数"是在**无成本世界**里选出来的：
+
+| 位置 | 问题 |
+|---|---|
+| `quant/backtest.py:38-40` `bt_cost_roundtrip()` | 默认 `"0"`，只有 `docker/scheduler_jobs.sh:19` 才 export 0.002 |
+| `quant/target_ab_experiment.py` | docstring `:10` 说 0.002，实际走 `:162` 的环境变量 → **缺 export 时静默零成本** |
+| `quant/watchlist_grid.py:380-383` | 同上 → **8100 组网格可能是在零成本下搜的** |
+| `quant/sentiment_feature_experiment.py:211-215` | 硬编码 `cost_roundtrip=0.0` 且 `filter_untradable=False` |
+
+另外 `quant/backtest.py:144-145` 的 `if pick.empty: continue` **整天丢弃**，是**非随机删失** —— 最难买的日子被系统性剔除，方向乐观。
+
+### P19 — 修 `offline_race` 的"一只 NaN 作废整天"（约 1 小时）
+
+`intraday_1400/offline_race.py:142-144` 的 `grouped["outcome_observed"].all()` 使**任一 NaN 让该模型当天整日作废**，而门槛检查的正是 `days == 60` / `== 20`（见 3.2 B3）。改成**按可观测子集计算 + 独立记录删失率**。
+
+同时：`fill 0.46–1.39/10` 的实验结果（`RESEARCH_ARCHIVE_20260810.md:112-115, 131, 158`）**不应参与比较** —— 86–95% 是现金，比较的是现金比例不是选股。要么先修 fill，要么改成"已成交部分的条件收益 + 独立的 fill 率报告"两个数分开报。
+
+### P20（第二轮新增，优先级紧随 P00b）— 修 `_evaluate_recipe_frames` 的非共同宇宙（约 1 小时）
+
+`fair_race_pipeline.py:1772-1775` 把 `predictions` 字典**逐个模型**传进 `simulate_fixed_exit_race`，配合 `offline_race.py:141-144` 的整日作废逻辑，**每个模型作废的是不同的天** → `:1827-1838` 的内层配方选择与 `:2008-2012` 的外层头对头都在**不同日期集合**上比 `mean_return`。
+
+改法：与其余 5 个调用点（`:775`、`:1205`、`:1376`、`:1552`）对齐，**一次性把整个字典传进去**。这是本轮成本最低、对"哪个配方/哪个头更好"这个判决影响最直接的修复 —— 它与 P00b（配对相对检验）是同一件事的两半：P00b 修统计，P20 修被统计的样本本身。
+
+### P21（第二轮新增）— 给 `run_screened_rolling_race` 补 `signal_eligible`（约 15 分钟）
+
+`fair_race_pipeline.py:758-779` 直接在完整合并面板上排序，另 5 个入口都先过 `signal_eligible`（`:1125`、`:1369-1371`、`:1545-1547`、`:1951-1953`、`:1993-1995`）。补齐前，**该入口的数字不可与其他入口并列**。
+
+### P22（第二轮新增）— E4 路径补覆盖率仪表 + 换权威交易日历（约 2 小时）
+
+两件事必须一起做，否则任何"日更分数作为盘中先验"的重测都不可解释：
+
+1. **权威日历**：`structural_combo_experiment.py:190` 与 `structural_combo_holdout.py:247` 都从面板自身 `unique()` 推日历。缺一个交易日就让先验静默陈旧 >1 session。改为外部交易日历，并**断言无缺日**。
+2. **四处覆盖率埋点**：`structural_combo.py:141`（`next_date` 映射 + `dropna` 前后行数）、`structural_combo_experiment.py:193-198`（两道过滤的保留率）、`structural_combo.py:195-200`（Top100 闸门后实际名字数；那里是 `how="inner"`，`validate="one_to_one"` 只抓重复键不抓丢行）、以及日历完整性断言。
+
+**做完之前，`plan` 里 E4 的 −42.87bp / −84.88bp 只能读作"某个不知道候选池有多大的臂的输出"。**
+
+### P23（第二轮新增）— 把黑名单对"分数形状"列名的缺口用**定向前缀**补上（约 30 分钟）
+
+`engineering.py:522-552` 与 `features.py:370-380`、`fair_race_pipeline.py:144-151` 都不禁 `pred` / `score` / `prior` / `e4`。**当前不发作**（E4 只在排序阶段被事后消费，从不进 `_fit_four_model_head`/`_fit_four_classifier_head`），但这是"有人真把模型分数当特征喂进去"时第一道会失守的护栏。
+
+**关键约束：不要用"凡含 `score` 一律禁"** —— `features.py:328-329` 有合法工程特征 `rule_score` / `rule_score_chg_5`。正确做法是加定向前缀（`e4_`、`prior_`、`daily_pred_`），或在建头边界处改成显式白名单。
+
+### P24（第二轮新增）— sentiment 链：先修"衰减不衰减"与 `fillna` 顺序，再谈结论（约半天）
+
+在这两处修好之前，**`sentiment-factor-ablation-negative` 这个判决不具备任何证据地位**（它还关掉了一个周期性 Qwen 任务）：
+
+1. `sentiment_feature_experiment.py:178-181` 把 `fillna(0.0)` 移到**截面 mean/std 之后**，或把无新闻股票从截面中排除；
+2. `:102-107` 的衰减列加 shrink 项（照 `sentiment_signal.py:182-183` 的做法），否则静默期比值精确不变；
+3. 补覆盖率门（照 `daily_update.py:250-251` 的写法），并在标注覆盖率低于阈值时**直接拒绝出结论**，而不是输出一个注定为负的数；
+4. 断言 `confirmation_predict_start > selection_end`（现在没有，`test_sentiment_ablation_experiment.py:58-63` 自己就传了更早的）；
+5. `_available_date`（`:38-45`）补午夜戳测试，并把 +1 自然日改成 +1 交易日。
+
+### P25（第二轮新增，与 P00 并列最高优先）— 落一份权威交易日历，并把所有"按天"改成按日历（约半天）
+
+这一条同时解掉 §5.13 与 §5.14，而且**它是 §5.12 之外唯一会同时影响标签、持仓期与实盘平仓三处的系统性口径问题**：
+
+1. **落盘**：`TRADING_CALENDAR_FILE` 在全仓库只有 `realtime/reference.py:286-312` 一处 `getattr`，`trading_calendar.parquet` **零写入者**。加一个写入者（`akshare` 的 `tool_trade_date_hist_sina` 或任何 exchange-calendar 包），并把兜底 `weekday() < 5` 改成 **缺日历即 raise**，而不是静默降级。
+2. **实盘影响立即可见**：`paper_trader.py:420`、`v2.py:118`、`v3.py:341` 当前跨春节/国庆把持仓天数**高估 5–7 个交易日 → 提前平仓**。
+3. **日线链改按日历位移**：`engineering.py:482`（目标 `shift(-horizon)`）、`:487-497`（`open` 成交口径）、`:156-192`（全部技术因子 rolling / pct_change）、`tradability.py:29-48, 99` 都是**行位移**。停牌 10 日时 `shift(-5)` 实际跨 15 个交易日，**停牌期间下跌被无代价跳过**（方向乐观）。
+4. **把 `risk_trading_gap_days` 从盘中链移植到日线链** —— `intraday_1400/features.py:274-281` 已有实现，日线链完全没有。
+5. **顺带修 purge**：`_purged_end`（`full_train_batched.py:226-236`）的 `unique()` 是全窗口所有股票的**日期并集**，停牌票的个体第 h 个后续交易日可能晚于面板第 h 个日期 → purge 不足。~~且 `--purge-horizon` 是 `action="store_true"` 默认关闭（`:1251`），`scheduled_workflow.py` **未传**。~~ ⚠️ **本轮更正**：`scheduled_workflow.py:958` **是传的**，但被包在 `if _uses_rolling_training(args):` 里，与 `--rolling-factor-select` 同生共死于同一个 manifest 布尔 → 日更究竟有没有 purge **取决于 §7.1 S10 那个读不到的布尔值**，详见 §4.5.4。
+6. **把情绪因子的 `freq="D"` 改成交易日**（`sentiment_feature_experiment.py:96-122`，半衰期被稀释约 40%，见 §5.18），与 P24 第 5 条合并做。
+
+### P26（第二轮新增，回答"结论是否置信"的关键一条）— 量化生存者偏差（约 1 天）
+
+§5.12 是**唯一一个方向明确乐观、且量级可能达到年化数个百分点**的偏差，因此它直接决定 §1.1 第一条判定「不可盈利 —— 成立」到底是被高估还是被低估。**注意方向：它使在位者的历史表现被高估，因此修掉它只会让"全部为负"更负，不会救回任何策略 —— 但它会改变"日更相对候选好多少"这个比较。**
+
+三步，全部只读或只增不改：
+
+1. **先证实 S9**（10 分钟，最高性价比）：生产主机上比对 `quant_data/price/` 的 parquet 数量与 `mainboard_active` 文件行数。若 `price/` 明显更多 → 已退市票的数据还在，说明**不指定 universe 文件的研究路径反而更诚实**，那么"研究跑不出生产分数"里有一部分是口径差异而非模型差异。
+2. **从现在起按月落 PIT 快照**（作者自己在 `build_dataset.py:18-22` 就写了这条，只是从未实现）：把 `datafeed.py:154-175` 从覆盖写改成**追加日期分区**，`full_train_batched.py:799-800` 按窗口起始日取当时的快照。历史无法回补，所以越早开始越好。
+3. **拿外部退市名单做一次上界估计**：把已退市个股按其退市前 250 个交易日的收益补回面板，重跑一次 `top_n=2` 的回测，两者之差即偏差量级的上界。
+
+同时**修正文档**：`RESEARCH_ARCHIVE_20260810.md:15` 的 "A-share point-in-time data" 与 `:71` 的 "stable universe hashes" 目前会让任何读者误以为宇宙是时点正确的。**哈希稳定只保证可复现，不保证时点正确。**
+
+### P27（第二轮新增）— 修数据完备性闸门的四个漏洞（约 2 小时，其中一处是 10 分钟的笔误）
+
+按性价比排序：
+
+1. **10 分钟**：修双重转义 bug —— `scheduled_workflow.py:319` 写出的是字面 `\n` 两字符，`daily_update.py:530` 匹配的是字面串 `"\d{6}"`。照 `refresh_qfq.py:111-121` 的正确写法改。**当前段错误后的缺口恢复路径从未生效过**（解析出 0 个代码 → 打印 `codes=0` 返回 0 → `:806` 覆盖率没变化 → 抛错拒绝训练）。
+2. **20 分钟**：把 `_price_freshness`（`scheduled_workflow.py:287-311`）挪到**成功路径上**也调用。现在 `:751-753` 是 `if rc == 0: return`，覆盖率检查只在 `rc in (-SIGSEGV, 139)` 分支内（`:764`、`:806`）。→ **`daily_update` 正常返回 0 但大量票停在旧交易日时，训练直接开跑，零闸门。**
+3. **5 分钟**：把 `MIN_COVERAGE = 0.85`（`:768`）提到 0.98 以上。当前允许约 450 只票停留在旧交易日仍继续训练。
+4. **10 分钟**：`check_daily_update.py:51-53` 的 `codes[:args.sample]` 改成**随机抽样**（并固定 seed 记录）。`datafeed.universe` 返回 `sorted(...)`，默认 `--sample 20` → **永远只查同样最小的 20 个代码，剩余约 3000 只从不被检查**，结构上无法发现"某些票从没拉过"。
+
+### P28（第二轮新增）— 补退市 / ST / 退市整理期处理（约半天）
+
+全仓库 grep `delist_date|end_date|last_trade|终止` **无任何按股票存储的退市日期**；`tradability.py` 全文 137 行无退市概念；退市整理期（30 交易日、首日不设涨跌幅）零处理；`mainboard_active` 无 ST 筛选（`datafeed.py:149` 只看名称含「退」）。至少要做到：
+
+- 存一份 `delist_date` 并在标签构造时**把退市前的真实暴跌保留下来**（现在被 `engineering.py:482` 越界 NaN + `:700` dropna 丢掉）；
+- **加 ST 判定并把封板阈值按板块/状态参数化** —— 现在 `tradability.py:102-103` 硬编码 ±9.5%，仓库自己在 `:7` 和 `:94` 两处注释里承认"ST ±5% 为已知盲区"。后果是 ST 股 +5% 封板被当作可自由买入、−5% 跌停被当作可自由卖出。UI 侧已有 `candidate_eval.py:132` 的 `4.8 if "ST" in name else 9.5`，把同样的判据下沉到 `quant/` 即可；
+- **加上市日期字段**（全仓库目前零处），并对上市首日 / 无涨跌幅限制日单独标注 —— 这两类日子上 ±9.5% 判定直接是错的。`INTRADAY_ASOF_1400_PLAN.md:509, 774, 796` 已有计划文字，日线链未实现；
+- **把盘中链的停牌建模移植到日线回测** —— `offline_race.py:362, 369` 已有 `suspended_t1_blocked` / `suspended_t1_roll`，而日线侧 `rolled_sell_close` 只在跌停时顺延，**停牌日的卖出按陈旧收盘价成交**；
+- **补 `risk_amount_vs_median_20` 的 `shift(1)`**（`intraday_1400/features.py:295-299`）—— 兄弟实现 `:363-366` 有，这一处没有，两族特征因此不可并列；
+- `full_a` 池（`datafeed.py:183`）连「退」都不过滤且含北交所 4xx/8xx，与 `mainboard_active` 口径不一致 —— 要么统一，要么在 CLI 上标注它不可用于回测；
+- 指数池（`datafeed.py:40-55`）的 `ak.index_stock_cons` **两条路径都没有日期参数** → 返回调用当日成分。用今天的沪深300 成分回测 2018 年等价于用已知赢家名单。生产 cron 目前不用，但任何 `--universe hs300` 的研究都无效，应在代码里直接 raise 而不是静默返回今日成分。
+
+### P29（第二轮新增，**10 分钟，且是唯一一条会让日更发布整体失败的缺陷**）— 修 `run_short_grid` 的 `UnboundLocalError`
+
+```python
+# quant/scheduled_workflow.py:144-160
+    try:
+        _grid, best = watchlist_grid.run_grid(...)
+    except Exception as e:  # noqa: BLE001
+        print(f"[short_grid] 失败（保留原参数）：{type(e).__name__}: {e}", flush=True)
+    if best is None or best.empty:      # ← best 只在 try 内部被绑定
+        return None
+```
+
+`best` 只在 `try` 成功时才存在 → **任何网格异常都变成 `UnboundLocalError`**，注释承诺的「保留原参数」**从未生效过**。更糟的是调用点 `:1180` 落在 `:1174` 那个 try 里，其 `except`（`:1188-1189`）把一切重新包装成 `RuntimeError(f"无法读取 incumbent 参数，拒绝发布以避免策略漂移: {exc}")` → **一次网格失败会中止整个日更发布，并报出一个完全误导的原因**。修法：把 `best = None` 提到 `try` 之前，或把 `return None` 挪进 `except`。
+
+### P30（第二轮新增，**直接回答用户原问题的那一条**）— 重做所有"特征无用"的判定
+
+在做完下面两件事之前，任何基于 Ridge 单列系数或单变量 IC 的"无用"判决都不可采信（理由见 §4.5，两个互相独立的失效机制：拟合前的单变量筛选、拟合后的特征族稀释）：
+
+1. **先结案 S10**（10 分钟）：确认日更是否开着 `--rolling-factor-select`。开着，则 `max_ic_corr=0.85` 的去相关已经生效，系数可读性大幅改善；没开，则系数不可读。
+2. **改成按特征族汇总**：族和（sum of coefficients within a highly-correlated family）或 grouped permutation importance。实测族和的自助标准差 0.00016 vs 单列 0.00145，**差 9 倍**；8 个克隆的最大单列系数 0.00395 **低于**一个独立弱特征的 0.00513 —— 只看单列会得出完全颠倒的排序。
+
+### P31（第二轮新增）— 把 `rule_score` 从特征集里摘掉重跑一次，分离模型 alpha 与规则 alpha
+
+`rule_score` / `rule_score_chg_5`（`engineering.py:192-193`，由 `:563-570` 收编）同时是**特征**、**朴素融合腿**（`watchlist_grid.py:214-217,268,326`，`naive_weight ∈ {0,0.1,0.2}`）、**组合阈值**（`backtest.py:134-142`，仅离线链）。`naive_weight > 0` 时两种 alpha **在算术上不可分离**。做法：去掉这两列重训一次，与在位对比；若分数不降，说明模型学到的相当部分就是那 10 条人工规则。
+
+### P32（第二轮新增）— `_metrics` 改逐日，且两条腿报同一个切分
+
+`model.py:184-198` 用**池化** Spearman + 池化 80 分位；`:404` Ridge 报的是 **valid**，`:688` Ranker 报的是 **test**。实测池化 0.0224 vs 逐日均值 0.0267，250 天里 183 天对池化 top-20% 贡献 0 只，前 10 天独占 20% → **它度量的是"选日"而不是"选股"**，对 lambdarank 尤其失真。**这很可能就是 `lgbm_weight` 被定在 0.85–1.0 的来源。** 两处都改成 `groupby("date")` 后取均值，并统一报同一个切分。
+
+### P33（第二轮新增）— 三个口径修正，都是小改动但都面向用户可见
+
+1. **swing horizon 标签错**：`TRAIN_STYLE_ORDER`（`scheduled_workflow.py:83`）把 swing 排除出训练，`--swing-horizon 10`（`:1074`）永不进训练，但 `publish_active_models:693` 仍写 `prediction_horizon=10`，`quant_signal.py:673-674` 把 h=1 的 `ridge_pred` 当"10 日预期收益"展示给用户 → **约 10 倍口径错配**。要么真训 h=10，要么把标签改回 1。
+2. **把 `lgbm_weight` 加进网格**：`FINAL_TRADE_STYLES`（`:40-73`）无该键 → 落 CLI 默认 0.85（`:1082`）；`_base_combos` 无该列 → `_fast_combo_metrics:311-312` 直接用把 0.85 烧进去的 `base_pred`。数值上两条等 IC 腿最优是 0.5，w=0.85 损失 1.9–7.3% 混合 IC；IC=0 且 ρ=0.6 的腿把 1.000 拖到 0.912。`selection_score`（`:435-459`）不以 IC 为目标，**结构上不可能发现这件事**。
+3. **影子腿权重要么接进网格要么删掉**：`elastic_z`/`catboost_z` 是有意的影子腿且**确实被下游消费**（`watchlist_grid._score_pred:205-210`、`quant_signal.py:613-616`），但网格从不搜索它们的权重（只有 `run_grid(catboost_weights=...)` 这个显式入口，仅两个实验脚本用过）→ "加 CatBoost 没效果"的观测**不是模型结论，是搜索空间结论**。
+
+### P34（第二轮新增）— 标签"可见时点"三修，其中一条只需改一个旗标
+
+对应 §5.21，按性价比排序：
+
+1. **一个旗标（5 分钟）**：`--refresh-months` 从 1 改到 **≥ 2**（`scheduled_workflow.py:1075`）。这同时解掉两件事：每月末 `horizon` 天标签永久 NaN（h=1 时约 **4.8% 的行**，且系统性集中在月末），以及缓解 qfq 重建后历史标签被冻结的问题。
+2. **半小时**：`ann_date` 缺失时**丢弃该行**，不要退化为 `report_date`（`engineering.py:227-229`、`:296-298`；上游 `datafeed.py:246-251`）。当前兜底让财报提前 1–4 个月可见，影响 20+ 个基本面特征，**方向明确乐观**。同时加一个"退化了多少行"的计数打印，否则修完也不知道原先污染了多少。
+3. **半小时**：把 `price_source_signature` 加回 baseline 腿的 recipe（`full_train_batched.py:721-723` 那个 `if train_target_mode != "baseline":` 豁免）。现在复权基准变了缓存也不失效 —— 这是 §7.1 S1/S8 的第三个侧面。若担心一次性全量重训成本，至少加一条"复权版本与缓存不符"的告警。
+4. **顺带**：把当日龙虎榜 / 大宗交易计数（`engineering.py:285`、`:477-480`）**后移一天** —— 它们约 18:00 才披露，当前进当日特征是乐观的。复权因子拉取失败时（`amazingdata_source.py:288-291, 309-311, 363-365`）**改为 raise**，不要静默写未复权价。`buyable_*` 在 OHLC 缺失时的默认值从 `True` 改为 `False`（`tradability.py:127-133`）。
+
+### P35（第二轮新增，**P00 的前置条件，做 P00 之前必须先做**）— 让 horizon 扫描不被 purge 掐死
+
+对应 §5.22(f)/S19。P00 的第一条是"延长持有期"（把 horizon 从 1 扫到 3/5/10），但当前配置下这件事**做不出可信结果**：
+
+1. `validation_months` 默认 1（约 21 交易日），h=10 时 purge 吃掉 10 天 → 验证段只剩 **11 天**，早停轮数基本是噪声；h=15 只剩约 6 天。**扫 horizon 时必须同时把 `validation_months` 提到 2–3。**
+2. 加一条"purge 后验证段短于 N 天"的**告警**（当前唯一兜底是整窗跳过，`full_train_batched.py:810-814`，不是缩窗告警）。
+3. 让 `--purge-horizon` 能在 `scheduled_workflow` 里**单独启用** —— 现在它和 `--rolling-factor-select` 被打包在同一个 `cmd.extend`（`:955-961`），想只开 purge 做对照实验在 CLI 上做不到。
+
+**注意本条的量级判断**（比第一轮的直觉温和得多）：purge 关闭对 **h=1 的现役短线腿几乎无害**（只有 1/499 ≈ **0.2%** 的训练日期标签伸进验证段，且 Ridge 无早停）。真正伤人的是 h=10 —— 而 h=10 的波段腿**从来没被训练过**（`TRAIN_STYLE_ORDER` 排除 swing，§4.6 S9）。所以 **purge 不是"现役成绩虚高"的解释，而是"P00 会不会白做"的前置条件。**
+
+### P36（第二轮新增，30 分钟）— 三个"标签正确性不进哈希"的口子一起补
+
+1. `_purge_span("tradable-label", h)` 改成 `h + cap - 1`（`full_train_batched.py:228-229`；同时改 `test_model_expansion_experiment.py:1398` 的断言）—— 当前短 2 个交易日，占 1 个月验证段的 10%（S16）。
+2. `QUANT_BT_SELL_ROLL_MAX_DAYS` 加进 `recipe_params`（`:698-723`）—— 它改变标签却不进任何哈希，改完重跑会静默命中旧缓存（S17）。
+3. purge 改为**逐股**（按 code 的自身行）或统一走交易日历，而不是只按面板日期并集 —— 停牌股当前会穿透边界（S18，估计 <0.5% 样本）。
+
+### P37（第二轮新增）— 作废所有出自 `pipeline.py` 的历史结论
+
+`pipeline.py:149-152` 不传 `train_end`（落 70/30 切点）且 `predict_start=None` → `predict = valid` → 早停的 `eval_set` 与最终评估集是同一批数据（S21）。它不在调度链上，所以**不影响现役**，但 `RESEARCH_ARCHIVE` 里任何据它得出的比较都要重跑。修法：给 `train_all`（`model.py:1024-1031`）无条件转发 `valid_end`/`predict_start`，而不是只给 4 个树腿。
+
+### P38（第二轮新增）— 重建因子候选清单，或至少把它当负对照
+
+`factor_selection_lh1000_cont` 在仓库里**没有生产者**（S14），而每窗滚动选择只能在它的子集内重挑（S15）→ 全部窗口的特征宇宙都由全历史 IC 筛出。做法：先做 S14 那个 10 分钟检查确认它是冻结的手工产物；然后**逐窗重建候选清单**（只用该窗训练段），与现状对比 IC 落差 —— 这个落差就是"CV 外做特征选择"贡献的乐观偏差。同时给 `select.daily_ic` 和 `train_catboost_ranker` 加 `label_col`（S20），否则 `open-label`/`tradable-label` 腿的因子选择和 CatBoost 腿一直在用收盘-收盘标签。
+
+---
+
+## 10. 关键数字速查表
+
+| 数字 | 含义 | 出处 |
+|---|---|---|
+| **+1.62%/天, Sharpe 264** | 在位日更 native 诊断，**已被明确标注 invalid** | `RESEARCH_ARCHIVE_20260810.md:50` |
+| **−4.78bp/天, Sharpe −1.80, 成交 0.79/10** | 同一份 active 分数，严格口径（固定 T+1 14:50 退出） | `INTRADAY_ASOF_1400_PLAN.md:374-378` |
+| +4.60bp/天, Sharpe 1.41, 成交 1.01/10 | 原始分钟 bar 自适应退出（但 1610 个名额买不进） | `:397-401` |
+| **−42.87bp/天, Sharpe −4.97** | 日更分数作为 E4（T−1 先验）全市场 26 日 | `:439-444` |
+| −0.2967%/天 | 收盘参照，三方共同池 175,453 行 | `:145` |
+| −1.4002%/天 | base 模型 Top10，同池 | `:145` |
+| −0.7013%/天 | 分钟增强，同池 | `:145` |
+| −0.2910%/天, −53.26%, Sharpe −2.06, 91/32 | 因果 as-of 控制，四窗口 240 日 | `:196-203` |
+| −0.2990% / −0.2909% | E1 cash-complete / h1 25% 融合 | `:231, 233` |
+| **−30.06bp/天, 复利 −17.56%, Sharpe −2.34, MDD −24.22%** | 一次性 60 日封存 holdout，100% 成交，无正 20 日块，`forward_shadow_eligible=false` | `:1033` |
+| **+0.41bp/天, CI [−22.14bp, +22.45bp]** | 分钟增量 —— **CI 半宽 ≈ 效应的 50 倍** | §1.8 |
+| +13.60bp/天 | 400 股试点（**已被 §1.18 全市场 −13.31bp/天 推翻**） | §1.17 |
+| +13.86bp/天 | 十日校准（**已被 plan:983 因果泄漏审计降级为无效**） | §13.1 |
+| −84.88bp/天 | E4（日更分数作盘中先验） | §13.1 |
+| **−9.21 / −25.20 / −27.25 / −28.97 bp/天** | 四个纯日线严格候选（open-buyin Ridge / +LGBM20% / +ExtraTrees20% / +RF20%） | `RESEARCH_ARCHIVE_20260810.md:313-318` |
+| −21.96 / −41.17 bp/天 | 目标重设计 | `:96-97` |
+| −8.50bp/天, 成交 1.19/10 | 日更 as-of 基线 | `:112` |
+| −5.04bp/天 | payoff v1 | `:157` |
+| 137 笔 −18.98bp/笔 → −60.14bp/成交笔 | 计入 6 次不可卖前后 | `INTRADAY_ASOF_1400_PLAN.md:383` |
+| 34 次事件 = −18.89bp/天 拖累 vs +0.07bp/笔 收益 | −10% 惩罚支配信号 | 见 3.2 B2 |
+| 6/6 日更、26/28 分钟不可卖仓位在 T+2/T+3 恢复 | 惩罚过苛的自证 | `:405-409` |
+| 37 笔 | 固定标签把实际可成交的日更持仓误判为不可买 | `:407` |
+| 103 → 40（删 61%） | 分钟特征候选池 → 入模，全按单变量 corr | 见 4.3 D1 |
+| 8.88e-16 | `market_excess` 与源特征 z-score 后差异 → **死代码** | 见 4.3 D2 |
+| 2.170e-15 | `log_mv_total` 中性化后残差 std（原 1.2008）→ **自我消灭** | 见 5.5 |
+| 0.4286 → ~0.30, True → False | 仅加成本导致的月胜率与晋升决策翻转（2026-07-25） | `docker/scheduler_jobs.sh:16-18` |
+| 20 股 26.3s … 800 股 66.9s | **数据厂商延迟基准**（非绩效），据此选 batch 800 | `INTRADAY_ASOF_1400_PLAN.md:39-50` |
+| 126 PASS / 0 FAIL | **回归测试通过数**（非收益） | `realtime/README.md:413` |
+| ~33 个交易日 vs 60 天 holdout | 分钟侧训练窗口 —— 真实劣势 | 子代理 `ad9c336f4d579584e` |
+| 33 声明 / 0 评估 | 网格点 | 同上 |
+| 48 bars/天（24+24） | fixture，首 09:30 末 14:55，与 SDK 实测行数一致 | `test_intraday_1400.py:121-123`、`plan:461-462` |
+| 36 根 | 到 13:55 cutoff 的完整日 bar 数 | `test_intraday_1400.py:162-166`、`features.py:156-157` |
+| 99.92% | `minute_feature_finite_ratio` 实测（门槛 ≥0.95） | `quality.py:37` |
+
+**本次审计新增的分解与功效数字（3.6 与 P00b）：**
+
+| 数字 | 含义 | 出处 |
+|---|---|---|
+| **−18.98bp 成本 + −13.33bp 惩罚 + (+3.21bp 毛) = −29.10bp/天** | 固定 T+1 退出的**逐位精确分解** | 见 3.6，源数据 `plan:198` |
+| **−19.79bp 成本 + −1.12bp 惩罚 + (+10.10bp 毛) = −10.81bp/天** | 自适应退出的**逐位精确分解** | 见 3.6，源数据 `plan:403` |
+| **+3.38bp/笔 / +10.2bp/笔** | 真实成交的**毛**收益（两种退出）→ **为正** | 3.6 |
+| **≈6.7bp** | 1771 笔上的单笔标准误 → `+10.2 ± 13bp`，**跨零** | 3.6 |
+| **日更 +65.7bp/笔 vs 分钟 +10.2bp/笔** | 按**实际投入资本**折算（日更只成交 180/1790 = 10.1%） | 3.2 B1 |
+| **20bp/天 = 年化 50.4%** | 满换手成本闸门。基线毛收益 = −9.21 + 20 = **+10.8bp/天** | P00 |
+| **≈234bp/天** | Top2 等权组合日波动（σ=2.8%, ρ=0.4） | P00b |
+| **15.6bp/天** | 单样本 SE（n=225）；基线 −9.21 距零仅 **0.59 SE** | P00b |
+| **≈44bp/天 ≈ 年化 110%** | 单样本 MDE（80% 功效）→ `mean_return>0` 门槛的真实分辨力 | P00b |
+| **≈152bp/天** | 配对差分波动（由 ±22bp CI 反解） | P00b |
+| **≈28bp/天** | 配对 MDE（n=225）；实测候选间差异仅 **16bp/天** → **不可分辨** | P00b |
+| **7,020 交易日 ≈ 28 年** | 检测 5bp/天 差异所需样本量 | P00b |
+| **64%** | 晋级路径族错误率（20 次同 holdout 测试、任一过即晋级、零校正） | P00c |
+| **8100 + 192 + 31 + 21 + 33 …** | 搜索组合数总量，**多重比较校正为零** | P00c |
+| **+13.60bp/天 → −13.31bp/天** | 400 股 → 全市场，翻转 **27bp**，正好是 MDE 量级 | `plan:447` |
+| **0.005 元** | 平板容差是**绝对元值**：¥3 股票 = 0.17% 振幅，¥200 股票 = 0.0025% | 3.6 末 |
+| **0 命中** | `hedge / benchmark_relative / beta_neutral / market_neutral / optimizer / covariance` 等全仓扫描 | P00d |
+| **5 个股票池定义 / 0 次在研究中变动** | `config.py:18-25` vs 全路径硬编码 `MAINBOARD_UNIVERSE_FILE` | P00e |
+
+**第二轮新增数字：**
+
+| 数字 | 含义 | 出处 |
+|---|---|---|
+| **CI95 [−58.65, +47.63] vs 点估计 −5.52bp/天** | E4 那个 26 天比较的 CI **宽约点估计的 10 倍**，统计上完全是空的 | §4.1.1、`plan:411`ff |
+| **E0-E4 −23.20 / E4 −84.88 / H1 −0.41 / H2 −142.80 bp/天** | 60 天因果 holdout 四个日更依赖变体 —— 但**全部只能读作量级参考**（§5.9） | `plan:1002-1008` |
+| **6 个 SHA 哈希 / 两端致命** | `structural_combo_holdout.py:41-60`；`:185-186` claim 后变更、`:305-306` 评估中变更均 `raise` —— 全仓库最强的 holdout 纪律 | §4.1.1 更正 3 |
+| **4 / 7 变体被排除** | `auto_research.py:63-68` 的 `DAILY_HISTORY_DEPENDENT_VARIANTS` 排除 4 个，**3 个纯分钟变体照常竞选** —— 原判"结构性死锁"因此不成立 | §3.2-B4 更正块 |
+| **20 个 `news_sent_*` 列，其中 5 个在标注停止后恒为 0、3 个是逐位重复列** | 5 组消融里 3 组**结构性不可能**通过严格 `rank_ic_gain > 0` | §4.2.1 (c) |
+| **36 路取最大 / 唯一校正是单次切分** | `sentiment_signal.py:223-232` 的 3 源 × 4 半衰期 × 3 权重集 | §4.2.1 (l) |
+| **`n >= 100` 数的是股票-日不是天** | `sentiment_signal.py:205, 238`；`_metrics` 只需 20 行就出 IC（`:200-201`） | §4.2.1 (l) |
+| **0 份实验产物** | 仓库内 `find` 不到任何 `ablation_report.json` / `experiment_report.json` / 面板 parquet；判决只以 3 处注释散文存在 | §4.2.1 (j) |
+| **5 / 6 个调用点正确** | `simulate_fixed_exit_race` 只有 `_evaluate_recipe_frames`（`:1772-1775`）逐模型单独调用 → 局部而非全局缺陷，但污染的恰是"选配方"与"哪个头更好" | §3.2 B5 |
+| **1 / 6 个入口缺 `signal_eligible`** | 只有 `run_screened_rolling_race`（`:758-779`）缺，另 5 处都有 | §3.2 B6 |
+| **`min_price_rows=1000`（约 4 年）** | 生产默认（`full_train_batched.py:1218`）；对照 `quant/pipeline.py:189` 默认 0。→ 2019 年的窗口按 2026 年攒的行数决定准入 | §5.12b |
+| **`MIN_COVERAGE = 0.85`** | 即使走到检查分支，也允许约 **450 只票**停留在旧交易日仍开训 | §5.15 (b) |
+| **`--sample` 默认 20，且是 `codes[:20]`** | `check_daily_update.py:51-53` + `datafeed.py:184` 的 `sorted()` → **永远同样最小的 20 个代码**，剩余约 3000 只从不检查 | §5.15 (c) |
+| **恢复路径解析出 0 个代码** | `scheduled_workflow.py:319` 写字面 `\n` / `daily_update.py:530` 匹配字面 `"\d{6}"`（`cat -A` 验证）→ **段错误缺口恢复从未生效过** | §5.15 (d) |
+| **`trading_calendar.parquet` 零写入者** | 全仓库仅 `realtime/reference.py:286-312` 一处 `getattr` → **永远走 `weekday()<5` 兜底**，跨长假高估持仓 **5–7 个交易日** | §5.13 |
+| **`.dt.days` 在 `quant/` 下仅 1 处** | `model.py:173`（时间衰减权重，用途正确）→ 日线链**无任何按日期差的校验**，全部是行位移 | §5.14 |
+| **退市排除条件 = 名称含「退」1 条** | `datafeed.py:149`。无成交额 / 换手 / 上市天数 / ST 任何筛选，"active" 名不副实 | §5.12c |
+| **18 已确认 / 5 疑似 / 11 排除** | 宇宙 · 日历专项审计的产出规模（第二轮单份最大） | §11.6 `a995264d91b89a636` |
+| **ST 阈值硬编码 ±9.5%** | `tradability.py:102-103` → ST 的 ±5% 封板被当作可自由成交；仓库注释自认盲区（`:7, 94`） | §5.19 (a) |
+| **上市日期字段：0 处** | 全仓库无 `list_date` / `ipo_date` / `上市日期`；唯一代理是全历史行数 | §5.19 (b) |
+| **`\\n` 全仓库出现 1 次** | `scheduled_workflow.py:319`，grep 计数 = 1 → 笔误非约定；对盘中自由文本正则恰好有效，对真消费者 `daily_update.py:530` 失效 | §5.20 |
+| **`snapshots/watchlist.txt`：8 处读 / 0 处写** | 纯手工维护，却是 `mobile_snapshot.json` 白名单分组的上游 | §5.20 |
+| **`intraday_1400` 在部署/cron/shell 文件里 0 出现** | 不只是股票池，**整条链的调度方式都在代码库之外** | §5.20 (2) |
+
+**关键量级对照：日更 native +1.62%/天 → 同尺 −4.78bp/天，差约 340 倍。**
+
+**第二轮融合层（§4.5 / §4.6）新增数字 —— 全部为本机 numpy 复现，可自行重跑：**
+
+| 数字 | 含义 | 出处 |
+|---|---|---|
+| **`max\|β_ridge − β_OLS\| = 1.79e-06`** | `alpha=10` 作用在 z 化输入、n≈200,000 上，隐含收缩 `n/(n+alpha) = 0.99995` → **Ridge 在数值上就是 OLS**。「用了 Ridge 所以共线性已处理」**不成立** | §4.5.1，`model.py:371-408` |
+| **8 克隆最大单列 0.00395 < 独立弱特征 0.00513** | ρ=0.98 的特征族把系数按 ~1/k 摊薄 → **只看单列会得出完全颠倒的重要性排序** | §4.5.2 |
+| **族和守恒 ≈0.0203（k=1/2/3/5/8 分别 0.0192/0.0202/0.0200/0.0206/0.0203）** | 稀释只搬动系数、不消灭信息 → **按族汇总是正确读法** | §4.5.2 |
+| **单列自助 sd 0.00145（8 次重采样中 2 次翻转符号）vs 族和 sd 0.00016** | 差 **9 倍**；单列系数的符号本身就不稳定 | §4.5.2 |
+| **`cond(X'X) = 3.15e2`；hist 系数 +0.01990（单跑 +0.01997）** | 精确线性恒等式（`macd_hist = dif − dea`，`engineering.py:175`）**不稀释** → 界定了 §4.5 的适用边界 | §4.5.3、E28 |
+| **相关 0.90/0.95/0.98/0.99 → 日 IC 序列相关 0.919/0.949/0.983/0.990** | 全部 > `max_ic_corr=0.85` → `_rolling_factor_selection`（`full_train_batched.py:275-329`）**确实是有效解药**，前提是它被打开 | §4.5.4 |
+| **池化 IC 0.0224 vs 逐日均值 0.0267；183/250 天贡献 0 只；前 10 天占 20%** | `_metrics`（`model.py:184-198`）度量的是**选日**不是选股 → 很可能就是 `lgbm_weight` 定在 0.85–1.0 的来源 | §4.6 S5、P32 |
+| **偏置子集上预存 z 均值 2.481 / 标准差 0.322 → 有效权重压缩 3.1 倍 + 常数 +2.48** | `watchlist_grid.py:261-283` 混了 ddof=0 子集 z 与 ddof=1 全宇宙 z；纯排序可抵消，**`positive_only` 闸门下不可抵消**，而日更正是 `positive_only=True` | §4.6 S7 |
+| **w=0.85 损失 1.9–7.3% 混合 IC；IC=0 且 ρ=0.6 的腿把 1.000 拖到 0.912** | 两条等 IC 腿的最优是 0.5；`lgbm_weight` **从未被网格搜索过** | §4.6 S10、P33 |
+| **`best` 未绑定 → `UnboundLocalError`** | `scheduled_workflow.py:144-160`，注释承诺的「保留原参数」**从未生效**；且异常经 `:1188-1189` 被误报成「无法读取 incumbent 参数」→ **一次网格失败中止整个日更发布** | §4.6.1、P29 |
+
+**第二轮 walk-forward / purge（§5.22）新增数字 —— 全部有 `file:line` 或档案实测反标定：**
+
+| 数字 | 含义 | 出处 |
+|---|---|---|
+| **0.2%**（1/499） | purge 关闭时，h=1 短线腿被污染的训练日期占比 → **对现役几乎无害** | §5.22(b) |
+| **48%**（10/21 天） | purge 打开时 h=10 波段腿被吃掉的验证段占比；而早停正靠这个验证段 | §5.22(b)、S19 |
+| **约 6 天** | h=15 时 purge 后剩余的验证段天数 → 早停轮数基本是噪声 | S19 |
+| **2 个交易日** | `tradable-label` 腿 purge 的缺口（`h` vs 需要的 `h+cap-1`，cap=3）；占训练集 0.4%、占 1 个月验证段 **10%** | S16 |
+| **56,307 预测/窗** | 由 `RESEARCH_ARCHIVE:233-235` 的"12 窗共 675,682 条"反解，÷ ~21 交易日 ≈ **2,680 只/日**，与主板池经 `min_price_rows=1000` 过滤后的规模吻合 → 这张样本量表可信 | §5.22(f) |
+| **≈2.00M / ≈1.33M / ≈1.31M** | 训练行数：h=1 train36m / h=1 train24m / h=10 train24m | §5.22(f) |
+| **79 窗 vs 67 窗** | train 24m vs 36m 的窗口总数；生产 `recent_windows` 默认 24 → 只跑最后 24 窗 | §5.22(f) |
+| **h=1/5/10 → gap 恰好 1/5/10 个交易日** | `_purged_end` 的手工数值复现，`train_end + h` 精确落在 boundary 前最后一个交易日 → **最紧的正确实现** | §5.22(a)、E35 |
+| **0 命中** | 全仓库 `embargo` 的 grep 结果（我独立复核）| E48 |
+| **3 处命中，全是消费者** | `lh1000` 在全仓库的 grep 结果 → 生产因子清单**没有生产者** | S14 |
+
+---
+
+## 11. 给接手 agent 的操作提示
+
+### 11.1 硬约束
+
+- **这是只读审计任务。** 用户未要求改代码。本次审计**未修改任何仓库文件**（只写了本文档和 `/tmp/rep/*.md`）。改动前请先确认用户意图。
+- **敏感项，继续避免**：`.env` 凭证、`sdk/` 下的私有券商 SDK wheel、`stock_analyzer/amazingdata_source.py` 里的凭证处理、`RESEARCH_ARCHIVE_20260810.md` 里记录的研究主机 IP。本次审计**未读取这些内容，未回显任何密钥值**。
+
+### 11.2 环境陷阱
+
+- **不能执行任何项目代码**（Python 3.6.5，见第 2 节）。数值验证需用**纯 numpy 手写**（本次两次验证都是这么做的）。
+- **Bash 的 cwd 在调用间会重置到 `/home/work/A_test`** —— 用绝对路径或在每条命令里显式 `cd`。
+- 子代理的 `.output` 路径是**指向完整 JSONL 会话记录的符号链接**，直读会爆 context。本次的做法：写一个小 python3 提取器，只取每个 agent 的最后一段 assistant 文本，>3000 字符的转存到 `/tmp/rep/*.md` 再读。
+
+### 11.3 memory 状态
+
+`/home/work/.claude/projects/-home-work-A-test/memory/` **为空，无 `MEMORY.md` 内容**。若需要跨会话记忆，需从零建立。
+
+### 11.4 术语歧义
+
+用户说的"分数特征"可能指分数类特征，也可能是"分钟特征"的口误。**两条线都已审计，结论一致（都是"不置信"）**，所以这个歧义不阻塞。若要澄清，问一句即可。
+
+### 11.5 本次审计的子代理产出清单
+
+10 份实质报告，已提取到 `/tmp/rep/agent-*.md`（**这些文件在 `/tmp`，可能已被清理**）：
+
+| 报告 ID | 主题 | 关键贡献 |
+|---|---|---|
+| `a8ab09d4004bb8f46` | 日线 vs 盘中预处理 | 生产路径是 `full_train_batched` 不是 `pipeline.py`；中性化仅市值（无 industry 列）；生产训练在无 mask 的 `target_ret_1d` |
+| `a0f3ca8094293af9d` | `quant/` 三个实验文件的门槛 | 无显著性检验；≤58 未校正 arm；holdout 边界随数据移动 |
+| `ad9c336f4d579584e` | 盘中 `auto_research`/`structural_combo` 门槛 | 账本被强制但有 6 种绕过；训练窗口 ~33 天 vs 60 天 holdout；33 声明 0 评估 |
+| `a2361d2df07664c24` | 收益核算 | 三套互不兼容口径；−10% 是成本 50 倍且支配信号；无 scipy/statsmodels/校正 |
+| `ae4fb3696c2dc25c6` | `target_ab_experiment.py` | 零程序化门槛，"显著"从未被计算；两条 `quant/` 路径都回填且不施加 −10% |
+| `a52dea2facb7d7814` | 文档结论 → 代码入口全映射 | 分钟特征几乎每轮都改善 RankIC 和相对收益，但从不改善绝对净收益；唯二正数都已被撤回 |
+| `a790f8f85bae35a19` | 负对照 / 涨跌停 / 磁盘数据 | **全仓库无负对照**（RNG 穷举）；`benchmark.py` 是厂商延迟基准；磁盘无数据；板块限幅基本缺失 |
+| `a667537b1c4a293e3` | 时间戳与复权 | bar START/END 未验证（可能 5 分钟前视）；volume/amount 跨拆分不复权；日更侧无 `factor_version` |
+| `aa27e9908ce6cebea` | 产品面 | 已发布选股无前向记录、无时效守卫；`quant/pipeline.py` 回测 close-fill 零成本、摩擦静默失效 |
+| `a6086947b77e0b971` | realtime 纸交易层 | 架构可信（实时成交、真成本、原子写），但**无聚合器**、**账本不入库** |
+| `af940af0b3673c7bb` | 日更基线是否被高估 | ★ **发现第 6 节的同口径对比已存在**；A4 完整链条；Sharpe 定义只贡献 14 倍；S1 缓存豁免 |
+| `abbe18ec38ded26b2` | 分钟特征构造 | ★ 103→40 裁剪量；`market_excess` 死代码（8.88e-16）；评估宇宙标签条件化；D4 配置不一致 |
+| `acbd38a41e1c25310` | 评估口径与收益计算 | ★★ **本次最重要的定量报告**：`−29.10bp/天` 与 `−10.80bp/天` 的**逐位精确三分解**（成本/惩罚/毛收益）；排除成本重复扣减、符号单位错误、标签错位；4 处未加门的 `fillna(-0.10)`；`0.005` 是绝对元值；÷N vs ÷实际两套分母并存；日更 vs 分钟的**按投入资本折算**修正；`signal_locked_up_1400` 零消费者、4.5% 规则未实现；codes-file 缺失导致宇宙不可复核；pandas 1.1.5 浅拷贝跨变体污染 |
+| `ad417aa7e0d3b5b26` | 分数类特征（sentiment）的消融结论 | ★ **生产 sentiment 信号有发布时间泄漏**（`sentiment_signal.py:166` 无截断、`:147-148` 用 T 收盘、`:213` 无 purge）→ `enabled`/`blend_weight` 决策不可信；`fillna(0.0)` 在算截面 mean/std **之前** → 无新闻股票拿到反向非零 z；标注 2026-07-28 停止后 3/5 消融组是常量零对严格 `>0` 门；`model.py:1023-1028` 只给树腿传 `valid_end` → Ridge 腿窗口口径错误；decay 分子分母同 alpha；`rank_ic` 是池化相关而非日均 IC（`select.py:28-53` 已有正确实现未复用）；零覆盖率埋点 |
+| `a42381d1d94994908` | 验收门槛与统计功效 | ★★ `choose_next_branch(current, result)` **签名里没有 baseline 参数** → 控制器在代码层面无法表达"优于在位"；4 个绝对门槛只有 2 个是活的，且收益门槛连基线自己都过不去；**完整功效解析**（σ_p≈234bp、单样本 MDE≈44bp、配对 MDE≈28bp vs 实测差异 16bp）；搜索组合数清点与**零多重校正**；`ci95`/`pairwise` 算出但**无一被 `if` 读取**；晋级路径族错误率 64%；**从未被搜索过的 7 个维度**（股票池、流动性、持有期、换手预算、调仓频率、组合构建、止损参数）；`benchmark_relative`/`hedge`/`beta_neutral` 全仓 0 命中 |
+
+**仍在后台运行、未回报的**（若接手时有结果可增量补充，但上述结论**不依赖**它们）：
+- `abc556ccf17b8024f` walk-forward 切分 / purge / embargo
+- `ac9ff3fdb75a3c4e5` 日线标签定义与 shift 方向
+- `a6b7101e5942b4183` 集成融合与分数校准
+
+**已完成并折入**：`a995264d91b89a636`（§5.12–§5.18）、`a88088146e128d9e1`（§5.19）、`a9867dc6c13402e97`（§5.20）。第二轮 6 份里 3 份已收，3 份在跑。
+
+### 11.6 第二轮审计（"再严格审计一遍"）的增量产出
+
+三份第一轮遗留报告已读完并折入本文；四份第二轮报告尚在运行。
+
+| 报告 ID | 主题 | 关键贡献 | 折入位置 |
+|---|---|---|---|
+| `a3e8e0654b3c8e8ac` | `fair_race_pipeline` 收益数学 | ★★ **赛跑在不同日期集合上比较模型**（`:1772-1775` 每模型单独调模拟器 → `:1827-1838` 内层配方选择与 `:2008-2012` 外层头对头都不做宇宙对齐，被其审计者判为本次最严重的核算缺陷）；`run_screened_rolling_race` 缺 `signal_eligible`；跨目标量纲混用 + `raw_pred` 未 z 化却当幅度用；两个独立成本旋钮；`evaluation.py:43` 把惩罚钉死在 −0.10 使成本扫描残缺；收益路径全程无 `/ float(top_n)`（证实 ÷N 是靠写 0 与补现金行实现） | §3.2 B5/B6、§5.10、§5.11 |
+| `a19d1fb891eef50bd` | 结构组合 E4 | ★★ **推翻我自己的两处原判**：`daily_history_causal: False` 是刻意诚实标记而非死锁，`auto_research.py:63-68,201-208` 只排除 4 个日更依赖变体、三个纯分钟变体照常竞选；E4 移位**因果正确**（`structural_combo.py:130-142` 显式交易日历后继映射）。新缺陷：面板派生日历可让先验静默陈旧 >1 session；整条 E4 路径零覆盖率仪表 → 淘汰量级不可解释；黑名单对 `pred`/`score`/`prior` 形状列名无覆盖（潜在，且不能用"禁含 score"修，会误伤 `rule_score`） | §3.2-B4 更正块、§4.1、§4.1.1、§5.9、P17 重写 |
+| `a962b91a5828d0142` | sentiment 分数特征（全量版） | ★★ **两套互不共享的 sentiment 实现且时间对齐相反**；`hybrid_decay_*` 在无标注时是 `local_decay_*` 的**逐位重复列**（把 S-3 钉到等号级别）；未标注文章进衰减分母 → 违反项目自己 `sentiment_signal.py:69` 写下的规则；「衰减」特征在静默期**比值精确不变**，实验侧连 shrink 项都没有；`_available_date` 的午夜戳条件性前视 + 自然日 +1 导致 `article_count_1d` 与其余 19 列口径不一致；**仓库内不存在任何实验产物**，判决只以三处注释散文存在；确认窗口不强制晚于选择窗口（仓库自己的测试就传了更早的）；`flash` 权重彻底惰性；覆盖率纪律双标（同仓库 `daily_update.py:250-251` 有硬门） | §4.2.1（新增 13 条 a–n） |
+| `a995264d91b89a636` | 宇宙生存者偏差与交易日历 | ★★★ **第二轮篇幅最大、新领域最多的一份**（18 条已确认 / 5 条疑似 / 11 条排除）：生产池是**今天仍在上市的快照**、覆盖写、退市仅按名称含「退」排除、被**回溯施加**到全部历史窗口与调参路径，而作者自己在 `build_dataset.py:18-22` 写下了正确做法却从未实现，`RESEARCH_ARCHIVE:15,71` 的 "point-in-time" / "stable universe hashes" 声明与实现直接矛盾（**哈希稳定 ≠ 时点正确**）；退市暴跌因 `shift(-horizon)` 越界 NaN + `engineering.py:700` dropna **永不进入标签**；`min_price_rows=1000` 构成 **look-ahead 型准入**；**全仓库没有真实交易日历**（`trading_calendar.parquet` 零写入者 → 永远走 `weekday()<5` 兜底，跨长假高估持仓 5–7 个交易日并触发提前平仓）；**所有按天的 shift/rolling 都是行位移**，停牌被无代价跳过，而 `risk_trading_gap_days` 这条防线只存在于盘中链；覆盖率检查只在 SIGSEGV 分支内、`MIN_COVERAGE=0.85`、`check_daily_update` 永远抽同样最小的 20 个代码；**段错误恢复路径写端 `\n` 读端 `r"\\d{6}"` 双重转义 bug → 从未生效过**（`cat -A` 验证）；`universe_codes` 被故意排出缓存键；盘中 codes-file 树外的穷举证据 | §5.12–§5.18、§7 E16–E20、§7.1 S6 升级 + S8/S9、P25–P28 |
+| `a88088146e128d9e1` | 退市 / ST / 新股 / 停牌 / 流动性五类过滤 | ★★ **独立复核，与 `a995264d91b89a636` 逐条吻合**（两份独立审计的交叉确认，显著提高置信度），并补三块空白：**ST 过滤完全不存在且仓库注释自认盲区**（`tradability.py:7, 94`），±9.5% 硬编码使 ST 的 ±5% 封板被当作可自由成交；**全仓库无上市日期字段**，上市首日 / 无涨跌幅限制日零处理；停牌在日线链无门（卖出按陈旧收盘价成交）而盘中链连模拟器都建模了 `suspended_t1_blocked` / `suspended_t1_roll`；**无任何绝对流动性阈值**，唯一池收窄是 `backtest.py:122-133` 的逐日截面分位（**逐日正确、无跨期泄漏**，但含当日自身 bar 且分位数算在已被生存者过滤的池上）；`risk_amount_vs_median_20`（`intraday_1400/features.py:295-299`）缺 `shift(1)`，与兄弟实现 `:363-366` 不可并列 | §5.19、§7.1 S6、P28 |
+| `a9867dc6c13402e97` | codes-file / 自选池的全部写入方 | ★★ 把 §5.17 推到穷举级：盘中 `--codes-file` **无默认值 / 无写入方 / 无调用方**，`intraday_1400` 在任何部署 cron shell 文件里**零出现**（连调度方式都在树外）；盘中链与 `quant/` 的耦合只有 2 个 parquet/json，grep `universe_file` 于 `intraday_1400/` 零命中 → **两条链宇宙定义完全无关**；**修正一处**：`realtime` 自选池其实有生成方（`top10_eval.py:63-92` → `mobile_snapshot.json`，cron `top10-eval`），真正无写入方的是它依赖的 `snapshots/watchlist.txt`（8 处读、0 处写）与 `realtime_holdings.txt`；`\\n` 是全仓库唯一一处（grep=1，笔误非约定），它**对盘中 collector 的自由文本正则恰好仍有效，对真正的消费者 `daily_update.py:530` 完全失效** | §5.20、§4.3 D8 补充、P27 |
+| `a6b7101e5942b4183` | 集成融合与分数校准 | ★★★ **本轮对用户原始问题最直接的一份**，但也是**准确率最低的一份**：报了 10 条，我逐条独立复核后**推翻 4 条**（S2 影子腿是有意设计且被下游消费、S2b RF 覆盖在唯一调用配置下语义正确、S4 双重衰减不触及两条生产腿、S8 无拟合泄漏且只在离线链），并在复核过程中**自己发现 1 条它没报的缺陷**（N1 = `run_short_grid` 的 `UnboundLocalError`，见 §4.6.1 / P29）。其最有价值的贡献是提出「**Ridge 单列系数不能用来判定特征无用**」这个方向 —— 我把它坐实成了 §4.5 的全套数值证据（`alpha=10` 数值上就是 OLS、族内 ~1/k 摊薄、8 克隆最大系数低于独立弱特征、族和守恒、精确恒等式不稀释）。它自己的定位原话是「这是本次审计中最可能直接推翻既有结论的一条」，我同意。**给接手者的教训：这份报告的结论必须逐条验证后再用，不要转抄** | §4.5、§4.6（含 4.6.1–4.6.5）、§7 E24–E30、§7.1 S10–S13、P29–P33、§10 新表 |
+| `ac9ff3fdb75a3c4e5` | 日线标签定义与 shift 方向 | ★★ **本轮唯一一份"先排除、再指控"结构清晰的报告**，可信度高：三处独立标签实现逐字复核全部正确、**off-by-one 明确排除**、特征侧零未来函数、`rolled_sell_close` 顺延决策经 numpy 复现不前视 —— 这些"清白"结论本身就有价值（见 E31–E34）。指控 12 条，全在**可见时点**而非位移量上，前三条既便宜又方向乐观：`ann_date` 缺失静默退化为 `report_date`（财报提前 1–4 个月可见，20+ 特征）、qfq 重建不使训练缓存失效（`_recipe_signature` 的第三个缺口）、每月末 `horizon` 天标签**永久 NaN**（h=1 约 4.8% 行、系统性月末，**一个旗标 `--refresh-months 2` 即可修**）。另有盘中快照被写成当日 OHLC、当日龙虎榜/大宗进特征、复权失败静默写未复权价、`buyable_*` 缺 OHLC 时默认 True 四条乐观向缺陷 | §5.21、§7 E31–E34、P34 |
+
+---
+| `abc556ccf17b8024f` | walk-forward 切分 / purge / embargo | ★★★ **本轮六份里最严谨的一份**（109 分钟、140 次工具调用），我逐条复核 12 条findings，**10 条直接成立、2 条需补充**，零推翻 —— 与 `a6b7101e5942b4183` 的 4/10 推翻率形成鲜明对比。它的独特价值有三：(1) **主动列出大段"清白"结论**（purge 打开时是数学最紧实现、走真实交易日、purged 日期被物理删除、缓存 key 对 purge 闭合 → E35–E48 共 14 条排除项都出自它），(2) 用档案实测值**反标定出每窗样本量**（56,307 预测/窗 ÷ 21 天 ≈ 2,680 只/日，与档案数字精确吻合）从而把 purge 的危害第一次量化成 0.2%（h=1）vs 48%（h=10），(3) 找到 `tradable-label` purge 短 2 天、`QUANT_BT_SELL_ROLL_MAX_DAYS` 不进哈希、停牌股穿透边界三条新缺陷。**我在它之上推进了两点**：`params["purge_horizon"]` 只写不读 + 训练 summary 也记录该布尔（S22，给 S10 两条更便宜的答法）；以及它说因子清单产自 `select.select_factors` **不确切** —— 全仓库 grep 证明该清单在代码库里根本没有生产者（S14）| §5.22、§7 E35–E48、§7.1 S14–S22、P35–P38、§10 新表、§12.4 |
+
+## 12. 一句话总结（给用户的答复原文）
+
+- **"分数特征无用"** —— 不置信。证据等级是"**未检验**"，不是"已证伪"；最可能的真相是 (ii) 冗余 + (iii) 被单变量 IC 筛选、评估宇宙标签条件化、零成本无 holdout 的实验设计抹掉的混合。sentiment 那条线更糟 —— 消融侧有两处机械抹除（无新闻股票拿到反向 z、标注停止后 3/5 组是常量零），而**生产侧那个"有用"的判断本身建立在一个有发布时间泄漏的 IC 上**，两个方向都不可信。
+- **"超不过现有版本"** —— 主要是流程产物，且现在能说清是**哪一种**流程产物：
+  1. **尺子不同**：在位者用**回填 + 零成本 + 错误 Sharpe 公式 + 大量空仓**的口径打分，挑战者用**不回填 + 20bp + 正确 Sharpe + 50× 成本的不可卖惩罚**打分。
+  2. **判决器在代码层面无法表达"更好"**：`choose_next_branch` 的函数签名里根本没有 baseline 参数，只能判绝对 `mean_return > 0` —— 而在位基线自己以 `−9.21bp/天` 死在这个门槛上。
+  3. **就算能表达也分辨不出**：225 天 Top2 的配对 MDE ≈ **28bp/天**，而候选之间的真实差异只有 **16bp/天**。"超不过"在统计上等价于"**分辨不出**"。
+  4. **8100+ 组合搜索、零多重校正、20 次同 holdout 复测任一通过即晋级**（族错误率 64%）。
+- **但这里有一个必须诚实交代的分界**：负号本身是真的。`−29.10bp/天` 可被**逐位分解**为 `−18.98bp 真实成本 + −13.33bp 尾部惩罚 + **+3.21bp 正毛收益**`（自适应退出版本是 `−19.79 + −1.12 + **+10.10**`，同样逐位闭合）。所以：
+  - **"模型比随机差"——被证伪**，真实成交的毛收益是正的；
+  - **"这个配置不可盈利"——成立**，而且原因很朴素：Top2/Top10 纯多头、每日全换手、不做基准中性，**光成本就是 20bp/天 = 年化 50.4%**，恰好和毛收益同一量级。
+  - **"毛收益是真 alpha"——无法确认**，因为 `+10.2bp/笔` 缺一个对照：同期全市场 14:50→次日 14:50 等权毛收益。**这一个数字就能定案，而它不存在。**
+- **日更该留着的理由不是它选股强**，而是：严格测过的替代品**全部为负**（−9.21 至 −28.97bp/天），最终路由 `human_review_required`（`RESEARCH_ARCHIVE_20260810.md:320`）；且日更在严格尺子下**几乎不成交**（0.79–1.01/10 名额，90%+ 是现金）。**低暴露天然低亏损。** 按实际投入资本折算，日更是 `+65.7bp/笔`（仅 180 笔）而分钟是 `+10.2bp/笔`（1771 笔）—— 那张让人以为"日更胜出"的表，比较的是**10% 仓位的现金保护**对**接近满仓的暴露**，不是选股能力。
+- **下一步最该做的三件事，按预期收益排序**（详见第 9 节 P00 系列）：
+  1. **P00 延长持有期到 h∈{3,5,10} + TopN 放到 {5,10,20}** —— 唯一能改变成本数量级的杠杆，且是纯配置变更、零建模工作量。基线毛收益 `+10.8bp/天` 在 h=10 下面对的成本从 20bp/天 降到约 2bp/天。
+  2. **P00b 把绝对门槛改成配对相对检验，并把仓库里已经算好却从没人读的 CI 接进判决** —— 这不会让任何策略变好，但会让"到底有没有差别"第一次可回答。
+  3. **P00d 引入基准相对收益 / 市场中性评估** —— 全仓 `hedge`/`benchmark_relative`/`beta_neutral` 零命中，当前所有 −9 到 −30bp/天 的结果里有多少是 beta、有多少是选股，**代码无法区分**。若超额为正而绝对为负，"全部为负"这个结论完全改写。
+
+### 12.1 第二轮审计的净增量（三条，其余都是细化）
+
+**(1) 我更正了自己的两处判断，方向都是"仓库比我原判的更诚实"。** `structural_combo_holdout.py:332-333` 那个 `daily_history_causal: False` 不是死锁而是刻意的诚实标记，`auto_research.py:63-68, 201-208` 只排除 4 个日更依赖变体、放三个纯分钟变体正常竞选；E4 的 T−1 移位用显式交易日历后继映射（`structural_combo.py:130-142`）实现，**因果方向是对的**，比我原先假设的实现质量高。→ **这意味着 E4 的淘汰确实有 60 天因果 holdout 支撑，不是只靠那个 CI 跨零十倍的 26 天运行。** 但同时也意味着"E4 无用"从来不等于"日更分数对盘中无信息"—— E4 本质只是分钟头已见信息集的一次针对 1 日期限的冗余压缩（组合面板本来就带 `daily__*` 与 `asof__*` 两个前缀，`fair_race_pipeline.py:153-235`），**这个实验在设计上就没有能力回答后一个问题**。
+
+**(2) 新增一个此前完全没看到的核算缺陷，而且它污染的正是"哪个配方/哪个头更好"这个判决。** `_evaluate_recipe_frames`（`fair_race_pipeline.py:1772-1775`）逐个模型调用模拟器，配合"一只 NaN 作废整天"，**每个模型作废的是不同的天** → `:1827-1838` 与 `:2008-2012` 在**不同日期集合**上比 `mean_return`。其余 5 个调用点都是对的，所以这是一处局部疏漏 —— 但它恰好长在选择路径上。修法见 P20，与 P00b 是同一件事的两半（P00b 修统计，P20 修被统计的样本）。
+
+**(3) sentiment 那条线的判决比我原先写的更没有地位。** 不是"设计有缺陷所以证据弱"，而是：**仓库内不存在任何实验产物**（`ablation_report.json` / `experiment_report.json` / 面板 parquet 一个都 `find` 不到），判决只以三处注释散文存在（`scheduler.crontab:41`、`scheduler_jobs.sh:215-217`、`snapshot_batch.py:239-247`），**无法复现、无法审计**；而按构造，标注停止后 20 列里 5 列恒为 0、3 列是**逐位重复列**，5 组消融里 3 组**结构性不可能**通过严格 `rank_ic_gain > 0`。**这条流水线在标注覆盖率低时只会输出"负"这一个答案，与舆情是否含信号无关。** 它却被用来关掉一个周期性 Qwen 任务，理由写的是「省 LLM token」。
+
+**总的方向没有变**：第 1.1 节四条判定一条都不需要改。第二轮的作用是（a）把两处过重的指控收回，（b）在选择路径上找到一个真缺陷，（c）把 sentiment 判决从"证据弱"降到"无证据"。
+
+### 12.2 第二轮的第四条净增量（宇宙 · 日历，独立成节因为它是新领域）
+
+前三条都在"评估与判决"层。这一条在**数据层**，此前 1800 行里完全没有覆盖，且它是全文**唯一方向明确乐观**的一类偏差：
+
+**(4) 生产的股票池和"天"的定义都不是时点正确的。** 两个独立机制：
+
+- **池子**：`quant/datafeed.py:154-175` 覆盖写"今天仍在上市"的快照，退市唯一排除手段是名称含「退」（`:149`），然后被 `full_train_batched.py:775-776, 799-800` **回溯施加到 2018 年起的每个训练/测试窗口**，并进入调参路径。退市个股退市前的暴跌因 `shift(-horizon)` 越界 NaN + `engineering.py:700` dropna **永不进入标签**。叠加 `min_price_rows=1000`（`engineering.py:339-352`）—— **一只股票能否进入 2019 年的窗口，取决于它到 2026 年攒了多少行** —— 这是纯粹的未来信息准入。作者本人在 `build_dataset.py:18-22` 写下了正确做法（按月落盘积累时点成分）却从未实现；而 `RESEARCH_ARCHIVE_20260810.md:15` 声明 "point-in-time data"、`:71` 声明 "stable universe hashes" —— **哈希稳定只保证同一份快照可复现，恰恰掩盖了快照本身被覆盖重写这一事实**（与 §5.9 的 `merge_active_predictions` 同构：SHA 冻结的是"读的时候文件里是什么"，不是"当时真实是什么"）。
+- **日历**：`trading_calendar.parquet` **在全仓库没有任何写入者**，唯一的读取处 `realtime/reference.py:286-312` 因此**永远走 `weekday() < 5` 兜底** → 跨春节/国庆持仓天数高估 5–7 个交易日，直接触发 `paper_trader.py:420`、`v2.py:118`、`v3.py:341` 的提前平仓。而日线链**所有按"天"的 shift/rolling 都是行位移**（`engineering.py:482, 487-497, 156-192`；`tradability.py:29-48, 99`），停牌 10 日时 `shift(-5)` 实际跨 15 个交易日，**停牌期间的下跌被无代价跳过**。`risk_trading_gap_days` 这条防线**只存在于盘中链**（`intraday_1400/features.py:274-281`），未移植到日线链。
+
+**这条对用户问题的意义要说清楚，别夸大**：它**不会**改变「该策略在 20bp 成本 + 每日全换手下不可盈利」——方向上修掉它只会让所有数字更负。它改变的是**第四条判定的量级**：在位日更的历史表现被系统性高估，所以"日更看起来最好"里又多了一层来源 —— 不只是尺子不同（§3.1）和统计分辨不出（§3.4），**在位者的历史本身就是在一个只含赢家的池子上、用一个把停牌算作免费的时间轴测出来的**。
+
+**唯一方向相反、因此最值得先查的一条**是 S9：若 `price/` 还留着已退市个股的 parquet，那么不指定 universe 文件的**研究**路径（`engineering.py:109-113` 直接扫全目录）反而比生产路径更少生存者偏差 —— 那么"研究怎么都跑不出生产的分数"里，就有一部分是**研究口径更诚实**，而不是研究的模型更差。这一条在生产主机上 10 分钟即可证实（比对 `price/` 的 parquet 数与 universe 文件行数），是全文性价比最高的单个待办。
+
+**两份独立审计的交叉确认**：这一块的结论由 `a995264d91b89a636` 与 `a88088146e128d9e1` **各自独立得出且逐条吻合**（后者还补上 ST / 上市日期 / 停牌 / 流动性四类，见 §5.19），第三份 `a9867dc6c13402e97` 从"谁写了这些文件"这个完全不同的角度切入，也落到同一处（§5.20）。三份独立路径同向，因此这一块的置信度**高于**本文档其余多数第二轮条目。
+
+
+
+
+
+
+
+
+### 12.3 第二轮的第五条净增量（融合层 + 标签时点，**这是对用户原始问题打击最直接的一条**）
+
+前四条分别在"评估与判决"层和"数据"层。这一条在**方法层**，而且它直接命中用户最初那个问题「分数特征是否真的无用，这个结论是否置信」：
+
+**(5) 用来宣布特征无用的那套方法本身是无效的 —— 拟合前后各有一个独立的失效机制。**
+
+- **拟合前**：单变量 IC 筛选（§4.3 D1）会在特征进入模型之前就把只有交互作用的特征筛掉。
+- **拟合后**：`model.py:371-408` 的 `alpha=10.0` 作用在**已被逐日 z 化**的输入上，n≈200,000 时隐含收缩是 `n/(n+alpha) = 0.99995` —— 实测 `max|β_ridge − β_OLS| = 1.79e-06`，**Ridge 在数值上就是 OLS**。所以「我们用了 Ridge，共线性已经处理过了」不成立。而 `engineering.py:145-197` 里高相关同向特征族比比皆是，它们的系数被按 **~1/k 摊薄**：ρ=0.98 的 8 个克隆，最大单列系数 **0.00395**，反而**低于**一个独立弱特征的 **0.00513** —— 只看单列会得出**完全颠倒**的重要性排序。族和守恒在 ≈0.0203（k=1..8 全部如此），单列的自助标准差 0.00145（8 次重采样里 2 次翻转符号）vs 族和 0.00016，**差 9 倍**。
+
+**必要的边界（否则这条会被过度使用）**：精确线性恒等式**不**稀释。在真实管线（逐日 1/99 winsorize → 逐日 z）上，`macd_hist = macd_dif − macd_dea` 且信号只在 hist 时，系数是 dif=+0.00037 / dea=−0.00051 / **hist=+0.01990**（单独跑 hist 是 +0.01997），`cond(X'X)=3.15e2`。→ 病灶是**高相关同向族**，不是任意共线性。
+
+**解药存在，但它的生产状态取决于一个本环境读不到的布尔值。** `_rolling_factor_selection`（`full_train_batched.py:275-329`）的 `max_ic_corr=0.85` 正是对症的（实测原始相关 0.90/0.95/0.98/0.99 对应的日 IC 序列相关是 0.919/0.949/0.983/0.990，**全部超过 0.85 会被剔除**）。但它是否在日更刷新里开着，取决于 `active_quant_model.json` 的 `params.rolling_factor_select` —— 一个**跨月自锁**的 manifest 布尔（`scheduled_workflow.py:836, 883-884, 955-961, 1010`）。而 `--purge-horizon` 被包在**同一个** `if` 里 → **共线性解药与标签 purge 同生共死**。这就是 S10。
+
+**因此 S9 + S10 是全文最高性价比的一对待办，都只需要生产主机上 10 分钟只读操作**：
+- **S9**：`ls quant_data/price/*.parquet | wc -l` vs universe 文件行数 → 判断研究口径是否反而更诚实。
+- **S10**：`cat quant_data/full_a_2018_wide/active_quant_model.json` 读 `params.rolling_factor_select` → 判断共线性解药与 purge 在生产里是否存在。
+
+**这一轮还有两个附带产出：**
+
+**(a) 一个新缺陷，会让日更发布整体失败并报出完全错误的原因。** `scheduled_workflow.py:144-160` 里 `best` 只在 `try` 内部被绑定，任何网格异常都变成 `UnboundLocalError` → 注释承诺的「保留原参数」**从未生效过**；且该异常经 `:1188-1189` 被重新包装成 `RuntimeError("无法读取 incumbent 参数，拒绝发布以避免策略漂移")`。修法 10 分钟（P29）。
+
+**(b) 子代理报告的可靠性本身需要打折。** `a6b7101e5942b4183` 报的 10 条里我复核后**推翻 4 条**（详见 §4.6 判定列与 §11.6）。我也**更正了自己上一轮的一处错误**（§5.14 曾说 `--purge-horizon` 从未被传，实际 `:958` 是传的）。→ **给接手者：本文档任何一条在动手改代码前都要自己回到 `file:line` 确认一遍，包括我写的。**
+
+**同时，日线标签专项（§5.21）给出了一个"清白"结论和一个一旗标修法**：三处独立标签实现公式全部正确、**off-by-one 明确排除**、特征侧零未来函数 —— 值得记住，因为它排除了一个很自然的怀疑方向。而 `--refresh-months` 从 1 改到 2（一个旗标）能修掉"每月末 `horizon` 天标签永久 NaN"（h=1 约 4.8% 的行，系统性集中在月末）。
+
+**总方向依旧不变**：§1.1 的四条判定一条都不需要改。第五条增量的作用是把第三条判定「分数特征无信息 —— 未成立（从未被有效检验）」的**置信度从"低"进一步坐实** —— 现在不只是"实验设计有问题"，而是**连"看系数、看单变量 IC"这两个判定手段本身都不成立**。
+
+### 12.4 第二轮的第六条净增量（walk-forward / purge，**方向与前五条相反：它给现役"减压"**）
+
+第六份、也是第二轮最后一份子代理（`abc556ccf17b8024f`）交出的结论，**与前五条增量的方向不同**：前五条都在指出"现役成绩可能虚高"，这一条主要在说**这条怀疑路径基本走不通**，同时把危害重新分配到别处。
+
+**(a) purge 的危害被前一轮高估了，必须更正权重。** 我上一轮把 S9（股票池口径）和 S10（`rolling_factor_select` 布尔）并列为两个最高价值的 10 分钟检查，理由之一是"purge 是否打开"。现在这个理由要撤回：
+
+- purge 打开时是**数学上最紧的正确实现**（h=1/5/10 手工复现，`train_end + h` 恰好落在边界前最后一个交易日，零标签重叠），走**真实交易日**，purged 日期被**物理删除**，缓存 key 对 purge 规则**闭合**（E35–E40）。
+- purge 关闭时，**h=1 的现役短线腿只有 1/499 ≈ 0.2% 的训练日期被污染**，且 Ridge 无早停 → 实际危害很小。
+- 真正伤人的是 **h=10：验证段 48% 的日期标签伸入测试段，而 LightGBM Ranker 的早停正靠它** —— 但 **h=10 的波段腿从来没被训练过**（`TRAIN_STYLE_ORDER` 排除 swing，§4.6 S9）。
+
+→ **S10 的价值要重新归因：它对"标签 purge"几乎不重要，对"共线性解药 `max_ic_corr=0.85` 在生产里是否存在"才是决定性的（§4.5.4）。** 这个更正很重要，因为它避免接手者把 10 分钟花在一个已经证明无害的方向上。
+
+**(b) 但 purge 是 P00 的前置条件（新增 P35）。** P00 第一条是"延长持有期"，把 horizon 扫到 3/5/10。一旦这么做，上面那条"不发作"的缺陷**立刻发作**：`validation_months` 默认 1，h=10 时验证段只剩 11 天、h=15 只剩约 6 天，早停轮数基本是噪声，且**没有任何告警**（唯一兜底是整窗跳过）。→ **扫 horizon 时必须同时把 `validation_months` 提到 2–3，并让 `--purge-horizon` 能单独启用**（当前它和 `--rolling-factor-select` 被绑在同一个 `cmd.extend`，做对照实验在 CLI 上做不到）。这是之前所有 P00 描述里漏掉的一步。
+
+**(c) 三条新的"标签正确性不进哈希"缺陷（P36）**：`tradable-label` 腿 purge 短 2 个交易日（占 1 个月验证段 10%，S16）；`QUANT_BT_SELL_ROLL_MAX_DAYS` 改变标签却不进任何哈希（S17）；purge 按面板日期而标签按个股行位移 → 停牌股穿透边界（S18，与 §5.14 同根）。
+
+**(d) 一个必须作废历史结论的发现（S21/P37）**：`pipeline.py:149-152` 连 `train_end` 都不传（落 70/30 切点），且 `predict_start=None` → `predict = valid` → **早停的 `eval_set` 与最终评估集是同一批数据**，教科书式早停泄漏。所幸它不在调度链上（`scheduled_workflow.py:923-924` 直接调 `full_train_batched`），**现役不受影响**；但 `RESEARCH_ARCHIVE` 里任何出自 `pipeline.py` 的比较都要重跑。
+
+**(e) 我在子代理之上的两点推进：**
+
+1. **S10 有了两条更便宜的答法。** `scheduled_workflow.py:1011` 也把 `purge_horizon` 写进 manifest，但 `:883-884` 的回读**只查 `rolling_factor_select`，从不查 `purge_horizon`**（只写不读，手工改会被静默忽略，S22）；更便宜的是 `full_train_batched.py:1179` 把 `purge_horizon` 写进**训练 summary** → **不用读 manifest，读任意一次训练 summary 即可。**
+2. **第三个"存在于代码库之外的关键产物"（S14）。** 子代理说因子候选清单 `factor_selection_lh1000_cont` 产自 `select.select_factors`；这不确切 —— 全仓库 grep `lh1000` **只有 3 处命中、全部是消费者**，而 `select.py:159` 和 `pipeline.py:72` 的默认名都是裸 `"factor_selection"`。→ 它是一份**来源不可审计、时间不明、无人重建的冻结手工清单**，而每窗滚动选择只能在它的子集内重挑（S15）。这比"全样本做特征选择"更糟：连"用了哪段全样本"都无从得知。加了第三个 10 分钟待办：在生产主机上 `ls -l` 看它的 mtime 与行数。
+
+**第六条增量不改变 §1.1 任何一条判定**，但它改变了两件事：**接手者的时间该花在哪**（S9 + S14 + S10 的共线性维度，而不是 purge），以及 **P00 该怎么做才不会白做**（P35 是前置条件）。

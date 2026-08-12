@@ -344,7 +344,7 @@ def panel_for_variant(panel: pd.DataFrame, variant: RaceVariant) -> pd.DataFrame
     if variant.training_target in {"execution", "execution_legacy"}:
         data = panel
     else:
-        data = panel.copy(deep=False)
+        data = panel.copy(deep=True)
     if variant.training_target == "execution":
         required = {"target_penalty_net_ret_t1", "target_penalty_excess_ret_t1"}
         if not required.issubset(data.columns):
@@ -755,6 +755,11 @@ def run_screened_rolling_race(
                     "reason": "history has no row-level publication timestamp",
                     "excluded_from_primary_common_universe": True,
                 }
+        predictions = _causal_eligible_predictions(
+            predictions, panel, valid_start, valid_end
+        )
+        if reference is not None:
+            reference = predictions["daily_current_reference"]
         labels = panel[
             [
                 "code",
@@ -1767,13 +1772,12 @@ def _evaluate_recipe_frames(
     labels: pd.DataFrame,
     top_n: int,
 ) -> tuple[pd.DataFrame, dict[str, dict]]:
-    records = []
+    records, comparison = simulate_fixed_exit_race(
+        predictions, labels, ExecutionConfig(top_n=top_n)
+    )
     metrics = {}
-    for name, frame in predictions.items():
-        model_records, comparison = simulate_fixed_exit_race(
-            {name: frame}, labels, ExecutionConfig(top_n=top_n)
-        )
-        records.append(model_records)
+    for name in predictions:
+        model_records = records[records["model"] == name]
         summary = comparison["models"][name]
         normal = (
             model_records["entry_buyable"].fillna(False).astype(bool)
@@ -1788,7 +1792,7 @@ def _evaluate_recipe_frames(
             ),
             "unsellable_rate": float(summary["unsellable"] / max(len(model_records), 1)),
         }
-    return pd.concat(records, ignore_index=True), metrics
+    return records, metrics
 
 
 def _select_inner_recipe(metrics: dict[str, dict]) -> dict:

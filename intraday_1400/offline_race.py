@@ -21,7 +21,7 @@ class ExecutionConfig:
     trailing_arm: float = 0.03
     trailing_drawdown: float = 0.02
     max_exit_sessions: int = 3
-    flat_bar_tolerance: float = 0.005
+    flat_bar_tolerance: float = 0.0005
     limit_return_threshold: float = 0.045
 
     def __post_init__(self) -> None:
@@ -299,7 +299,9 @@ def _locked_bar(row: pd.Series, previous_close: float | None, direction: str, co
     if float(row.get("volume") or 0.0) <= 0:
         return True
     spread = abs(float(row["high"]) - float(row["low"]))
-    if spread > config.flat_bar_tolerance or not previous_close:
+    if not previous_close:
+        return False
+    if spread / abs(float(previous_close)) > config.flat_bar_tolerance:
         return False
     bar_return = float(row["close"]) / previous_close - 1.0
     if direction == "buy":

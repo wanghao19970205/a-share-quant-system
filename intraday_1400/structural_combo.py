@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
@@ -173,6 +175,52 @@ def build_daily_execution_filter_scores(
     merged["score"] = merged["e4_daily_prior"]
     merged["model_variant"] = "e4_top100_buy_filter_daily_rank"
     return merged.sort_values(["date", "code"]).reset_index(drop=True)
+
+
+def e4_coverage_diagnostics(
+    daily_prior: pd.DataFrame,
+    minute_combo: pd.DataFrame,
+    expected_dates: pd.DatetimeIndex,
+    candidate_n: int = 100,
+) -> dict:
+    expected = pd.DatetimeIndex(expected_dates).normalize().drop_duplicates().sort_values()
+    daily = _raw_head(daily_prior, "e4_daily_prior")
+    minute = _raw_head(minute_combo, "minute_combo")
+    available = pd.DatetimeIndex(daily["date"].unique()).sort_values()
+    missing = expected.difference(available)
+    if len(missing):
+        formatted = ",".join(str(pd.Timestamp(value).date()) for value in missing)
+        raise ValueError(f"E4 daily prior missing expected dates: {formatted}")
+    daily = daily[daily["date"].isin(expected)].sort_values(
+        ["date", "e4_daily_prior", "code"],
+        ascending=[True, False, True],
+        kind="mergesort",
+    )
+    daily["e4_candidate_rank"] = daily.groupby("date").cumcount() + 1
+    candidates = daily[daily["e4_candidate_rank"] <= int(candidate_n)]
+    merged = candidates.merge(
+        minute[["code", "date"]],
+        on=["code", "date"],
+        how="inner",
+        validate="one_to_one",
+    )
+    candidate_rows = int(len(candidates))
+    merged_rows = int(len(merged))
+    calendar_payload = "\n".join(
+        str(pd.Timestamp(value).date()) for value in expected
+    ).encode("ascii")
+    return {
+        "calendar_sha256": hashlib.sha256(calendar_payload).hexdigest(),
+        "expected_dates": int(len(expected)),
+        "available_dates": int(len(available.intersection(expected))),
+        "missing_dates": [],
+        "daily_prior_rows": int(len(daily)),
+        "candidate_rows": candidate_rows,
+        "minute_matched_candidate_rows": merged_rows,
+        "top_candidate_retention": (
+            float(merged_rows / candidate_rows) if candidate_rows else None
+        ),
+    }
 
 
 def build_e0_e4_staged_scores(
