@@ -135,6 +135,13 @@ case "$job" in
             --skip-events --skip-valuation --skip-fundamentals --skip-snapshots \
             --intraday-spot \
             --strategy-mode incumbent-refresh \
+            --train-target-mode tradable-label \
+            --strict-execution-labels \
+            --strict-calendar-factors \
+            --strict-announcement-lag \
+            --strict-pit-min-price-rows \
+            --purge-horizon \
+            --pit-index-code 000852.SH \
             --skip-swing-grid \
             --model-threads 12 \
             --recent-windows 6 \
@@ -160,6 +167,13 @@ case "$job" in
             --skip-valuation --skip-fundamentals --skip-snapshots \
             --force-latest-price \
             --strategy-mode incumbent-refresh \
+            --train-target-mode tradable-label \
+            --strict-execution-labels \
+            --strict-calendar-factors \
+            --strict-announcement-lag \
+            --strict-pit-min-price-rows \
+            --purge-horizon \
+            --pit-index-code 000852.SH \
             --skip-swing-grid \
             --model-threads 12 \
             --recent-windows 24 \
@@ -182,6 +196,13 @@ case "$job" in
             --lookback-days 5 --event-window-days 180 \
             --skip-snapshots \
             --strategy-mode incumbent-refresh \
+            --train-target-mode tradable-label \
+            --strict-execution-labels \
+            --strict-calendar-factors \
+            --strict-announcement-lag \
+            --strict-pit-min-price-rows \
+            --purge-horizon \
+            --pit-index-code 000852.SH \
             --skip-swing-grid \
             --model-threads 12 \
             --recent-windows 24 \
@@ -207,6 +228,13 @@ case "$job" in
         python -m quant.scheduled_workflow \
             --skip-daily-update \
             --strategy-mode candidate-upgrade --short-only-upgrade \
+            --train-target-mode tradable-label \
+            --strict-execution-labels \
+            --strict-calendar-factors \
+            --strict-announcement-lag \
+            --strict-pit-min-price-rows \
+            --purge-horizon \
+            --pit-index-code 000852.SH \
             --output-prefix monthly_factor_candidate \
             --refresh-months 1 --recent-windows 36 \
             --train-months "$TRAIN_MONTHS" \

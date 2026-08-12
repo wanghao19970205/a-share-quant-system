@@ -155,18 +155,20 @@ def _base_combos(path: Path, kind: str) -> pd.DataFrame:
                 for gross in (0.18, 0.24, 0.30):
                     for rq in (0.45, 0.50, 0.55, 0.60, 0.65, 0.70):
                         for pq in (None, 0.50, 0.55, 0.60, 0.65, 0.70):
-                            for naive in (0.0, 0.1, 0.2):
-                                rows.append({
-                                    "ic_weight": ic,
-                                    "top_n": top_n,
-                                    "gross_exposure": gross,
-                                    "slot_weight": gross / top_n,
-                                    "ridge_quantile": rq,
-                                    "pred_quantile": pq,
-                                    "naive_weight": naive,
-                                    "rebalance_stride": 1,
-                                    "hold_rank_buffer": 0,
-                                })
+                                for naive in (0.0, 0.1, 0.2):
+                                    for stride in (1, 2, 3):
+                                        for buffer in (0, 1, 2):
+                                            rows.append({
+                                                "ic_weight": ic,
+                                                "top_n": top_n,
+                                                "gross_exposure": gross,
+                                                "slot_weight": gross / top_n,
+                                                "ridge_quantile": rq,
+                                                "pred_quantile": pq,
+                                                "naive_weight": naive,
+                                                "rebalance_stride": stride,
+                                                "hold_rank_buffer": buffer,
+                                            })
         standard = pd.DataFrame(rows)
         if template.empty:
             return standard
@@ -176,11 +178,14 @@ def _base_combos(path: Path, kind: str) -> pd.DataFrame:
         for mw in (0.07, 0.08, 0.09, 0.10):
             for rq in (0.30, 0.35, 0.40, 0.45):
                 for pq in (None, 0.55, 0.60):
-                    rows.append({
-                        "ic_weight": ic, "max_weight": mw,
-                        "ridge_quantile": rq, "pred_quantile": pq,
-                        "rebalance_stride": 1,
-                    })
+                    for stride in (1, 2, 3):
+                        for buffer in (0, 1, 2):
+                            rows.append({
+                                "ic_weight": ic, "max_weight": mw,
+                                "ridge_quantile": rq, "pred_quantile": pq,
+                                "rebalance_stride": stride,
+                                "hold_rank_buffer": buffer,
+                            })
     standard = pd.DataFrame(rows)
     if template.empty:
         return standard
@@ -539,13 +544,25 @@ def _selection_summary(grid: pd.DataFrame) -> pd.DataFrame:
         avg_direction_win_rate=("direction_win_rate", "mean"),
         avg_turnover=("avg_turnover", "mean"),
     ).reset_index()
+    gross = pd.to_numeric(out.get("gross_exposure"), errors="coerce")
+    if gross is None:
+        gross = pd.Series(np.nan, index=out.index)
+    max_weight = pd.to_numeric(out.get("max_weight"), errors="coerce")
+    top_n = pd.to_numeric(out.get("top_n"), errors="coerce")
+    if max_weight is not None:
+        if top_n is None:
+            top_n = pd.Series(3.0, index=out.index)
+        gross = gross.fillna(max_weight * top_n)
+    gross = gross.where(gross > 0)
+    normalized_drawdown = out["worst_drawdown"] / gross
+    normalized_turnover = out["avg_turnover"] / gross
     out["selection_score"] = (
         out["avg_sharpe"].fillna(0.0)
         + (out["avg_win_rate"].fillna(0.5) - 0.5) * 2.0
         + (out["avg_direction_win_rate"].fillna(0.5) - 0.5)
         + out["avg_annual_return"].fillna(0.0) * 0.15
-        + out["worst_drawdown"].fillna(-1.0) * 0.25
-        - out["avg_turnover"].fillna(1.0) * 0.05
+        + normalized_drawdown.fillna(-1.0) * 0.25
+        - normalized_turnover.fillna(1.0) * 0.05
     )
     return out.sort_values("selection_score", ascending=False).reset_index(drop=True)
 
@@ -668,7 +685,7 @@ def stability_decision(candidate: dict[int, pd.DataFrame], baseline: dict[int, p
     """Accept one clear non-overlap win when all other horizons are broadly stable."""
     details = []
     improved = significant = acceptable = 0
-    month_wins = month_total = 0
+    monthly_win_rates = []
     for horizon in sorted(set(candidate) & set(baseline)):
         candidate_frame = candidate[horizon]
         stride_values = pd.to_numeric(
@@ -707,21 +724,25 @@ def stability_decision(candidate: dict[int, pd.DataFrame], baseline: dict[int, p
             lambda x: (1.0 + x).prod() - 1.0)
         valid_months = monthly.dropna()
         wins = int((valid_months["ret_candidate"] > valid_months["ret_baseline"]).sum())
-        month_wins += wins
-        month_total += len(valid_months)
+        months = int(len(valid_months))
+        monthly_win_rate = wins / months if months else 0.0
+        monthly_win_rates.append(monthly_win_rate)
         details.append({"horizon": int(horizon), "nonoverlap_candidate_sharpe": c_sharpe,
                         "nonoverlap_baseline_sharpe": b_sharpe,
                         "nonoverlap_sharpe_gain": sharpe_gain,
                         "significant_improvement": is_significant,
                         "within_allowed_decline": is_acceptable,
                         "monthly_wins": wins, "months": int(len(valid_months))})
-    monthly_win_rate = month_wins / month_total if month_total else 0.0
     common = len(details)
+    monthly_win_rate = (
+        float(np.mean(monthly_win_rates)) if monthly_win_rates else 0.0
+    )
     passed = (
         significant >= 1
         and acceptable == common
         and common > 0
-        and monthly_win_rate >= float(min_monthly_win_rate)
+        and monthly_win_rates
+        and all(rate >= float(min_monthly_win_rate) for rate in monthly_win_rates)
     )
     return {"passed": bool(passed), "nonoverlap_improved_horizons": improved,
             "significant_improved_horizons": significant,
@@ -729,7 +750,9 @@ def stability_decision(candidate: dict[int, pd.DataFrame], baseline: dict[int, p
             "min_significant_sharpe_gain": float(min_significant_sharpe_gain),
             "max_other_sharpe_decline": float(max_other_sharpe_decline),
             "common_horizons": common, "monthly_win_rate": monthly_win_rate,
-            "monthly_wins": month_wins, "months": month_total, "details": details}
+            "monthly_win_rates": monthly_win_rates,
+            "monthly_wins": int(sum(int(d["monthly_wins"]) for d in details)),
+            "months": int(sum(int(d["months"]) for d in details)), "details": details}
 
 
 def promotion_decision(candidate: pd.DataFrame, baseline: pd.DataFrame,

@@ -1372,6 +1372,14 @@ class ModelExpansionExperimentTest(unittest.TestCase):
 
         self.assertEqual(selected["date"].tolist(), [dates[0], dates[4]])
 
+    def test_base_grid_searches_stride_and_hold_buffer(self):
+        short = watchlist_grid._base_combos(Path("missing-template.parquet"), "short")
+        swing = watchlist_grid._base_combos(Path("missing-template.parquet"), "swing")
+        self.assertEqual(set(short["rebalance_stride"]), {1, 2, 3})
+        self.assertEqual(set(short["hold_rank_buffer"]), {0, 1, 2})
+        self.assertEqual(set(swing["rebalance_stride"]), {1, 2, 3})
+        self.assertEqual(set(swing["hold_rank_buffer"]), {0, 1, 2})
+
     def test_watchlist_stride_defaults_daily_and_uses_authoritative_calendar(self):
         dates = pd.bdate_range("2026-01-05", periods=5)
         pred = pd.DataFrame({
@@ -1404,19 +1412,32 @@ class ModelExpansionExperimentTest(unittest.TestCase):
             "param_id": [0, 1],
             "source": ["template", "template"],
             "rebalance_stride": [1, 2],
+            "gross_exposure": [0.2, 0.4],
             "horizon": [1, 1],
             "sharpe": [0.1, 0.2],
             "annual_return": [0.01, 0.02],
-            "max_drawdown": [-0.1, -0.1],
+            "max_drawdown": [-0.1, -0.2],
             "win_rate": [0.5, 0.5],
             "direction_win_rate": [0.5, 0.5],
-            "avg_turnover": [0.2, 0.2],
+            "avg_turnover": [0.2, 0.4],
         })
 
         summary = watchlist_grid._selection_summary(grid)
 
         self.assertEqual(set(summary["rebalance_stride"]), {1, 2})
         self.assertEqual(len(summary), 2)
+
+    def test_selection_score_normalizes_exposure_scaled_penalties(self):
+        grid = pd.DataFrame({
+            "param_id": [0, 1], "source": ["template", "template"],
+            "gross_exposure": [0.2, 0.4], "horizon": [1, 1],
+            "sharpe": [1.0, 1.0], "annual_return": [0.1, 0.1],
+            "max_drawdown": [-0.1, -0.2], "win_rate": [0.5, 0.5],
+            "direction_win_rate": [0.5, 0.5], "avg_turnover": [0.2, 0.4],
+        })
+        summary = watchlist_grid._selection_summary(grid)
+        scores = summary.sort_values("gross_exposure")["selection_score"].tolist()
+        self.assertAlmostEqual(scores[0], scores[1])
 
     def test_grid_selection_keeps_hold_buffer_in_parameter_identity(self):
         grid = pd.DataFrame({
@@ -1434,6 +1455,24 @@ class ModelExpansionExperimentTest(unittest.TestCase):
         summary = watchlist_grid._selection_summary(grid)
         self.assertEqual(len(summary), 2)
         self.assertEqual(set(summary["hold_rank_buffer"]), {0, 1})
+
+    def test_stability_gate_requires_each_horizon_monthly_win_rate(self):
+        dates = pd.to_datetime(["2026-01-05", "2026-02-05", "2026-03-05"])
+        candidate = {
+            1: pd.DataFrame({"date": dates, "ret": [0.03, 0.03, 0.03]}),
+            3: pd.DataFrame({"date": dates, "ret": [0.03, -0.03, -0.03]}),
+        }
+        baseline = {
+            1: pd.DataFrame({"date": dates, "ret": [0.0, 0.0, 0.0]}),
+            3: pd.DataFrame({"date": dates, "ret": [0.0, 0.0, 0.0]}),
+        }
+        decision = watchlist_grid.stability_decision(
+            candidate, baseline,
+            min_significant_sharpe_gain=-100.0,
+            max_other_sharpe_decline=100.0,
+        )
+        self.assertFalse(decision["passed"])
+        self.assertEqual(decision["monthly_win_rates"], [1.0, 1 / 3])
 
     def test_weight_turnover_uses_stock_and_cash_weights(self):
         self.assertAlmostEqual(

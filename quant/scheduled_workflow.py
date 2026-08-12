@@ -1028,10 +1028,15 @@ def _append_research_training_args(cmd: list[str], args: argparse.Namespace) -> 
         "strict_pit_min_price_rows": "--strict-pit-min-price-rows",
         "strict_execution_labels": "--strict-execution-labels",
         "require_selection_provenance": "--require-selection-provenance",
+        "pit_index_code": "--pit-index-code",
         "enforce_c30_gates": "--enforce-c30-gates",
     }
     for attribute, option in flag_options.items():
-        if bool(getattr(args, attribute, False)):
+        value = getattr(args, attribute, None)
+        if attribute == "pit_index_code":
+            if value:
+                cmd.extend([option, str(value)])
+        elif bool(value):
             cmd.append(option)
     train_target_mode = str(getattr(args, "train_target_mode", "baseline"))
     if train_target_mode != "baseline":
@@ -1195,6 +1200,7 @@ def build_params(args: argparse.Namespace) -> dict:
         "strict_calendar_factors": bool(getattr(args, "strict_calendar_factors", False)),
         "strict_announcement_lag": bool(getattr(args, "strict_announcement_lag", False)),
         "strict_execution_labels": bool(getattr(args, "strict_execution_labels", False)),
+        "pit_index_code": str(getattr(args, "pit_index_code", "") or ""),
         "enforce_c30_gates": bool(getattr(args, "enforce_c30_gates", False)),
         "train_target_mode": str(getattr(args, "train_target_mode", "baseline")),
         "min_adv20": getattr(args, "min_adv20", None),
@@ -1305,6 +1311,8 @@ def main() -> None:
     ap.add_argument("--strict-announcement-lag", action="store_true")
     ap.add_argument("--strict-pit-min-price-rows", action="store_true")
     ap.add_argument("--strict-execution-labels", action="store_true")
+    ap.add_argument("--pit-index-code", default="",
+                    help="resolve a PIT index universe at each training window anchor")
     ap.add_argument("--require-selection-provenance", action="store_true")
     ap.add_argument("--enforce-c30-gates", action="store_true")
     ap.add_argument(
