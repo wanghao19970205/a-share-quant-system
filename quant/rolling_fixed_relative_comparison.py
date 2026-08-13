@@ -137,6 +137,13 @@ def compare(args: argparse.Namespace) -> None:
         p_values = [model_stats["rolling"][str(block)].get("p_value_one_sided") for block in blocks]
         valid_p = [p for p in p_values if p is not None]
         comparisons[baseline] = {"rolling": model_stats["rolling"], "fixed": model_stats["fixed"], "holm_p_values": _holm_adjust(valid_p)}
+    comparisons["rolling_vs_fixed"] = {
+        str(block): _paired_block_bootstrap(
+            result["rolling_absolute_return"], result["fixed_absolute_return"],
+            args.bootstrap_samples, block, args.seed,
+        )
+        for block in blocks
+    }
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     atomic_parquet(result, output / "relative_daily.parquet")
