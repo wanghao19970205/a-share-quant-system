@@ -650,6 +650,7 @@ def train_lightgbm_ranker(panel: pd.DataFrame, features: list[str], horizon: int
                           decay_half_life_days: float | None = 90.0, min_weight: float = 0.05,
                           n_estimators: int = 800, learning_rate: float | None = None,
                           early_stopping_rounds: int = 50, n_jobs: int | None = None,
+                          model_threads: int | None = None,
                           rank_bins: int = 5, eval_at: tuple[int, ...] = (3,),
                           label_col: str | None = None, train_mask_col: str | None = None,
                           predict_end: str | None = None) -> TrainResult:
@@ -675,7 +676,8 @@ def train_lightgbm_ranker(panel: pd.DataFrame, features: list[str], horizon: int
         x_df = pd.DataFrame(x, columns=features)
         xv_df = pd.DataFrame(xv, columns=features)
         xp_df = pd.DataFrame(xp, columns=features)
-        model = lgb.LGBMRanker(objective="lambdarank", metric="ndcg", n_estimators=n_estimators, learning_rate=learning_rate or 0.02, num_leaves=31, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, verbose=-1, n_jobs=n_jobs)
+        ranker_threads = model_threads if model_threads is not None else n_jobs
+        model = lgb.LGBMRanker(objective="lambdarank", metric="ndcg", n_estimators=n_estimators, learning_rate=learning_rate or 0.02, num_leaves=31, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0, random_state=42, verbose=-1, n_jobs=ranker_threads)
         callbacks = [lgb.early_stopping(early_stopping_rounds, verbose=False)] if early_stopping_rounds else []
         model.fit(x_df, y, group=group.tolist(), sample_weight=sample_weight,
                   eval_set=[(xv_df, yv)], eval_group=[valid_group.tolist()],
