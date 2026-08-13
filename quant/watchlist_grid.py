@@ -542,15 +542,15 @@ def _selection_summary(grid: pd.DataFrame) -> pd.DataFrame:
         avg_direction_win_rate=("direction_win_rate", "mean"),
         avg_turnover=("avg_turnover", "mean"),
     ).reset_index()
-    gross = pd.to_numeric(out.get("gross_exposure"), errors="coerce")
-    if gross is None:
-        gross = pd.Series(np.nan, index=out.index)
-    max_weight = pd.to_numeric(out.get("max_weight"), errors="coerce")
-    top_n = pd.to_numeric(out.get("top_n"), errors="coerce")
-    if max_weight is not None:
-        if top_n is None:
-            top_n = pd.Series(3.0, index=out.index)
-        gross = gross.fillna(max_weight * top_n)
+    def numeric_series(column: str, default: float = np.nan) -> pd.Series:
+        if column not in out:
+            return pd.Series(default, index=out.index, dtype=float)
+        return pd.to_numeric(out[column], errors="coerce")
+
+    gross = numeric_series("gross_exposure")
+    max_weight = numeric_series("max_weight")
+    top_n = numeric_series("top_n", default=3.0)
+    gross = gross.fillna(max_weight * top_n)
     gross = gross.where(gross > 0)
     normalized_annual_return = out["avg_annual_return"] / gross
     normalized_drawdown = out["worst_drawdown"] / gross
