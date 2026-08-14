@@ -160,9 +160,30 @@ def _causal_screened_features(
         minute_features=minute_sources,
         max_rows=max_rows,
     )
-    selected = screen_window_features(screening_panel, groups, train_end)
-    control = selected["daily_asof_plus_minute_control"]
-    base_features = list(control["asof_matched"])
+    # The causal gate only consumes the matched base and minute selections.
+    # Avoid screening unrelated diagnostic variants that cannot affect output.
+    screening_variants = tuple(
+        variant for variant in DEFAULT_TRAINED_VARIANTS
+        if variant.name in {"daily_close_control", "daily_close_plus_minute_control"}
+    )
+    selected = screen_window_features(
+        screening_panel,
+        groups,
+        train_end,
+        variants=screening_variants,
+        align_controls=False,
+    )
+    legacy_control = selected.get("daily_asof_plus_minute_control", {})
+    close_control = selected.get("daily_close_control")
+    if close_control is None:
+        # Keep compatibility with callers that provide the already aligned control.
+        base_features = list(legacy_control["asof_matched"])
+    else:
+        base_features = [
+            f"asof__{feature.removeprefix('daily__')}"
+            for feature in close_control["daily_matched"]
+        ]
+    minute_control = selected.get("daily_close_plus_minute_control", legacy_control)
     if groups.get("minute"):
         causal_variant = next(
             variant for variant in DEFAULT_TRAINED_VARIANTS
@@ -179,7 +200,7 @@ def _causal_screened_features(
         minute_features = list(selected_minute)
     else:
         selected_by_family = {}
-        minute_features = list(control["minute"])
+        minute_features = list(minute_control["minute"])
     if not base_features or not minute_features:
         raise RuntimeError("causal daily-minute screening selected an empty feature group")
     selected_sources = {
@@ -736,7 +757,11 @@ def _run_enhancement_race_unlocked(
         # feature panel and a model matrix from overlapping in memory.
         execution_labels = labels[labels["date"].isin(fold["oos"])].copy()
         execution_panel, universe_hashes = _build_panel(
-            execution_labels, daily_dir, intraday_dir, [], []
+            execution_labels,
+            daily_dir,
+            intraday_dir,
+            base_features,
+            minute_features,
         )
         universe_hashes_by_fold[fold["name"]] = universe_hashes
         prepared_vs_label_key_counts_by_fold[fold["name"]] = execution_panel.attrs.get(

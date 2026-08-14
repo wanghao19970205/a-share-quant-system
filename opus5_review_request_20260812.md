@@ -86,3 +86,30 @@ Please review especially:
 6. Whether subprocess intermediate artifacts and their input hashes are sufficiently represented in the final protocol/provenance manifest.
 
 Current minute conclusion: **no minute feature return conclusion exists**. Do not promote, publish, modify active manifests, change realtime, or enable scheduler based on any partial or capped run.
+
+## Current gate acceleration and failure handoff (2026-08-14)
+
+The current working tree contains research-only acceleration changes for the minute runner:
+
+- `intraday_1400/pipeline.py` vectorizes the daily Spearman IC calculation while preserving the old equal-weight daily semantics; random-data equivalence was within `2.6e-18`, and a 24-feature benchmark improved from `3.275s` to `0.337s`.
+- `intraday_1400/daily_minute_enhancement.py` limits causal screening to the two controls actually consumed by the gate, passes an explicit `align_controls=False` for incomplete variant subsets, and reuses the selected feature projection for execution-universe loading.
+- `intraday_1400/fair_race_pipeline.py` keeps the default full-variant control alignment unchanged and adds the explicit opt-out only for the bounded research gate.
+
+Remote evidence that needs review:
+
+- v1 unrestricted gate eventually exited `137` after long single-core screening; no artifact was produced. This is separate from the older 12 GiB memcg OOM evidence.
+- v2 exited `1` before screening because its actual container mount list lacked `/app/quant_data`; the same configuration with explicit mounts passed `provenance_ok 44`.
+- v4 exited `1` in `align_control_feature_selections()` because the reduced variant subset violated an implicit assumption that all aligned variant keys exist.
+- v5 exited `1` after screening, when execution-universe loading passed empty feature lists and `merge_prepared_frames()` rejected empty daily/asof/minute groups.
+- v6 reached the `wf1 / daily_asof_baseline` candidate panel path but exited `1` at the same non-empty feature-group check. It produced no checkpoint, prediction, metrics, daily return, or report artifact. `OOMKilled=false`; host memory was healthy.
+- After v6, further remote fixes and gate restarts were paused for this Opus5 review. The failed containers and isolated output directories are retained for diagnosis.
+
+Review these specific contracts before any next run:
+
+1. Define the contract for empty feature lists in `load_joined_prepared()` and `_build_panel()` separately for execution-universe and candidate-model panels; verify whether both paths should use the same projection.
+2. Check per-month schema filtering and whether a valid selected feature can become an empty group after `intraday_columns` projection.
+3. Review the new `align_controls` escape hatch and require tests for partial variant subsets without weakening the default full protocol.
+4. Confirm that the optimized IC implementation is numerically identical to the previous daily Spearman definition under missing values, ties, constant columns, and insufficient dates.
+5. Recommend a disk-first batch design for screening/panel loading before restarting real validation.
+
+Tests currently available: full intraday regression `147/147`, minute enhancement targeted tests `13/13`, optimized IC equivalence, compileall, and `git diff --check`. These are engineering checks only; there is still no minute OOS return conclusion.

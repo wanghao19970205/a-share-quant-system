@@ -591,6 +591,7 @@ def screen_window_features(
     train_end: pd.Timestamp,
     variants: tuple[RaceVariant, ...] = DEFAULT_TRAINED_VARIANTS,
     total_feature_budget: int = 80,
+    align_controls: bool = True,
 ) -> dict[str, dict[str, list[str]]]:
     selected = {}
     for variant in variants:
@@ -612,7 +613,7 @@ def screen_window_features(
             )
             for group in variant.feature_groups
         }
-    return align_control_feature_selections(selected, groups)
+    return align_control_feature_selections(selected, groups) if align_controls else selected
 
 
 def align_control_feature_selections(

@@ -702,17 +702,48 @@ def _daily_ic_score(
     min_rows: int = 5,
     min_dates: int = 20,
 ) -> float | None:
-    daily_ic = []
-    for _, group in train.groupby("date", sort=False):
-        pair = group[[feature, label_col]].apply(pd.to_numeric, errors="coerce").dropna()
-        if len(pair) < min_rows or pair[feature].nunique() < 2 or pair[label_col].nunique() < 2:
-            continue
-        correlation = pair[feature].corr(pair[label_col], method="spearman")
-        if pd.notna(correlation):
-            daily_ic.append(float(correlation))
-    if len(daily_ic) < min_dates:
+    """Return the equal-weight mean absolute daily Spearman IC.
+
+    Rank once per feature/label pair, then calculate Pearson correlation on the
+    ranks from grouped sufficient statistics. This preserves the previous
+    per-date ``Series.corr(method="spearman")`` semantics without invoking a
+    Python callback for every date and feature.
+    """
+    pair = train[["date", feature, label_col]].copy()
+    pair[feature] = pd.to_numeric(pair[feature], errors="coerce")
+    pair[label_col] = pd.to_numeric(pair[label_col], errors="coerce")
+    pair = pair.dropna(subset=[feature, label_col])
+    if pair.empty:
         return None
-    return abs(float(np.mean(daily_ic)))
+    grouped = pair.groupby("date", sort=False, observed=True)
+    counts = grouped.size().rename("n")
+    feature_unique = grouped[feature].nunique().rename("feature_unique")
+    label_unique = grouped[label_col].nunique().rename("label_unique")
+    eligible = (counts >= int(min_rows)) & (feature_unique >= 2) & (label_unique >= 2)
+    if int(eligible.sum()) < int(min_dates):
+        return None
+    pair["_feature_rank"] = pair.groupby("date", sort=False, observed=True)[feature].rank(method="average")
+    pair["_label_rank"] = pair.groupby("date", sort=False, observed=True)[label_col].rank(method="average")
+    ranked = pair.loc[pair["date"].isin(eligible.index[eligible]), ["date", "_feature_rank", "_label_rank"]].copy()
+    ranked["_feature_rank_sq"] = ranked["_feature_rank"] ** 2
+    ranked["_label_rank_sq"] = ranked["_label_rank"] ** 2
+    ranked["_rank_product"] = ranked["_feature_rank"] * ranked["_label_rank"]
+    grouped_rank = ranked.groupby("date", sort=False, observed=True)
+    n = grouped_rank.size().astype(float)
+    sums = grouped_rank[[
+        "_feature_rank", "_label_rank", "_feature_rank_sq", "_label_rank_sq", "_rank_product",
+    ]].sum()
+    sum_x = sums["_feature_rank"]
+    sum_y = sums["_label_rank"]
+    sum_xx = sums["_feature_rank_sq"]
+    sum_yy = sums["_label_rank_sq"]
+    sum_xy = sums["_rank_product"]
+    numerator = n * sum_xy - sum_x * sum_y
+    denominator = np.sqrt((n * sum_xx - sum_x * sum_x) * (n * sum_yy - sum_y * sum_y))
+    correlations = (numerator / denominator).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(correlations) < int(min_dates):
+        return None
+    return abs(float(correlations.mean()))
 
 
 def _select_features(
