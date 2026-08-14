@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .config import RealtimeConfig
+from .reference import assert_prediction_fresh
 
 # mobile_snapshot.json 里的三个固定分组（白名单 Top10/全A Top30/创新药 Top10）。
 _CANDIDATE_GROUPS = ("白名单", "全A", "创新药")
@@ -124,9 +125,11 @@ def _read_predictions(path: Path) -> list[str]:
 def load_codes(cfg: RealtimeConfig) -> list[str]:
     """返回去重后的订阅代码列表（6 位）。
 
-    模拟盘和人工持仓必须有实时价才能执行风控/卖出，因此优先于候选名单，不能在
+    预测制品是候选链的信任根；即使存在持仓、固定候选或全市场兜底，也必须先通过
+    freshness 门禁。模拟盘和人工持仓必须有实时价才能执行风控/卖出，因此优先于候选名单，不能在
     max_subscribe 截断时被挤掉。候选来源保持固定候选组 -> 预测 -> 兜底池的顺序。
     """
+    assert_prediction_fresh(cfg)
     ordered: list[str] = []
     seen: set[str] = set()
 

@@ -1340,6 +1340,34 @@ class ForwardEvaluationTest(unittest.TestCase):
 
 
 class StructuralComboTest(unittest.TestCase):
+    def test_fixed_nonprice_source_is_used_when_configured(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "2025-01.parquet"
+            source.touch()
+            with mock.patch.dict(
+                pipeline.os.environ,
+                {"INTRADAY_1400_NONPRICE_PREPARED_DIR": str(root)},
+            ):
+                self.assertEqual(pipeline._existing_nonprice_source("2025-01"), source)
+
+    def test_feature_screening_uses_equal_weight_daily_ic(self):
+        rows = []
+        dates = pd.bdate_range("2025-01-02", periods=20)
+        for date_index, date in enumerate(dates):
+            size = 100 if date_index == 0 else 5
+            target = np.arange(size, dtype=float)
+            feature = target if date_index == 0 else -target
+            rows.extend(
+                {"date": date, "feature": value, "label": label}
+                for value, label in zip(feature, target)
+            )
+        panel = pd.DataFrame(rows)
+
+        score = pipeline._daily_ic_score(panel, "feature", "label")
+
+        self.assertAlmostEqual(score, 0.9)
+
     def test_feature_screening_window_never_exceeds_training_cutoff(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "screening.json"
@@ -2597,6 +2625,30 @@ class TargetRedesignBackfillTest(unittest.TestCase):
 
 
 class DailyMinuteEnhancementTest(unittest.TestCase):
+    def test_fold_candidate_checkpoint_paths_are_stable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            records, metrics = daily_minute_enhancement._fold_candidate_paths(
+                Path(temporary), "wf1", daily_minute_enhancement.BASELINE
+            )
+            self.assertEqual(records.name, "wf1__daily_asof_baseline.parquet")
+            self.assertEqual(metrics.name, "wf1__daily_asof_baseline.json")
+
+    def test_model_panel_projects_only_candidate_columns(self):
+        panel = pd.DataFrame({
+            "code": ["000001"],
+            "date": pd.to_datetime(["2025-01-02"]),
+            "daily_target_ret_1d": [0.01],
+            "minute__m5_ret_15": [0.02],
+            "unused_execution_column": [True],
+        })
+        projected = daily_minute_enhancement._project_model_panel(
+            panel, ["minute__m5_ret_15"]
+        )
+        self.assertEqual(
+            projected.columns.tolist(),
+            ["code", "date", "daily_target_ret_1d", "minute__m5_ret_15"],
+        )
+
     def test_candidate_grid_keeps_identical_daily_base(self):
         base = ["asof__ret_5d", "asof__volatility_20"]
         minute = [

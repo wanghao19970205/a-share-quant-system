@@ -170,10 +170,10 @@ def assert_prediction_fresh(
         cfg: RealtimeConfig,
         today=None,
 ):
-    """Reject an existing prediction artifact whose newest date is too old."""
+    """Reject missing or unsafe prediction artifacts before realtime startup."""
     path = cfg.predictions_file
     if not path.exists():
-        return None
+        raise RuntimeError(f"prediction artifact is missing: {path}")
     try:
         import pandas as pd
         dates = pd.read_parquet(path, columns=["date"])["date"]
@@ -206,10 +206,8 @@ def _load_expected_return(
     `expected_return` 只融合 Ridge/ElasticNet/ExtraTrees 三条 target_ret 回归腿；`pred` 包含
     LightGBM/IC 等无量纲信号，只转换成 [0,1] 百分位用于排序主序。
     """
-    path = cfg.predictions_file
-    if not path.exists():
-        return {}, None, {}, {}, {}
     assert_prediction_fresh(cfg)
+    path = cfg.predictions_file
     try:
         import pandas as pd
     except Exception:  # noqa: BLE001
@@ -411,9 +409,8 @@ def _build_calibration(cfg: RealtimeConfig):
     """
     if not getattr(cfg, "calib_enabled", True):
         return None
+    assert_prediction_fresh(cfg)
     path = cfg.predictions_file
-    if not path.exists():
-        return None
     try:
         import numpy as np
         import pandas as pd
@@ -478,7 +475,8 @@ def _build_calibration(cfg: RealtimeConfig):
 
 
 def build(cfg: RealtimeConfig, codes: list[str]) -> dict[str, RefRow]:
-    """构建 {code: RefRow}。任何来源缺失都优雅返回可用子集，不抛异常。"""
+    """构建 {code: RefRow}；预测制品缺失或不新鲜时直接阻断。"""
+    assert_prediction_fresh(cfg)
     atr_map = _load_atr_map(cfg, codes)
     ret_map, prediction_date, return_components, model_scores, model_rank_pct = (
         _load_expected_return(cfg))

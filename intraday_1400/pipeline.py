@@ -362,6 +362,12 @@ def build_feature_parts() -> dict:
 
 
 def _existing_nonprice_source(month: str) -> Path | None:
+    fixed_dir = os.environ.get("INTRADAY_1400_NONPRICE_PREPARED_DIR")
+    if fixed_dir:
+        path = Path(fixed_dir) / f"{month}.parquet"
+        if not path.is_file():
+            raise RuntimeError(f"fixed intraday nonprice source is missing for {month}: {path}")
+        return path
     quant_dir = Path(os.environ.get("QUANT_DATA_DIR", "quant_data"))
     candidates = sorted(
         quant_dir.glob(f"*_parts/prepared_monthly/{month}.parquet"),
@@ -689,6 +695,26 @@ def _evaluate_close_baseline(
     }
 
 
+def _daily_ic_score(
+    train: pd.DataFrame,
+    feature: str,
+    label_col: str,
+    min_rows: int = 5,
+    min_dates: int = 20,
+) -> float | None:
+    daily_ic = []
+    for _, group in train.groupby("date", sort=False):
+        pair = group[[feature, label_col]].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(pair) < min_rows or pair[feature].nunique() < 2 or pair[label_col].nunique() < 2:
+            continue
+        correlation = pair[feature].corr(pair[label_col], method="spearman")
+        if pd.notna(correlation):
+            daily_ic.append(float(correlation))
+    if len(daily_ic) < min_dates:
+        return None
+    return abs(float(np.mean(daily_ic)))
+
+
 def _select_features(
     panel: pd.DataFrame,
     features: list[str],
@@ -701,16 +727,11 @@ def _select_features(
     if len(train) > max_rows:
         step = max(len(train) // max_rows, 1)
         train = train.iloc[::step].head(max_rows)
-    target = train.groupby("date")[label_col].rank(pct=True) - 0.5
     scores: list[tuple[float, str]] = []
     for feature in features:
-        values = pd.to_numeric(train[feature], errors="coerce")
-        valid = values.notna() & target.notna()
-        if valid.sum() < 100 or values[valid].std() == 0:
-            continue
-        correlation = values[valid].corr(target[valid])
-        if pd.notna(correlation):
-            scores.append((abs(float(correlation)), feature))
+        score = _daily_ic_score(train, feature, label_col)
+        if score is not None:
+            scores.append((score, feature))
     selected = [feature for _, feature in sorted(scores, reverse=True)[:max(int(top_n), 1)]]
     if not selected:
         raise RuntimeError("feature screening selected no usable columns")
@@ -744,16 +765,11 @@ def _select_minute_features_grouped(
     if len(train) > max_rows:
         step = max(len(train) // max_rows, 1)
         train = train.iloc[::step].head(max_rows)
-    target = train.groupby("date")[label_col].rank(pct=True) - 0.5
     scores: dict[str, float] = {}
     for feature in features:
-        values = pd.to_numeric(train[feature], errors="coerce")
-        valid = values.notna() & target.notna()
-        if valid.sum() < 100 or values[valid].std() == 0:
-            continue
-        correlation = values[valid].corr(target[valid])
-        if pd.notna(correlation):
-            scores[feature] = abs(float(correlation))
+        score = _daily_ic_score(train, feature, label_col)
+        if score is not None:
+            scores[feature] = score
     grouped: dict[str, list[str]] = {}
     for feature in sorted(scores, key=scores.get, reverse=True):
         grouped.setdefault(_minute_family(feature), []).append(feature)

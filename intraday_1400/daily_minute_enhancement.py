@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +23,13 @@ from intraday_1400.direct_return_experiment import (
     _simulate_adaptive_label_race,
 )
 from intraday_1400.fair_race_pipeline import (
+    DEFAULT_TRAINED_VARIANTS,
     _causal_eligible_predictions,
     default_daily_prepared_dir,
     load_joined_prepared,
+    panel_for_variant,
     screen_window_features,
+    _cap_training_panel,
 )
 from intraday_1400.offline_race import ExecutionConfig, compare_execution_records
 from intraday_1400.storage import artifact_hash, atomic_json, atomic_parquet
@@ -57,6 +65,7 @@ MODEL_RECIPE = {
     },
     "decay_half_life_days": 60.0,
     "min_weight": 0.03,
+    "max_train_rows": 100_000,
     "top_n": TOP_N,
     "roundtrip_cost": 0.002,
     "schema_version": config.SCHEMA_VERSION,
@@ -130,24 +139,49 @@ def _causal_screened_features(
     daily_dir: Path,
     intraday_dir: Path,
     prepared_provenance: dict,
+    max_rows: int | None = None,
 ) -> tuple[dict, list[str], list[str], dict]:
     source_window, _, _, _ = _selected_features(screening_report_path)
     train_end = pd.Timestamp(source_window["train_end"])
+    manifest_path = Path(prepared_provenance["feature_manifest"]["path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_features = set(manifest.get("features", []))
+    minute_sources = [
+        feature for feature in manifest.get("features", [])
+        if str(feature).startswith("m5_")
+    ]
+    if not minute_sources:
+        raise RuntimeError("verified feature manifest has no minute feature sources")
     screening_panel, groups = load_joined_prepared(
         daily_dir,
         intraday_dir,
         pd.Timestamp("2018-01-01"),
         train_end,
+        minute_features=minute_sources,
+        max_rows=max_rows,
     )
     selected = screen_window_features(screening_panel, groups, train_end)
     control = selected["daily_asof_plus_minute_control"]
     base_features = list(control["asof_matched"])
-    minute_features = list(control["minute"])
+    if groups.get("minute"):
+        causal_variant = next(
+            variant for variant in DEFAULT_TRAINED_VARIANTS
+            if variant.name == "daily_asof_plus_minute_control"
+        )
+        selected_minute, selected_by_family = pipeline._select_minute_features_grouped(
+            panel_for_variant(screening_panel, causal_variant),
+            groups["minute"],
+            str(train_end.date()),
+            top_n=40,
+            quota=5,
+            label_col="target_excess_ret_t1",
+        )
+        minute_features = list(selected_minute)
+    else:
+        selected_by_family = {}
+        minute_features = list(control["minute"])
     if not base_features or not minute_features:
         raise RuntimeError("causal daily-minute screening selected an empty feature group")
-    manifest_path = Path(prepared_provenance["feature_manifest"]["path"])
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest_features = set(manifest.get("features", []))
     selected_sources = {
         feature.removeprefix("asof__") for feature in base_features
     } | {
@@ -164,6 +198,11 @@ def _causal_screened_features(
         "screening_rows": int(len(screening_panel)),
         "screening_dates": int(screening_panel["date"].nunique()),
         "selected_hash": _canonical_hash({"base": base_features, "minute": minute_features}),
+        "minute_family_counts": {
+            family: len(selected_by_family.get(family, []))
+            for family in MINUTE_FAMILIES
+        },
+        "minute_selection_source": "verified_feature_manifest_recomputed_by_family",
         "source_report_window_metadata_hash": _canonical_hash({
             key: source_window.get(key)
             for key in ("window", "train_end", "purge_date", "valid_start", "valid_end")
@@ -212,6 +251,7 @@ def _build_panel(
         daily_features=[name.removeprefix("asof__") for name in base_features],
         asof_features=[name.removeprefix("asof__") for name in base_features],
         minute_features=[name.removeprefix("minute__") for name in minute_features],
+        key_filter=labels[["code", "date"]],
     )
     if "daily_target_ret_1d" not in panel:
         raise ValueError("matched daily h1 target is unavailable")
@@ -263,6 +303,59 @@ def _build_panel(
     return panel, hashes
 
 
+def _project_model_panel(panel: pd.DataFrame, features: list[str]) -> pd.DataFrame:
+    columns = ["code", "date", "daily_target_ret_1d", *features]
+    missing = sorted(set(columns) - set(panel.columns))
+    if missing:
+        raise ValueError(f"daily-minute model panel is missing columns: {missing}")
+    return panel.loc[:, list(dict.fromkeys(columns))].copy()
+
+
+def _model_worker(config_path: Path) -> None:
+    worker = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    panel = pd.read_parquet(worker["panel_path"])
+    common = {
+        "panel": panel,
+        "features": worker["features"],
+        "horizon": 1,
+        "train_end": worker["train_end"],
+        "valid_end": worker["valid_end"],
+        "predict_start": worker["predict_start"],
+        "predict_end": worker["predict_end"],
+        "decay_half_life_days": float(MODEL_RECIPE["decay_half_life_days"]),
+        "min_weight": float(MODEL_RECIPE["min_weight"]),
+        "label_col": "daily_target_ret_1d",
+        "train_mask_col": None,
+    }
+    if worker["model"] == "ridge":
+        recipe = MODEL_RECIPE["ridge"]
+        result = model.train_ridge(**common, alpha=float(recipe["alpha"]))
+    elif worker["model"] == "lightgbm_ranker":
+        recipe = MODEL_RECIPE["lightgbm_ranker"]
+        result = model.train_lightgbm_ranker(
+            **common,
+            n_estimators=int(recipe["n_estimators"]),
+            learning_rate=float(recipe["learning_rate"]),
+            early_stopping_rounds=int(recipe["early_stopping_rounds"]),
+            n_jobs=int(worker["threads"]),
+            rank_bins=int(recipe["rank_bins"]),
+            eval_at=tuple(recipe["eval_at"]),
+        )
+    else:
+        raise ValueError(f"unknown daily-minute model worker: {worker['model']}")
+    if not result.ok:
+        raise RuntimeError(result.message)
+    predictions_path = Path(worker["predictions_path"])
+    metrics_path = Path(worker["metrics_path"])
+    atomic_parquet(result.predictions, predictions_path)
+    atomic_json({
+        "model": worker["model"],
+        "rows": len(result.predictions),
+        "predictions_sha256": artifact_hash(predictions_path),
+        "metrics": result.metrics,
+    }, metrics_path)
+
+
 def _fit_daily_head(
     panel: pd.DataFrame,
     features: list[str],
@@ -272,39 +365,73 @@ def _fit_daily_head(
     threads: int,
     candidate: str,
     fold: str,
+    artifact_dir: Path | None = None,
+    max_train_rows: int | None = None,
 ) -> pd.DataFrame:
-    common = {
-        "panel": panel,
-        "features": features,
-        "horizon": 1,
-        "train_end": str(train_end.date()),
-        "valid_end": str(oos_end.date()),
-        "predict_start": str(oos_start.date()),
-        "predict_end": str(oos_end.date()),
-        "decay_half_life_days": float(MODEL_RECIPE["decay_half_life_days"]),
-        "min_weight": float(MODEL_RECIPE["min_weight"]),
-        "label_col": "daily_target_ret_1d",
-        "train_mask_col": None,
-    }
+    panel = _cap_training_panel(
+        panel,
+        train_end,
+        max_train_rows=(
+            int(max_train_rows)
+            if max_train_rows is not None
+            else int(MODEL_RECIPE["max_train_rows"])
+        ),
+    )
+    cleanup_dir = artifact_dir is None
+    worker_dir = Path(artifact_dir or tempfile.mkdtemp(prefix="daily_minute_workers_"))
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    panel_path = worker_dir / "model_panel.parquet"
+    atomic_parquet(panel, panel_path)
+    del panel
+    gc.collect()
+    predictions = {}
+    try:
+        for model_name in ("ridge", "lightgbm_ranker"):
+            predictions_path = worker_dir / f"{model_name}_predictions.parquet"
+            metrics_path = worker_dir / f"{model_name}_metrics.json"
+            config_path = worker_dir / f"{model_name}_worker.json"
+            atomic_json({
+                "model": model_name,
+                "panel_path": str(panel_path),
+                "features": features,
+                "train_end": str(train_end.date()),
+                "valid_end": str(oos_end.date()),
+                "predict_start": str(oos_start.date()),
+                "predict_end": str(oos_end.date()),
+                "threads": max(int(threads), 1),
+                "predictions_path": str(predictions_path),
+                "metrics_path": str(metrics_path),
+            }, config_path)
+            worker_code = (
+                "from pathlib import Path; "
+                "from intraday_1400.daily_minute_enhancement import _model_worker; "
+                "_model_worker(Path(__import__('sys').argv[1]))"
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", worker_code, str(config_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "worker exited without output")[-2000:]
+                raise RuntimeError(f"{candidate} {fold} {model_name} worker failed: {detail}")
+            if not predictions_path.is_file() or not metrics_path.is_file():
+                raise RuntimeError(f"{candidate} {fold} {model_name} worker produced no artifact")
+            metadata = json.loads(metrics_path.read_text(encoding="utf-8"))
+            if metadata.get("predictions_sha256") != artifact_hash(predictions_path):
+                raise RuntimeError(f"{candidate} {fold} {model_name} prediction artifact hash mismatch")
+            predictions[model_name] = pd.read_parquet(predictions_path)
+    finally:
+        panel_path.unlink(missing_ok=True)
+        if cleanup_dir:
+            shutil.rmtree(worker_dir, ignore_errors=True)
     ridge_recipe = MODEL_RECIPE["ridge"]
     ranker_recipe = MODEL_RECIPE["lightgbm_ranker"]
-    ridge = model.train_ridge(**common, alpha=float(ridge_recipe["alpha"]))
-    ranker = model.train_lightgbm_ranker(
-        **common,
-        n_estimators=int(ranker_recipe["n_estimators"]),
-        learning_rate=float(ranker_recipe["learning_rate"]),
-        early_stopping_rounds=int(ranker_recipe["early_stopping_rounds"]),
-        n_jobs=threads,
-        rank_bins=int(ranker_recipe["rank_bins"]),
-        eval_at=tuple(ranker_recipe["eval_at"]),
-    )
-    for name, result in (("ridge", ridge), ("lightgbm_ranker", ranker)):
-        if not result.ok:
-            raise RuntimeError(f"{candidate} {fold} {name} failed: {result.message}")
-    merged = ridge.predictions[["code", "date", "pred"]].rename(
+    merged = predictions["ridge"][['code', 'date', 'pred']].rename(
         columns={"pred": "ridge_pred"}
     ).merge(
-        ranker.predictions[["code", "date", "pred"]].rename(columns={"pred": "ranker_pred"}),
+        predictions["lightgbm_ranker"][["code", "date", "pred"]].rename(columns={"pred": "ranker_pred"}),
         on=["code", "date"],
         how="inner",
         validate="one_to_one",
@@ -542,6 +669,11 @@ def validate_state(state: dict, verify_inputs: bool = True) -> None:
         _validate_saved_inputs(state.get("input_hashes", {}))
 
 
+def _fold_candidate_paths(checkpoint_dir: Path, fold_name: str, candidate: str) -> tuple[Path, Path]:
+    key = f"{fold_name}__{candidate}"
+    return checkpoint_dir / f"{key}.parquet", checkpoint_dir / f"{key}.json"
+
+
 def _run_enhancement_race_unlocked(
     label_paths: list[Path],
     screening_report_path: Path,
@@ -550,6 +682,10 @@ def _run_enhancement_race_unlocked(
     daily_dir: Path | None = None,
     intraday_dir: Path | None = None,
     model_threads: int = 8,
+    only_fold: str | None = None,
+    only_candidate: str | None = None,
+    gate_only: bool = False,
+    max_train_rows: int | None = None,
 ) -> dict:
     output_dir = Path(output_dir)
     state_dir = Path(state_dir)
@@ -567,39 +703,135 @@ def _run_enhancement_race_unlocked(
     labels = combine_historical_labels(label_paths)
     dates = validate_historical_dates(labels, load_trading_calendar(intraday_dir))
     folds = registered_folds(dates)
+    if only_fold is not None:
+        folds = [fold for fold in folds if fold["name"] == only_fold]
+        if not folds:
+            raise ValueError(f"unknown daily-minute fold: {only_fold}")
     feature_window, base_features, minute_features, screening_evidence = _causal_screened_features(
         screening_report_path,
         daily_dir,
         intraday_dir,
         inputs["prepared_provenance"],
+        max_rows=(int(max_train_rows) if gate_only and max_train_rows is not None else None),
     )
     grid = candidate_features(base_features, minute_features)
-    panel, universe_hashes = _build_panel(
-        labels, daily_dir, intraday_dir, base_features, minute_features
-    )
-    all_records = []
+    if only_candidate is not None:
+        if only_candidate not in grid:
+            raise ValueError(f"unknown daily-minute candidate: {only_candidate}")
+        grid = {only_candidate: grid[only_candidate]}
+    if gate_only and (only_fold is None or only_candidate is None):
+        raise ValueError("gate-only mode requires --only-fold and --only-candidate")
+    checkpoint_dir = output_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_record_paths = []
     fold_reports = []
+    universe_hashes_by_fold = {}
+    prepared_vs_label_key_counts_by_fold = {}
     for fold in folds:
-        fold_panel = panel[~panel["date"].isin(fold["purge"])].copy()
         train_end = pd.Timestamp(fold["train"][-1])
         oos_start = pd.Timestamp(fold["oos"][0])
         oos_end = pd.Timestamp(fold["oos"][-1])
+        # Keep only execution labels/state resident for the fold. Candidate
+        # feature panels are loaded one at a time below, preventing the full
+        # feature panel and a model matrix from overlapping in memory.
+        execution_labels = labels[labels["date"].isin(fold["oos"])].copy()
+        execution_panel, universe_hashes = _build_panel(
+            execution_labels, daily_dir, intraday_dir, [], []
+        )
+        universe_hashes_by_fold[fold["name"]] = universe_hashes
+        prepared_vs_label_key_counts_by_fold[fold["name"]] = execution_panel.attrs.get(
+            "prepared_vs_label_key_counts", {}
+        )
+        fold_panel = execution_panel[
+            ~execution_panel["date"].isin(fold["purge"])
+        ].copy()
+        del execution_labels, execution_panel
+        gc.collect()
         models = {}
         for name, features in grid.items():
-            print(
-                f"[daily-minute] fold={fold['name']} candidate={name} "
-                f"features={len(features)} train_end={train_end.date()} "
-                f"oos={oos_start.date()}..{oos_end.date()}",
-                flush=True,
+            records_path, metrics_path = _fold_candidate_paths(
+                checkpoint_dir, fold["name"], name
             )
-            predictions = _fit_daily_head(
-                fold_panel, features, train_end, oos_start, oos_end,
-                model_threads, name, fold["name"],
-            )
-            records, metrics = _evaluate_candidate(name, predictions, fold_panel, fold["oos"])
-            records["fold"] = fold["name"]
-            all_records.append(records)
+            checkpoint_key = {
+                "protocol": PROTOCOL,
+                "input_hashes": inputs,
+                "fold": fold["name"],
+                "candidate": name,
+                "features": features,
+            }
+            if records_path.is_file() and metrics_path.is_file():
+                saved = json.loads(metrics_path.read_text(encoding="utf-8"))
+                if saved.get("checkpoint_key") != checkpoint_key:
+                    raise RuntimeError(
+                        f"daily-minute checkpoint does not match frozen inputs: {records_path}"
+                    )
+                records = pd.read_parquet(records_path)
+                if artifact_hash(records_path) != saved.get("records_sha256"):
+                    raise RuntimeError(f"daily-minute checkpoint artifact changed: {records_path}")
+                metrics = saved["metrics"]
+                print(
+                    f"[daily-minute] reuse fold={fold['name']} candidate={name}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[daily-minute] fold={fold['name']} candidate={name} "
+                    f"features={len(features)} train_end={train_end.date()} "
+                    f"oos={oos_start.date()}..{oos_end.date()}",
+                    flush=True,
+                )
+                candidate_base = [
+                    feature for feature in features if feature.startswith("asof__")
+                ]
+                candidate_minute = [
+                    feature for feature in features if feature.startswith("minute__")
+                ]
+                candidate_source_labels = labels[labels["date"] <= oos_end].copy()
+                candidate_labels = _cap_training_panel(
+                    candidate_source_labels,
+                    train_end,
+                    max_train_rows=int(MODEL_RECIPE["max_train_rows"]),
+                )
+                del candidate_source_labels
+                candidate_panel, _ = _build_panel(
+                    candidate_labels,
+                    daily_dir,
+                    intraday_dir,
+                    candidate_base,
+                    candidate_minute,
+                )
+                del candidate_labels
+                candidate_panel = candidate_panel[
+                    ~candidate_panel["date"].isin(fold["purge"])
+                ]
+                model_panel = _project_model_panel(candidate_panel, features)
+                del candidate_panel
+                predictions = _fit_daily_head(
+                    model_panel, features, train_end, oos_start, oos_end,
+                    model_threads, name, fold["name"],
+                    checkpoint_dir / "model_workers" / fold["name"] / name,
+                    max_train_rows,
+                )
+                del model_panel
+                gc.collect()
+                records, metrics = _evaluate_candidate(
+                    name, predictions, fold_panel, fold["oos"]
+                )
+                records["fold"] = fold["name"]
+                atomic_parquet(records, records_path)
+                atomic_json(
+                    {
+                        "checkpoint_key": checkpoint_key,
+                        "records_sha256": artifact_hash(records_path),
+                        "metrics": metrics,
+                    },
+                    metrics_path,
+                )
+                del predictions
+            checkpoint_record_paths.append(records_path)
             models[name] = metrics
+            del records, metrics
+            gc.collect()
         fold_reports.append({
             "name": fold["name"],
             "train_end": str(train_end.date()),
@@ -609,7 +841,30 @@ def _run_enhancement_race_unlocked(
             "oos_days": len(fold["oos"]),
             "models": models,
         })
-    records = pd.concat(all_records, ignore_index=True)
+        del fold_panel, models
+        gc.collect()
+    if gate_only:
+        gate_report = {
+            "protocol": PROTOCOL,
+            "gate_only": True,
+            "folds": [fold["name"] for fold in folds],
+            "candidates": list(grid),
+            "input_hashes": inputs,
+            "checkpoint_dir": str(checkpoint_dir.resolve()),
+            "checkpoint_count": len(checkpoint_record_paths),
+            "max_train_rows": int(max_train_rows) if max_train_rows is not None else int(MODEL_RECIPE["max_train_rows"]),
+            "production_candidate": False,
+            "human_approval_required": True,
+        }
+        output_dir.mkdir(parents=True, exist_ok=True)
+        atomic_json(gate_report, output_dir / "gate_report.json")
+        return gate_report
+    records = pd.concat(
+        [pd.read_parquet(path) for path in checkpoint_record_paths],
+        ignore_index=True,
+    )
+    del checkpoint_record_paths
+    gc.collect()
     oos_dates = pd.DatetimeIndex(
         sorted({pd.Timestamp(value) for fold in folds for value in fold["oos"]})
     )
@@ -643,8 +898,8 @@ def _run_enhancement_race_unlocked(
         "feature_screening_train_end": str(pd.Timestamp(feature_window["train_end"]).date()),
         "causal_feature_screening": screening_evidence,
         "feature_grid": grid,
-        "eligible_universe_hashes": universe_hashes,
-        "prepared_vs_label_key_counts": panel.attrs.get("prepared_vs_label_key_counts", {}),
+        "eligible_universe_hashes_by_fold": universe_hashes_by_fold,
+        "prepared_vs_label_key_counts_by_fold": prepared_vs_label_key_counts_by_fold,
         "universe_policy": (
             "adaptive labels must be a subset of raw intraday signal eligibility; keys without "
             "a matched daily prepared row are excluded uniformly; every candidate uses the same "
@@ -701,6 +956,10 @@ def run_enhancement_race(
     daily_dir: Path | None = None,
     intraday_dir: Path | None = None,
     model_threads: int = 8,
+    only_fold: str | None = None,
+    only_candidate: str | None = None,
+    gate_only: bool = False,
+    max_train_rows: int | None = None,
 ) -> dict:
     state_dir = Path(state_dir)
     with _cycle_lock(state_dir):
@@ -712,6 +971,10 @@ def run_enhancement_race(
             daily_dir,
             intraday_dir,
             model_threads,
+            only_fold,
+            only_candidate,
+            gate_only,
+            max_train_rows,
         )
 
 
@@ -724,10 +987,16 @@ def main() -> None:
     parser.add_argument("--daily-dir", type=Path)
     parser.add_argument("--intraday-dir", type=Path, default=config.PREPARED_DIR)
     parser.add_argument("--model-threads", type=int, default=8)
+    parser.add_argument("--only-fold", choices=[item["name"] for item in FOLD_POSITIONS])
+    parser.add_argument("--only-candidate")
+    parser.add_argument("--gate-only", action="store_true")
+    parser.add_argument("--max-train-rows", type=int)
     args = parser.parse_args()
     result = run_enhancement_race(
         args.labels, args.screening_report, args.output_dir, args.state_dir,
         args.daily_dir, args.intraday_dir, args.model_threads,
+        args.only_fold, args.only_candidate, args.gate_only,
+        args.max_train_rows,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 

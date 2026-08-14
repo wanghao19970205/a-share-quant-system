@@ -48,6 +48,7 @@ def main() -> int:
         return 1
 
     from realtime.config import load
+    import pandas as pd
     from realtime.snapshot import Snapshot, from_mapping
     from realtime.strategy import (LimitMoveWatch, Signal, SurgeWatch, VolumeSurge,
                                     VWAPDeviation, ChandelierStop, GapCalibrate,
@@ -57,6 +58,14 @@ def main() -> int:
     from realtime.notifier import Notifier
 
     cfg = load()
+    # Selftest owns a fresh temporary prediction artifact so it exercises the same
+    # fail-closed gate without depending on a production file.
+    cfg.predictions_file = tmp / "predictions.parquet"
+    pd.DataFrame({
+        "code": ["000001"],
+        "date": [pd.Timestamp.today().normalize()],
+        "pred": [0.0],
+    }).to_parquet(cfg.predictions_file, index=False)
 
     # 1a) 默认只保留低层 Top/模拟盘 push；通用 Signal 被抑制但不影响后续账本链路。
     notifier_probe = Notifier(cfg)

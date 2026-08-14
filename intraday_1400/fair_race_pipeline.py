@@ -248,6 +248,7 @@ def load_joined_prepared(
     minute_features: list[str] | None = None,
     max_rows: int | None = None,
     exclude_dates: list[pd.Timestamp] | None = None,
+    key_filter: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, list[str]]]:
     daily_paths = _month_paths(daily_dir, start, end)
     intraday_paths = _month_paths(intraday_dir, start, end)
@@ -257,6 +258,9 @@ def load_joined_prepared(
     excluded = {
         pd.Timestamp(value).normalize() for value in (exclude_dates or [])
     }
+    filter_keys = None
+    if key_filter is not None:
+        filter_keys = _normalize_keys(key_filter[["code", "date"]], "key_filter")
     rows_per_month = None
     if max_rows is not None:
         rows_per_month = max(int(max_rows) // len(months), 1)
@@ -298,6 +302,15 @@ def load_joined_prepared(
         if excluded:
             daily = daily[~daily["date"].isin(excluded)]
             intraday = intraday[~intraday["date"].isin(excluded)]
+        if filter_keys is not None:
+            month_keys = filter_keys[
+                (filter_keys["date"] >= start)
+                & (filter_keys["date"] <= end)
+                & (filter_keys["date"] >= pd.Timestamp(month + "-01"))
+                & (filter_keys["date"] < pd.Timestamp(month + "-01") + pd.offsets.MonthBegin(1))
+            ]
+            daily = daily.merge(month_keys, on=["code", "date"], how="inner", validate="one_to_one")
+            intraday = intraday.merge(month_keys, on=["code", "date"], how="inner", validate="one_to_one")
         if daily.empty or intraday.empty:
             continue
         merged, month_groups = merge_prepared_frames(
