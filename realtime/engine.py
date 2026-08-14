@@ -260,6 +260,8 @@ class Engine:
     # ---- 主循环 --------------------------------------------------------------
     def run(self) -> None:
         self._install_signal_handlers()
+        # Validate before prediction fallback can populate subscriptions or references.
+        ref_mod.assert_prediction_fresh(self._cfg)
         codes = wl_mod.load_codes(self._cfg)
         if not codes:
             print("[engine] 订阅清单为空（选股清单/持仓/兜底池都没读到），退出。", flush=True)

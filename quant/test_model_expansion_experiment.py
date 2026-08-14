@@ -819,6 +819,44 @@ class PublishAccelerationTest(unittest.TestCase):
 
         latest_price.assert_not_called()
 
+    def test_dry_run_freshness_check_is_read_only_and_validates_existing_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "short_bt_ridge_lightgbm_ranker_ensemble_predictions.parquet"
+            pd.DataFrame({"date": pd.to_datetime(["2026-07-21"])}).to_parquet(
+                source, index=False
+            )
+            prefixes = {"short_1_3": "short", "swing_7_15": "short"}
+            horizons = {"short_1_3": 1}
+            with mock.patch.object(scheduled_workflow, "_quant_dir", return_value=root), \
+                    mock.patch.object(
+                        scheduled_workflow, "_latest_price_date",
+                        return_value=pd.Timestamp("2026-07-21"),
+                    ):
+                statuses = scheduled_workflow.validate_publish_dry_run(prefixes, horizons)
+
+        self.assertEqual(statuses["short_1_3"], "fresh")
+        self.assertEqual(statuses["swing_7_15"], "fresh")
+        self.assertFalse((root / "active_quant_short_predictions.parquet").exists())
+
+    def test_dry_run_freshness_check_rejects_stale_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "short_bt_ridge_lightgbm_ranker_ensemble_predictions.parquet"
+            pd.DataFrame({"date": pd.to_datetime(["2026-07-20"])}).to_parquet(
+                source, index=False
+            )
+            with mock.patch.object(scheduled_workflow, "_quant_dir", return_value=root), \
+                    mock.patch.object(
+                        scheduled_workflow, "_latest_price_date",
+                        return_value=pd.Timestamp("2026-07-21"),
+                    ):
+                with self.assertRaises(RuntimeError):
+                    scheduled_workflow.validate_publish_dry_run(
+                        {"short_1_3": "short", "swing_7_15": "short"},
+                        {"short_1_3": 1},
+                    )
+
 
 class DailyPanelAccelerationTest(unittest.TestCase):
     def test_pit_price_row_gate_uses_nth_historical_observation(self):

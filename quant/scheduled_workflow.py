@@ -756,6 +756,30 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
     return published
 
 
+def validate_publish_dry_run(
+    output_prefixes: dict[str, str],
+    horizons: dict[str, int],
+) -> dict[str, str]:
+    """Validate existing publication sources without copying or writing artifacts."""
+    price_latest = _latest_price_date()
+    published_horizons = _published_prediction_horizons(horizons)
+    statuses: dict[str, str] = {}
+    for style in FINAL_TRADE_STYLE_ORDER:
+        src_style = DERIVE_FROM.get(style, style)
+        artifact = _style_artifact(
+            output_prefixes[src_style], ACTIVE_STYLE_FILES[style], published_horizons[style]
+        )
+        src = _quant_dir() / artifact["source_predictions_file"]
+        if not src.exists():
+            statuses[style] = "source-missing-not-validated"
+            print(f"[publish:dry-run] {style}: source missing, freshness not validated", flush=True)
+            continue
+        assert_active_is_latest(src, strict=True, price_latest=price_latest)
+        statuses[style] = "fresh"
+        print(f"[publish:dry-run] {style}: freshness passed", flush=True)
+    return statuses
+
+
 def publish_active_models(output_prefixes: dict[str, str], horizons: dict[str, int], params: dict,
                           swing_score_params: dict | None = None,
                           short_score_params: dict | None = None,
@@ -764,6 +788,8 @@ def publish_active_models(output_prefixes: dict[str, str], horizons: dict[str, i
     manifest = quant_dir / "active_quant_model.json"
     style_artifacts: dict[str, dict] = {}
     active_paths: list[Path] = []
+    if dry_run:
+        validate_publish_dry_run(output_prefixes, horizons)
     price_latest = None if dry_run else _latest_price_date()
     published_horizons = _published_prediction_horizons(horizons)
 
@@ -1481,6 +1507,7 @@ def main() -> None:
                 flush=True,
             )
     if args.strategy_mode == "incumbent-refresh" and args.dry_run:
+        validate_publish_dry_run(_output_prefixes(args), _horizons(args))
         print("[publish] dry-run: incumbent short would refresh; swing champion would remain unchanged", flush=True)
         return
     if args.strategy_mode == "incumbent-refresh":

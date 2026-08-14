@@ -113,6 +113,9 @@ class RealtimeConfig:
     predictions_file: Path = field(
         default_factory=lambda: Path(_qconfig.QUANT_DIR)
         / "active_quant_short_predictions.parquet")
+    # 预测制品允许落后当前日期的最大日历天数；旧制品必须 fail-closed，避免 mtime 未变化时永久沿用。
+    prediction_max_age_days: int = field(default_factory=lambda: max(
+        0, _env_int("REALTIME_PREDICTION_MAX_AGE_DAYS", 3)))
     # 持仓清单（可选）：一行一个 6 位代码，可选跟买入日期（"代码 YYYY-MM-DD" /
     # "代码,YYYYMMDD"，支持行内 # 注释）；存在则并入订阅，买入日期供 T+N 到期卖出判定。
     # 默认落挂载盘 logs/realtime（与 notify.env/账本同处），宿主机可直接编辑、无需进容器。

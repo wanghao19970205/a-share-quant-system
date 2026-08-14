@@ -166,6 +166,37 @@ def _ensemble_return_series(df, cfg: RealtimeConfig):
     return numerator.div(denominator.where(denominator > 0))
 
 
+def assert_prediction_fresh(
+        cfg: RealtimeConfig,
+        today=None,
+):
+    """Reject an existing prediction artifact whose newest date is too old."""
+    path = cfg.predictions_file
+    if not path.exists():
+        return None
+    try:
+        import pandas as pd
+        dates = pd.read_parquet(path, columns=["date"])["date"]
+    except Exception as exc:  # noqa: BLE001 - an existing unreadable artifact is unsafe
+        raise RuntimeError(f"prediction artifact cannot be read: {path}") from exc
+    parsed = pd.to_datetime(dates, errors="coerce").dropna()
+    if parsed.empty:
+        raise RuntimeError(f"prediction artifact has no valid dates: {path}")
+    latest = parsed.max().normalize()
+    current = pd.Timestamp.today().normalize() if today is None else pd.Timestamp(today).normalize()
+    age_days = int((current - latest).days)
+    if age_days < 0:
+        raise RuntimeError(
+            f"prediction artifact is dated in the future: latest={latest.date()} current={current.date()}"
+        )
+    if age_days > int(cfg.prediction_max_age_days):
+        raise RuntimeError(
+            f"prediction artifact is stale: latest={latest.date()} current={current.date()} "
+            f"age_days={age_days} max_age_days={cfg.prediction_max_age_days} path={path}"
+        )
+    return latest
+
+
 def _load_expected_return(
         cfg: RealtimeConfig,
 ) -> tuple[dict[str, float], Optional[str], dict[str, dict],
@@ -178,6 +209,7 @@ def _load_expected_return(
     path = cfg.predictions_file
     if not path.exists():
         return {}, None, {}, {}, {}
+    assert_prediction_fresh(cfg)
     try:
         import pandas as pd
     except Exception:  # noqa: BLE001
