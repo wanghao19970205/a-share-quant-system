@@ -32,6 +32,12 @@ logs/
 *.pkl
 *.pickle
 
+# Research-only runs and audit dumps: evidence lives in the research records,
+# not in the repository
+research_runs/
+audit_*.json
+sentiment_*.json
+
 # Private/vendor SDK binaries and external archives
 sdk/
 *.whl

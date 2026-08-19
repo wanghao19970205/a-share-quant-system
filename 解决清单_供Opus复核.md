@@ -172,6 +172,16 @@
 - **证据**：`audit_20260812_rolling_fixed_paired_validation.json`。
 - **状态**：结果层配对评估已完成；rolling 仅为方向性更好，未确认 alpha。旧 `factor_selection_lh1000_cont.parquet` 的 producer/window/label provenance 无法从权威证据重建，禁止伪造 sidecar，仍为 promotion blocker。下一步生成新的 strict fixed-33 control，并输出完整 selection manifest。
 
+### C10b C11 市场/行业相对收益基线探针
+
+- **真实远端探针**：strict rolling prediction panel 共 177 个日期、115,165 行，`tradable_ret_1d` 与 `buyable_close` 完整存在。
+- **市场基线**：同一 prediction universe 的等权 `tradable_ret_1d` 日收益，不冒充外部指数 total return。
+- **PIT 行业源**：`snapshots/sw_industry_history_pit.parquet`，使用 `valid_from <= date < valid_to` 且 `available_from <= date`。
+- **覆盖结果**：177/177 个共同日期；110,509/115,165 行成功映射，覆盖率 95.9571%；246 个行业。
+- **描述性差异**：市场等权减 PIT 行业等权平均 `+0.590481bp/日`。
+- **边界**：这是 baseline coverage probe，不是模型 excess-return、alpha 或 promotion 证据；正式比较尚未接入发布门禁。
+- **下一步**：研究副本模块 `quant/rolling_fixed_relative_comparison.py` 已实现并通过本地静态检查，输出 `absolute_return`、`market_excess_return` 和 PIT industry-relative return，并记录 common-key hash 与缺失行业处理。首次远端执行因 `/www/A/research_runs` 缺少 fixed-33 prediction/return artifacts 被阻断；不得替换成 legacy fixed selection。下一步回到 strict fixed-33 一次性重建，重建后直接运行该模块。
+
 ### C11 市场/行业相对收益
 
 - **证据**：`问题` P00d；全仓 `hedge/benchmark_relative/beta_neutral` 零命中。

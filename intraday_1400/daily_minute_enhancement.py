@@ -48,12 +48,19 @@ from intraday_1400.adaptive_exit_replay import load_trading_calendar
 from quant import model
 
 
-PROTOCOL = "intraday_1400_daily_minute_enhancement_v1"
+PROTOCOL = "intraday_1400_daily_minute_enhancement_v2"
 BASELINE = "daily_asof_baseline"
 ALL_MINUTE = "daily_plus_all_minute"
 MINUTE_FAMILIES = ("speed", "path", "volume_vwap", "risk", "dependence", "context")
 MODEL_RECIPE = {
-    "target": "daily_target_ret_1d",
+    # v2: train on the executable label the race is scored on. The raw daily
+    # 1d return rewards names that close limit-up, which are exactly the names
+    # that cannot be bought at 14:50, so a model trained on it ranks unbuyable
+    # names first. The adaptive t+3 label is net of cost and undefined for
+    # unbuyable entries, and _xy drops those rows from train/valid while
+    # predictions still cover the full eligible universe.
+    "target": "adaptive_realized_net_ret_t3",
+    "selection_pool": "order_time_buyable",
     "ridge": {"weight": 0.15, "alpha": 10.0},
     "lightgbm_ranker": {
         "weight": 0.85,
@@ -100,6 +107,7 @@ def protocol_payload() -> dict:
             "minimum_fill_rate": 0.60,
             "minimum_fold_wins_vs_baseline": 3,
             "mean_return_must_exceed_baseline": True,
+            "mean_and_compound_return_must_be_positive": True,
             "max_drawdown_tolerance": 0.05,
         },
         "historical_results_are_untouched": False,
@@ -232,6 +240,59 @@ def _causal_screened_features(
     return source_window, base_features, minute_features, evidence
 
 
+def _causal_screened_features_cached(
+    cache_path: Path,
+    screening_report_path: Path,
+    daily_dir: Path,
+    intraday_dir: Path,
+    inputs: dict,
+    max_rows: int | None = None,
+) -> tuple[dict, list[str], list[str], dict]:
+    """Return the causal screening selection, reusing a verified cache.
+
+    Screening is a deterministic function of the frozen inputs, yet a
+    fold/candidate subset run repeats it for every pair. The cache key carries
+    the full input hash set, which already covers the prepared provenance, the
+    screening report and every code dependency, so any change to data or code
+    forces a recomputation.
+    """
+    cache_key = {
+        "protocol": PROTOCOL,
+        "input_hashes": inputs,
+        "max_rows": int(max_rows) if max_rows is not None else None,
+    }
+    cache_path = Path(cache_path)
+    if cache_path.is_file():
+        saved = json.loads(cache_path.read_text(encoding="utf-8"))
+        if saved.get("cache_key") == cache_key:
+            print("[daily-minute] reuse screening cache", flush=True)
+            return (
+                saved["feature_window"],
+                list(saved["base_features"]),
+                list(saved["minute_features"]),
+                saved["screening_evidence"],
+            )
+    feature_window, base_features, minute_features, evidence = _causal_screened_features(
+        screening_report_path,
+        daily_dir,
+        intraday_dir,
+        inputs["prepared_provenance"],
+        max_rows=max_rows,
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(
+        {
+            "cache_key": cache_key,
+            "feature_window": feature_window,
+            "base_features": base_features,
+            "minute_features": minute_features,
+            "screening_evidence": evidence,
+        },
+        cache_path,
+    )
+    return feature_window, base_features, minute_features, evidence
+
+
 def _intraday_eligible_keys(intraday_dir: Path, dates: pd.DatetimeIndex) -> pd.DataFrame:
     start_month = pd.Timestamp(dates[0]).strftime("%Y-%m")
     end_month = pd.Timestamp(dates[-1]).strftime("%Y-%m")
@@ -293,6 +354,8 @@ def _build_panel(
         label_keys, on=["date", "code"], how="outer", indicator=True
     )
     panel = eligible.merge(labels, on=["date", "code"], how="inner", validate="one_to_one")
+    if MODEL_RECIPE["target"] not in panel:
+        raise ValueError(f"model training target {MODEL_RECIPE['target']} is unavailable")
     final_keys = panel[["date", "code"]].drop_duplicates(["date", "code"])
 
     def hashes_by_date(keys: pd.DataFrame) -> dict[str, str]:
@@ -325,7 +388,7 @@ def _build_panel(
 
 
 def _project_model_panel(panel: pd.DataFrame, features: list[str]) -> pd.DataFrame:
-    columns = ["code", "date", "daily_target_ret_1d", *features]
+    columns = ["code", "date", str(MODEL_RECIPE["target"]), *features]
     missing = sorted(set(columns) - set(panel.columns))
     if missing:
         raise ValueError(f"daily-minute model panel is missing columns: {missing}")
@@ -345,7 +408,7 @@ def _model_worker(config_path: Path) -> None:
         "predict_end": worker["predict_end"],
         "decay_half_life_days": float(MODEL_RECIPE["decay_half_life_days"]),
         "min_weight": float(MODEL_RECIPE["min_weight"]),
-        "label_col": "daily_target_ret_1d",
+        "label_col": str(MODEL_RECIPE["target"]),
         "train_mask_col": None,
     }
     if worker["model"] == "ridge":
@@ -476,7 +539,7 @@ def _evaluate_candidate(
     records = _simulate_adaptive_label_race(
         {name: filtered},
         _execution_labels(panel, dates),
-        ExecutionConfig(top_n=TOP_N, **EXECUTION_CONFIG),
+        ExecutionConfig(top_n=TOP_N, select_from_buyable_only=True, **EXECUTION_CONFIG),
     )
     account = cash_normalized_execution_records(records, dates, top_n=TOP_N, models=[name])
     comparison = compare_execution_records(account)
@@ -517,6 +580,12 @@ def select_enhancement(
         fill_rate = float(metrics["mean_filled_names"]) / TOP_N
         if (
             fill_rate >= 0.60
+            # next_branch=forward_shadow moves a candidate toward production, so
+            # beating the baseline is necessary but not sufficient: a candidate
+            # that loses money out of sample in every fold must not be promoted
+            # just because the baseline loses more.
+            and float(metrics["mean_return"]) > 0.0
+            and float(metrics["compound_return"]) > 0.0
             and float(metrics["mean_return"]) > float(baseline["mean_return"])
             and float(metrics["max_drawdown"]) >= float(baseline["max_drawdown"]) - 0.05
             and fold_wins >= 3
@@ -728,11 +797,12 @@ def _run_enhancement_race_unlocked(
         folds = [fold for fold in folds if fold["name"] == only_fold]
         if not folds:
             raise ValueError(f"unknown daily-minute fold: {only_fold}")
-    feature_window, base_features, minute_features, screening_evidence = _causal_screened_features(
+    feature_window, base_features, minute_features, screening_evidence = _causal_screened_features_cached(
+        output_dir / "screening_cache.json",
         screening_report_path,
         daily_dir,
         intraday_dir,
-        inputs["prepared_provenance"],
+        inputs,
         max_rows=(int(max_train_rows) if gate_only and max_train_rows is not None else None),
     )
     grid = candidate_features(base_features, minute_features)
@@ -805,12 +875,9 @@ def _run_enhancement_race_unlocked(
                     f"oos={oos_start.date()}..{oos_end.date()}",
                     flush=True,
                 )
-                candidate_base = [
-                    feature for feature in features if feature.startswith("asof__")
-                ]
-                candidate_minute = [
-                    feature for feature in features if feature.startswith("minute__")
-                ]
+                # Load the same frozen selection for every candidate so the
+                # prepared join, universe and schema stay identical, then keep
+                # only the candidate's own features in the model panel.
                 candidate_source_labels = labels[labels["date"] <= oos_end].copy()
                 candidate_labels = _cap_training_panel(
                     candidate_source_labels,
@@ -822,8 +889,8 @@ def _run_enhancement_race_unlocked(
                     candidate_labels,
                     daily_dir,
                     intraday_dir,
-                    candidate_base,
-                    candidate_minute,
+                    base_features,
+                    minute_features,
                 )
                 del candidate_labels
                 candidate_panel = candidate_panel[
@@ -915,6 +982,7 @@ def _run_enhancement_race_unlocked(
     report = {
         "protocol": PROTOCOL,
         "protocol_hash": _canonical_hash(protocol_payload()),
+        "protocol_payload": protocol_payload(),
         "historical_backfill": True,
         "untouched_holdout": False,
         "production_publication": False,

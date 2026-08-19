@@ -557,7 +557,14 @@ def evaluate_confidence_gate_shadow(
         max_drawdown_worsening=0.02,
         min_improved_horizons=1,
     )
-    stability = watchlist_grid.stability_decision(candidate_returns, baseline_returns)
+    stability = watchlist_grid.stability_decision(
+        candidate_returns, baseline_returns,
+        # The holdout candidate is the best of every gate quantile tried on the
+        # selection window, so the gate p-value must be corrected for that search.
+        search_family_size=sum(
+            1 for row in selection if row["gate_quantile"] is not None
+        ),
+    )
     report = {
         "candidate": "confidence_gate",
         "publishable": False,
@@ -828,7 +835,10 @@ def evaluate_topk_residual_rerank_shadow(
         max_drawdown_worsening=0.02,
         min_improved_horizons=1,
     )
-    stability = watchlist_grid.stability_decision(candidate_returns, baseline_returns)
+    stability = watchlist_grid.stability_decision(
+        candidate_returns, baseline_returns,
+        search_family_size=sum(1 for row in selection if float(row["weight"]) > 0),
+    )
     holdout_scored = _topk_residual_rerank_scores(
         holdout_frame, leg_column, champion_params, int(pool_size), selected_weight
     )
@@ -1049,7 +1059,8 @@ def evaluate_topk_residual_confidence_gate_shadow(
         min_improved_horizons=1,
     )
     stability = watchlist_grid.stability_decision(
-        holdout_candidate_returns, holdout_baseline_returns
+        holdout_candidate_returns, holdout_baseline_returns,
+        search_family_size=len(recipes),
     )
     holdout_weights = holdout_activation.map({True: float(rerank_weight), False: 0.0})
     holdout_scored = _topk_residual_rerank_scores(
@@ -1283,7 +1294,10 @@ def evaluate_residual_state_gate_shadow(
         max_drawdown_worsening=0.02,
         min_improved_horizons=1,
     )
-    stability = watchlist_grid.stability_decision(candidate_returns, baseline_returns)
+    stability = watchlist_grid.stability_decision(
+        candidate_returns, baseline_returns,
+        search_family_size=len(recipes),
+    )
     report = {
         "candidate": "strict_pit_residual_state_gate",
         "publishable": False,
@@ -1580,7 +1594,12 @@ def evaluate_market_regime_weights(
         int(horizon): values.drop(columns=["horizon", "weight"], errors="ignore")
         for horizon, values in adaptive_returns.groupby("horizon")
     }
-    stability = watchlist_grid.stability_decision(adaptive_dict, baseline_dict)
+    stability = watchlist_grid.stability_decision(
+        adaptive_dict, baseline_dict,
+        # One weight is picked per regime, so the search spans every
+        # weight-by-regime pair, not just the weight list.
+        search_family_size=len(candidate_weights) * max(len(selected), 1),
+    )
 
     def summarize(values: pd.DataFrame) -> list[dict]:
         rows = []

@@ -1,5 +1,0 @@
-{
-  "probe": "c28_amazingdata_schema",
-  "status": "error",
-  "error": "TypeError: 'NoneType' object is not subscriptable"
-}

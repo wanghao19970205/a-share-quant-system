@@ -1433,9 +1433,12 @@ class ModelExpansionExperimentTest(unittest.TestCase):
         short = watchlist_grid._base_combos(Path("missing-template.parquet"), "short")
         swing = watchlist_grid._base_combos(Path("missing-template.parquet"), "swing")
         self.assertEqual(set(short["rebalance_stride"]), {1})
-        self.assertEqual(set(short["hold_rank_buffer"]), {0, 1, 2})
+        # Both branches deliberately pin the buffer: the selection score rises
+        # monotonically with it, so searching the dimension only returns the
+        # largest value offered at a multiple of the compute cost.
+        self.assertEqual(set(short["hold_rank_buffer"]), {0})
         self.assertEqual(set(swing["rebalance_stride"]), {1})
-        self.assertEqual(set(swing["hold_rank_buffer"]), {0, 1, 2})
+        self.assertEqual(set(swing["hold_rank_buffer"]), {0})
 
     def test_watchlist_stride_defaults_daily_and_uses_authoritative_calendar(self):
         dates = pd.bdate_range("2026-01-05", periods=5)
@@ -1530,6 +1533,68 @@ class ModelExpansionExperimentTest(unittest.TestCase):
         )
         self.assertFalse(decision["passed"])
         self.assertEqual(decision["monthly_win_rates"], [1.0, 1 / 3])
+
+    def _stability_frames(self, candidate_returns, baseline_returns, periods=180):
+        dates = pd.bdate_range("2024-01-01", periods=periods)
+        candidate = {1: pd.DataFrame({"date": dates, "ret": candidate_returns})}
+        baseline = {1: pd.DataFrame({"date": dates, "ret": baseline_returns})}
+        return candidate, baseline
+
+    def test_stability_gate_rejects_a_champion_without_family_wise_significance(self):
+        # A candidate that is only marginally ahead cannot clear the gate once the
+        # p-value is corrected for the number of combinations tried.
+        rng = np.random.default_rng(7)
+        baseline_returns = rng.normal(0.0, 0.02, 180)
+        candidate_returns = baseline_returns + rng.normal(0.0005, 0.02, 180)
+        candidate, baseline = self._stability_frames(candidate_returns, baseline_returns)
+        decision = watchlist_grid.stability_decision(
+            candidate, baseline,
+            min_significant_sharpe_gain=-100.0,
+            max_other_sharpe_decline=100.0,
+            min_monthly_win_rate=0.0,
+            search_family_size=24300,
+            bootstrap_samples=500,
+        )
+        self.assertFalse(decision["passed"])
+        self.assertFalse(decision["multiplicity_passed"])
+        self.assertEqual(decision["search_family_size"], 24300)
+        self.assertEqual(decision["details"][0]["search_adjusted_p_value"], 1.0)
+
+    def test_stability_gate_reports_family_corrected_p_values(self):
+        rng = np.random.default_rng(11)
+        baseline_returns = rng.normal(0.0, 0.01, 180)
+        candidate_returns = baseline_returns + 0.01 + rng.normal(0.0, 0.001, 180)
+        candidate, baseline = self._stability_frames(candidate_returns, baseline_returns)
+        decision = watchlist_grid.stability_decision(
+            candidate, baseline,
+            min_significant_sharpe_gain=-100.0,
+            max_other_sharpe_decline=100.0,
+            min_monthly_win_rate=0.0,
+            search_family_size=1,
+            bootstrap_samples=500,
+        )
+        detail = decision["details"][0]
+        self.assertIsNotNone(detail["paired_bootstrap_p_value"])
+        self.assertIsNotNone(detail["holm_p_value"])
+        self.assertIsNotNone(detail["search_adjusted_p_value"])
+        self.assertTrue(decision["multiplicity_passed"])
+        self.assertTrue(decision["passed"])
+        self.assertEqual(
+            decision["paired_bootstrap"]["family_correction"],
+            "holm_across_horizons_then_bonferroni_across_search",
+        )
+
+    def test_search_adjusted_p_value_applies_bonferroni_over_the_search(self):
+        self.assertAlmostEqual(watchlist_grid.search_adjusted_p_value(0.001, 20), 0.02)
+        self.assertEqual(watchlist_grid.search_adjusted_p_value(0.001, 24300), 1.0)
+        self.assertIsNone(watchlist_grid.search_adjusted_p_value(None, 20))
+
+    def test_holm_adjusted_p_values_are_monotone_step_down(self):
+        self.assertEqual(watchlist_grid.holm_adjusted_p_values([]), [])
+        adjusted = watchlist_grid.holm_adjusted_p_values([0.01, 0.02, 0.5])
+        self.assertAlmostEqual(adjusted[0], 0.03)
+        self.assertAlmostEqual(adjusted[1], 0.04)
+        self.assertAlmostEqual(adjusted[2], 0.5)
 
     def test_weight_turnover_uses_stock_and_cash_weights(self):
         self.assertAlmostEqual(
@@ -2019,7 +2084,7 @@ class ModelExpansionExperimentTest(unittest.TestCase):
                 params,
                 set(frame["code"]),
                 output,
-                weights=(0.0, 0.05),
+                weights=(0.0, 0.05, 0.1),
                 holdout_months=6,
             )
 
@@ -2027,6 +2092,10 @@ class ModelExpansionExperimentTest(unittest.TestCase):
             self.assertTrue((output / "shadow_evaluation.json").exists())
             self.assertTrue((output / "recipe.json").exists())
             self.assertFalse((output / "active_quant_model.json").exists())
+            # The shadow gate must know how many weights were searched, otherwise
+            # its p-value reads as a single independent test.
+            self.assertEqual(report["stability_gate"]["search_family_size"], 2)
+            self.assertIn("best_search_adjusted_p_value", report["stability_gate"])
 
     def test_neutralize_target_shrinks_small_industry_effects(self):
         rng = np.random.default_rng(23)
@@ -2347,7 +2416,7 @@ class ModelExpansionExperimentTest(unittest.TestCase):
                 watchlist_grid, "promotion_decision", return_value={"promote": False}
             ), mock.patch.object(
                 watchlist_grid, "stability_decision", return_value={"passed": False}
-            ):
+            ) as stability_gate:
                 report = shadow_leg_evaluation.evaluate_optional_leg(
                     source,
                     "orthogonal_increment_pred",
@@ -2358,6 +2427,10 @@ class ModelExpansionExperimentTest(unittest.TestCase):
                     horizons=(1, 2, 3),
                 )
 
+        # Three non-zero weights were searched before the holdout gate ran.
+        self.assertEqual(
+            stability_gate.call_args.kwargs["search_family_size"], 3
+        )
         self.assertEqual(report["selected_weight"], 0.05)
         self.assertEqual(selection_calls[:4], [0.0, 0.03, 0.05, 0.10])
         self.assertEqual(selection_calls[4:], [0.0, 0.05])

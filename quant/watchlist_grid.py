@@ -155,19 +155,24 @@ def _base_combos(path: Path, kind: str) -> pd.DataFrame:
                 for gross in (0.18, 0.24, 0.30):
                     for rq in (0.45, 0.50, 0.55, 0.60, 0.65, 0.70):
                         for pq in (None, 0.50, 0.55, 0.60, 0.65, 0.70):
-                                for naive in (0.0, 0.1, 0.2):
-                                    for buffer in (0, 1, 2):
-                                        rows.append({
-                                            "ic_weight": ic,
-                                            "top_n": top_n,
-                                            "gross_exposure": gross,
-                                            "slot_weight": gross / top_n,
-                                            "ridge_quantile": rq,
-                                            "pred_quantile": pq,
-                                            "naive_weight": naive,
-                                            "rebalance_stride": 1,
-                                            "hold_rank_buffer": buffer,
-                                        })
+                            for naive in (0.0, 0.1, 0.2):
+                                rows.append({
+                                    "ic_weight": ic,
+                                    "top_n": top_n,
+                                    "gross_exposure": gross,
+                                    "slot_weight": gross / top_n,
+                                    "ridge_quantile": rq,
+                                    "pred_quantile": pq,
+                                    "naive_weight": naive,
+                                    "rebalance_stride": 1,
+                                    # Searching hold_rank_buffer here is useless: the
+                                    # selection score rises monotonically with the
+                                    # buffer, so the grid just returns the largest value
+                                    # offered while costing a multiple of the compute.
+                                    # Buffer stays a research dimension, decided against
+                                    # the holdout, not a searched parameter.
+                                    "hold_rank_buffer": 0,
+                                })
         standard = pd.DataFrame(rows)
         if template.empty:
             return standard
@@ -177,13 +182,15 @@ def _base_combos(path: Path, kind: str) -> pd.DataFrame:
         for mw in (0.07, 0.08, 0.09, 0.10):
             for rq in (0.30, 0.35, 0.40, 0.45):
                 for pq in (None, 0.55, 0.60):
-                    for buffer in (0, 1, 2):
-                        rows.append({
-                            "ic_weight": ic, "max_weight": mw,
-                            "ridge_quantile": rq, "pred_quantile": pq,
-                            "rebalance_stride": 1,
-                            "hold_rank_buffer": buffer,
-                        })
+                    rows.append({
+                        "ic_weight": ic, "max_weight": mw,
+                        "ridge_quantile": rq, "pred_quantile": pq,
+                        "rebalance_stride": 1,
+                        # Same monotonicity as the short branch: the selection score
+                        # rises with the buffer, so the grid would only ever return
+                        # the largest value offered.
+                        "hold_rank_buffer": 0,
+                    })
     standard = pd.DataFrame(rows)
     if template.empty:
         return standard
@@ -677,14 +684,73 @@ def evaluate_fixed_returns(predictions: Path, params: dict, horizons: list[int],
     return evaluate_prepared_returns(pred, params, horizons, kind, positive_only)
 
 
+def _paired_block_bootstrap_p_value(diff: np.ndarray, samples: int = 2000,
+                                    block_length: int = 5, seed: int = 42) -> float | None:
+    """One-sided p-value that the paired mean difference is genuinely positive.
+
+    Circular moving-block resampling preserves the serial dependence of
+    overlapping portfolio returns. An i.i.d. bootstrap would understate the
+    variance of the mean and make ordinary noise look significant.
+    """
+    values = np.asarray(diff, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return None
+    observed = float(values.mean())
+    block = max(int(block_length), 1)
+    draws = max(int(samples), 1)
+    blocks = int(np.ceil(values.size / block))
+    rng = np.random.default_rng(int(seed))
+    starts = rng.integers(0, values.size, size=(draws, blocks))
+    offsets = np.arange(block)
+    index = (starts[:, :, None] + offsets[None, None, :]) % values.size
+    resampled = values[index.reshape(draws, -1)[:, : values.size]]
+    centered = resampled.mean(axis=1) - observed
+    return float((np.count_nonzero(centered >= observed) + 1) / (draws + 1))
+
+
+def holm_adjusted_p_values(p_values: list[float]) -> list[float]:
+    """Holm step-down family-wise correction, in the input order."""
+    if not p_values:
+        return []
+    values = np.asarray(p_values, dtype=float)
+    order = np.argsort(values)
+    adjusted = np.empty(values.size, dtype=float)
+    running = 0.0
+    total = values.size
+    for rank, index in enumerate(order):
+        running = max(running, float((total - rank) * values[index]))
+        adjusted[index] = min(running, 1.0)
+    return adjusted.tolist()
+
+
+def search_adjusted_p_value(p_value: float | None, family_size: int) -> float | None:
+    """Bonferroni correction for how many combinations were tested at this gate.
+
+    A grid that tries thousands of parameter sets produces a champion whose
+    nominal p-value is the minimum of thousands of draws, so the unadjusted
+    value cannot be read as evidence.
+    """
+    if p_value is None:
+        return None
+    return float(min(1.0, float(p_value) * max(int(family_size), 1)))
+
+
 def stability_decision(candidate: dict[int, pd.DataFrame], baseline: dict[int, pd.DataFrame],
                        min_significant_sharpe_gain: float = 0.50,
                        max_other_sharpe_decline: float = 0.50,
-                       min_monthly_win_rate: float = 2 / 3) -> dict:
+                       min_monthly_win_rate: float = 2 / 3,
+                       search_family_size: int = 1,
+                       max_search_adjusted_p_value: float = 0.05,
+                       bootstrap_samples: int = 2000,
+                       bootstrap_block_length: int = 5,
+                       bootstrap_seed: int = 42) -> dict:
     """Accept one clear non-overlap win when all other horizons are broadly stable."""
     details = []
     improved = significant = acceptable = 0
     monthly_win_rates = []
+    horizon_p_values: list[float] = []
+    horizon_p_index: list[int] = []
     for horizon in sorted(set(candidate) & set(baseline)):
         candidate_frame = candidate[horizon]
         stride_values = pd.to_numeric(
@@ -726,15 +792,37 @@ def stability_decision(candidate: dict[int, pd.DataFrame], baseline: dict[int, p
         months = int(len(valid_months))
         monthly_win_rate = wins / months if months else 0.0
         monthly_win_rates.append(monthly_win_rate)
+        paired_p_value = _paired_block_bootstrap_p_value(
+            (sampled["ret_candidate"] - sampled["ret_baseline"]).to_numpy(dtype=float),
+            samples=bootstrap_samples,
+            block_length=bootstrap_block_length,
+            seed=bootstrap_seed,
+        )
+        if paired_p_value is not None:
+            horizon_p_values.append(float(paired_p_value))
+            horizon_p_index.append(len(details))
         details.append({"horizon": int(horizon), "nonoverlap_candidate_sharpe": c_sharpe,
                         "nonoverlap_baseline_sharpe": b_sharpe,
                         "nonoverlap_sharpe_gain": sharpe_gain,
                         "significant_improvement": is_significant,
                         "within_allowed_decline": is_acceptable,
+                        "paired_bootstrap_p_value": paired_p_value,
+                        "nonoverlap_observations": int(len(sampled)),
                         "monthly_wins": wins, "months": int(len(valid_months))})
     common = len(details)
     monthly_win_rate = (
         float(np.mean(monthly_win_rates)) if monthly_win_rates else 0.0
+    )
+    holm_values = holm_adjusted_p_values(horizon_p_values)
+    family_size = max(int(search_family_size), 1)
+    search_adjusted = [search_adjusted_p_value(value, family_size) for value in holm_values]
+    for position, detail_index in enumerate(horizon_p_index):
+        details[detail_index]["holm_p_value"] = holm_values[position]
+        details[detail_index]["search_adjusted_p_value"] = search_adjusted[position]
+    best_search_adjusted_p_value = min(search_adjusted) if search_adjusted else None
+    multiplicity_passed = (
+        best_search_adjusted_p_value is not None
+        and best_search_adjusted_p_value <= float(max_search_adjusted_p_value)
     )
     passed = (
         significant >= 1
@@ -742,12 +830,27 @@ def stability_decision(candidate: dict[int, pd.DataFrame], baseline: dict[int, p
         and common > 0
         and monthly_win_rates
         and all(rate >= float(min_monthly_win_rate) for rate in monthly_win_rates)
+        # A champion picked out of a large search must clear a family-wise
+        # adjusted p-value, otherwise the gate only measures how many
+        # combinations were tried.
+        and multiplicity_passed
     )
     return {"passed": bool(passed), "nonoverlap_improved_horizons": improved,
             "significant_improved_horizons": significant,
             "acceptable_horizons": acceptable,
             "min_significant_sharpe_gain": float(min_significant_sharpe_gain),
             "max_other_sharpe_decline": float(max_other_sharpe_decline),
+            "multiplicity_passed": bool(multiplicity_passed),
+            "search_family_size": family_size,
+            "max_search_adjusted_p_value": float(max_search_adjusted_p_value),
+            "best_search_adjusted_p_value": best_search_adjusted_p_value,
+            "paired_bootstrap": {
+                "samples": int(bootstrap_samples),
+                "block_length": int(bootstrap_block_length),
+                "seed": int(bootstrap_seed),
+                "method": "circular_moving_block_paired_one_sided",
+                "family_correction": "holm_across_horizons_then_bonferroni_across_search",
+            },
             "common_horizons": common, "monthly_win_rate": monthly_win_rate,
             "monthly_win_rates": monthly_win_rates,
             "monthly_wins": int(sum(int(d["monthly_wins"]) for d in details)),

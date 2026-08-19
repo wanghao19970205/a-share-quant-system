@@ -550,6 +550,11 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
             active_pred, incumbent_params, horizons, kind, True)
 
         trials: list[dict] = []
+        # Every combination in selection_best was scored on the same selection
+        # window, and the holdout gate is applied to the top slice of that
+        # search, so the gate's p-values must be corrected for how many
+        # candidates are tested here.
+        holdout_family_size = int(min(20, len(selection_best)))
         for selection_rank, (_, candidate_row) in enumerate(selection_best.head(20).iterrows(), start=1):
             candidate_params: dict = {}
             for key in param_keys:
@@ -574,7 +579,8 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
                 candidate_pred, candidate_params, horizons, kind, True)
             stability = watchlist_grid.stability_decision(
                 candidate_returns, baseline_returns,
-                min_monthly_win_rate=args.promotion_min_monthly_win_rate)
+                min_monthly_win_rate=args.promotion_min_monthly_win_rate,
+                search_family_size=holdout_family_size)
             decision["daily_gate_passed"] = bool(decision.get("promote"))
             decision["stability_gate"] = stability
             decision["promote"] = bool(decision.get("promote") and stability.get("passed"))
@@ -596,6 +602,10 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
         decision["incumbent_params"] = incumbent_params
         decision["candidates_evaluated"] = len(trials)
         decision["candidates_passed"] = passed_count
+        # Provenance for the search that produced these candidates: without it a
+        # champion reads as a single test instead of the maximum of a large grid.
+        decision["selection_search_size"] = int(len(selection_best))
+        decision["holdout_family_size"] = holdout_family_size
         decision["candidate_trials"] = trials
         reports[style] = decision
     promote = bool(reports) and all(bool(r.get("promote")) for r in reports.values())

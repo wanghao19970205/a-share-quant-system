@@ -23,6 +23,7 @@ class ExecutionConfig:
     max_exit_sessions: int = 3
     flat_bar_tolerance: float = 0.0005
     limit_return_threshold: float = 0.045
+    select_from_buyable_only: bool = False
 
     def __post_init__(self) -> None:
         if self.top_n <= 0:
@@ -205,6 +206,14 @@ def simulate_fixed_exit_race(
     outcomes["date"] = pd.to_datetime(outcomes["date"], errors="coerce").dt.normalize()
     outcomes = outcomes.drop_duplicates(["code", "date"], keep="last")
     outcome_keys = outcomes[["code", "date"]]
+    if config.select_from_buyable_only:
+        # Buyability is observable at the 14:50 order time, so restricting the
+        # ranking pool is point-in-time legal. Without it an unbuyable name
+        # consumes a slot and contributes a zero return, which makes the
+        # portfolio metrics a function of the fill rate instead of the signal.
+        outcome_keys = outcomes.loc[
+            outcomes["entry_buyable"].fillna(False).astype(bool), ["code", "date"]
+        ]
     common = {
         name: frame.merge(
             outcome_keys, on=["code", "date"], how="inner", validate="one_to_one"

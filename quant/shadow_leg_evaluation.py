@@ -326,7 +326,10 @@ def evaluate_optional_leg(
     candidate_returns = watchlist_grid.evaluate_prepared_returns(
         holdout_frame, candidate_params, horizon_values, "short", True
     )
-    stability = watchlist_grid.stability_decision(candidate_returns, baseline_returns)
+    stability = watchlist_grid.stability_decision(
+        candidate_returns, baseline_returns,
+        search_family_size=sum(1 for row in selection if float(row["weight"]) > 0),
+    )
     evaluated_horizons = sorted(
         int(value) for value in baseline_eval.get("horizon", pd.Series(dtype=int)).dropna().unique()
     )

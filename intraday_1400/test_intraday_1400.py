@@ -1793,6 +1793,27 @@ class OfflineRaceTest(unittest.TestCase):
         self.assertAlmostEqual(float(minute["net_return"]), -0.10)
         self.assertEqual(report["models"]["daily"]["mean_names"], 1.0)
 
+    def test_fixed_race_can_restrict_selection_to_order_time_buyable_pool(self):
+        labels = pd.DataFrame({
+            "code": ["600000", "600001", "600002"],
+            "date": pd.to_datetime(["2026-07-01"] * 3),
+            "entry_buyable": [False, True, True],
+            "target_outcome_observed_t1": [True, True, True],
+            "target_net_ret_t1": [0.05, 0.02, 0.03],
+            "label_entry_price_1450": [10.0, 20.0, 30.0],
+        })
+        records, report = simulate_fixed_exit_race(
+            self._predictions(),
+            labels,
+            ExecutionConfig(top_n=1, select_from_buyable_only=True),
+        )
+        daily = records[records["model"] == "daily"].iloc[0]
+        self.assertEqual(daily["code"], "600001")
+        self.assertTrue(bool(daily["entry_buyable"]))
+        self.assertAlmostEqual(float(daily["net_return"]), 0.02)
+        self.assertEqual(report["models"]["daily"]["unbuyable"], 0)
+        self.assertEqual(report["models"]["daily"]["mean_names"], 1.0)
+
     def test_fixed_race_reports_all_pairwise_model_comparisons(self):
         predictions = self._predictions()
         predictions["daily_plus_minute"] = predictions["minute"].assign(
@@ -2634,10 +2655,12 @@ class DailyMinuteEnhancementTest(unittest.TestCase):
             self.assertEqual(metrics.name, "wf1__daily_asof_baseline.json")
 
     def test_model_panel_projects_only_candidate_columns(self):
+        target = daily_minute_enhancement.MODEL_RECIPE["target"]
         panel = pd.DataFrame({
             "code": ["000001"],
             "date": pd.to_datetime(["2025-01-02"]),
-            "daily_target_ret_1d": [0.01],
+            target: [0.01],
+            "daily_target_ret_1d": [0.03],
             "minute__m5_ret_15": [0.02],
             "unused_execution_column": [True],
         })
@@ -2646,7 +2669,20 @@ class DailyMinuteEnhancementTest(unittest.TestCase):
         )
         self.assertEqual(
             projected.columns.tolist(),
-            ["code", "date", "daily_target_ret_1d", "minute__m5_ret_15"],
+            ["code", "date", target, "minute__m5_ret_15"],
+        )
+
+    def test_model_recipe_trains_on_the_executable_scored_label(self):
+        # The race scores adaptive_realized_net_ret_t3, which is net of cost and
+        # undefined for unbuyable entries. Training on the raw daily 1d return
+        # instead makes the model rank limit-up (unbuyable) names first.
+        self.assertEqual(
+            daily_minute_enhancement.MODEL_RECIPE["target"],
+            "adaptive_realized_net_ret_t3",
+        )
+        self.assertEqual(
+            daily_minute_enhancement.MODEL_RECIPE["selection_pool"],
+            "order_time_buyable",
         )
 
     def test_candidate_grid_keeps_identical_daily_base(self):
@@ -2698,6 +2734,23 @@ class DailyMinuteEnhancementTest(unittest.TestCase):
         self.assertEqual(decision["status"], "enhancement_selected")
         self.assertEqual(decision["selected"], "daily_plus_risk")
 
+    def test_selection_rejects_a_candidate_that_only_loses_less_than_baseline(self):
+        names = {
+            daily_minute_enhancement.BASELINE,
+            daily_minute_enhancement.ALL_MINUTE,
+            *[f"daily_plus_{name}" for name in daily_minute_enhancement.MINUTE_FAMILIES],
+        }
+        aggregate = {name: self._metrics(-0.003) for name in names}
+        aggregate["daily_plus_path"] = self._metrics(-0.001)
+        folds = []
+        for index in range(4):
+            models = {name: self._metrics(-0.003) for name in names}
+            models["daily_plus_path"] = self._metrics(-0.001)
+            folds.append({"name": f"wf{index + 1}", "models": models})
+        decision = daily_minute_enhancement.select_enhancement(aggregate, folds)
+        self.assertEqual(decision["status"], "no_enhancement_passed")
+        self.assertEqual(decision["selected"], daily_minute_enhancement.BASELINE)
+
     def test_build_panel_freezes_the_common_labeled_universe(self):
         prepared = pd.DataFrame({
             "date": pd.to_datetime(["2025-07-01"]),
@@ -2708,6 +2761,7 @@ class DailyMinuteEnhancementTest(unittest.TestCase):
         labels = pd.DataFrame({
             "date": pd.to_datetime(["2025-07-01", "2025-07-01"]),
             "code": ["000001", "000002"],
+            "adaptive_realized_net_ret_t3": [0.02, -0.01],
             "adaptive_stress_net_ret_t3": [0.02, -0.01],
         })
         intraday_keys = labels[["date", "code"]].copy()
@@ -2753,6 +2807,55 @@ class DailyMinuteEnhancementTest(unittest.TestCase):
                 daily_minute_enhancement._build_panel(
                     labels, Path("daily"), Path("minute"), [], []
                 )
+
+    def test_model_panel_keeps_only_candidate_features(self):
+        target = daily_minute_enhancement.MODEL_RECIPE["target"]
+        panel = pd.DataFrame({
+            "code": ["000001"],
+            "date": pd.to_datetime(["2025-11-03"]),
+            target: [0.01],
+            "asof__ret_5d": [0.2],
+            "minute__m5_ret_15m": [0.3],
+        })
+
+        projected = daily_minute_enhancement._project_model_panel(panel, ["asof__ret_5d"])
+
+        self.assertEqual(
+            projected.columns.tolist(),
+            ["code", "date", target, "asof__ret_5d"],
+        )
+
+    def test_screening_cache_reused_only_for_identical_inputs(self):
+        calls = []
+
+        def fake_screening(report, daily_dir, intraday_dir, provenance, max_rows=None):
+            calls.append(max_rows)
+            return (
+                {"train_end": "2025-08-06"},
+                ["asof__ret_5d"],
+                ["minute__m5_ret_15m"],
+                {"selected_hash": "abc"},
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "screening_cache.json"
+            inputs = {"prepared_provenance": {"cutoff_time": "13:55"}, "labels": []}
+            with mock.patch.object(
+                daily_minute_enhancement, "_causal_screened_features", fake_screening
+            ):
+                first = daily_minute_enhancement._causal_screened_features_cached(
+                    cache, Path("report.json"), Path("daily"), Path("minute"), inputs
+                )
+                second = daily_minute_enhancement._causal_screened_features_cached(
+                    cache, Path("report.json"), Path("daily"), Path("minute"), inputs
+                )
+                changed = dict(inputs, labels=[{"sha256": "changed"}])
+                daily_minute_enhancement._causal_screened_features_cached(
+                    cache, Path("report.json"), Path("daily"), Path("minute"), changed
+                )
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 2)
 
     def test_causal_screening_recomputes_features_from_verified_panel(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -113,3 +113,14 @@ Review these specific contracts before any next run:
 5. Recommend a disk-first batch design for screening/panel loading before restarting real validation.
 
 Tests currently available: full intraday regression `147/147`, minute enhancement targeted tests `13/13`, optimized IC equivalence, compileall, and `git diff --check`. These are engineering checks only; there is still no minute OOS return conclusion.
+
+## v7 resolution (2026-08-14)
+
+The v6 failure was the per-candidate feature projection: `daily_asof_baseline` produced an empty minute list, which `merge_prepared_frames()` rejects. The candidate panel now loads the identical frozen selection for every candidate, so the prepared join, universe and schema are identical across candidates, and `_project_model_panel()` remains the only fairness boundary. `test_model_panel_keeps_only_candidate_features` pins this invariant; local suite is now `148/148`.
+
+Remote v7 (`minute-gate-wf1-baseline-nomem-v7`, `wf1 / daily_asof_baseline / gate-only / max-train-rows=20000`) exited `0` in 2m11s with `OOMKilled=false` and produced the full artifact set: checkpoint parquet/JSON with `records_sha256`, ridge and lightgbm_ranker predictions (`120064` rows each) with `predictions_sha256`, and `gate_report.json`. `/app` was mounted read-only from the isolated snapshot and no production path was written.
+
+Open questions for review are unchanged in substance, plus two new ones:
+
+6. Loading the full frozen selection for base-only candidates adds roughly 40 unused columns of memory per candidate. Confirm whether this is acceptable at the frozen `100000` recipe across four folds, or whether the projection should instead be pushed into `load_joined_prepared()` while keeping the join keys identical.
+7. The v7 gate is heavily capped (`mean_filled_names=2.275` against `mean_names=10`, `unbuyable=309`). Confirm that the formal four-fold run must regenerate all artifacts and that no gate metric may enter the return record.
