@@ -12,7 +12,10 @@ ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
 # 训练/行情/券商 SDK 运行所需系统依赖：
 # - libgomp1: lightgbm 多线程；libgssapi_krb5: tgw .so 依赖
 # - cron: 容器内定时任务；tzdata: 时区（Asia/Shanghai）
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# apt 也走清华源：deb.debian.org 在这台机器上实测约 15KB/s，6MB 依赖要十分钟以上。
+RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 libstdc++6 ca-certificates \
         libgssapi-krb5-2 libkrb5-3 \
         cron tzdata \

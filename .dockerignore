@@ -10,6 +10,7 @@ __pycache__
 *.pyc
 .git
 .comate
+.cache
 snapshots
 quant_data
 logs

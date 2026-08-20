@@ -12,7 +12,10 @@ ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
     PIP_RETRIES=5
 
 # tgw 原生库运行所需的系统依赖（libgssapi_krb5 是 tgw .so 的依赖）
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# apt 也走清华源：deb.debian.org 在这台机器上实测约 15KB/s。
+RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 libstdc++6 ca-certificates \
         libgssapi-krb5-2 libkrb5-3 \
     && rm -rf /var/lib/apt/lists/*
