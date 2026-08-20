@@ -214,9 +214,9 @@ cp .env.example .env   # 若无示例则手动创建，见下方「配置」
 在项目根目录创建 `.env`（**已被 Git 忽略，切勿提交真实凭证**）：
 
 ```dotenv
-# 可选：Qwen 新闻标注（无 Key 时降级为本地规则）
+# 可选：DeepSeek 新闻标注（无 Key 时降级为本地规则）
 DASHSCOPE_API_KEY=
-DASHSCOPE_MODEL=qwen-plus
+DASHSCOPE_MODEL=deepseek-v4-flash
 
 # 可选：AmazingData 券商数据源（不用则走 AKShare）
 AMAZINGDATA_USER=

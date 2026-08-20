@@ -111,21 +111,13 @@ with st.sidebar:
     proxy = st.text_input("代理(可选)", value="",
                           placeholder="http://127.0.0.1:7890",
                           help="填代理后：日韩/外围走该代理，且东财(A股行情/名称)请求也经代理路由，可尝试恢复被屏蔽的东财数据源；留空则直连(自动用新浪/腾讯兜底)。").strip()
-    qwen_key = st.text_input("Qwen API Key(可选)", value="", type="password",
-                             help="填入 DashScope(通义千问) API Key 后，新闻情绪用大模型分析；留空则用本地词典兜底。").strip()
+    qwen_key = st.text_input("DeepSeek API Key(可选)", value="", type="password",
+                             help="填入 DashScope API Key 后，新闻情绪用 deepseek-v4-flash 分析；留空则用本地词典兜底。").strip()
     qwen_base = st.text_input(
-        "Qwen接口地址(可选)",
+        "DeepSeek接口地址(可选)",
         value="https://ws-yuvikqba21b4koic.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         help="专属工作空间的 openAiCompatible 地址；用公共 DashScope 则改为 https://dashscope.aliyuncs.com/compatible-mode/v1。").strip()
-    _QWEN_MODELS = [
-        "qwen3.7-plus", "qwen3.7-max", "qwen3.7-max-preview", "qwen3.7-max-2026-06-08",
-        "qwen3.7-plus-2026-05-26", "qwen3.7-max-2026-05-20", "qwen3.7-max-2026-05-17",
-        "qwen3.6-plus", "qwen3.6-flash", "qwen3.6-flash-2026-04-16", "qwen3.6-35b-a3b",
-        "qwen3.5-plus", "qwen3.5-flash", "qwen3.5-plus-2026-04-20",
-        "qwen3.5-plus-2026-02-15", "qwen3.5-flash-2026-02-23",
-    ]
-    qwen_model = st.selectbox("Qwen模型", _QWEN_MODELS, index=0,
-                              help="选择通义千问模型；该工作空间需已授权对应模型。默认 qwen3.7-plus。")
+    qwen_model = "deepseek-v4-flash"
     with st.expander("券商数据源 AmazingData(可选)"):
         st.caption("需先安装券商 SDK(tgw + AmazingData wheel)。可用时 A股行情优先走券商官方数据。")
         ad_user = st.text_input("账号", value="", key="ad_user").strip()

@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
 
-PROJECT_DIR="/Users/wanghao81/Desktop/A"
+PROJECT_DIR="/Users/wanghao81/Desktop/A/a-share-quant-system"
 AGENT_DIR="$HOME/Library/LaunchAgents"
 USER_DOMAIN="gui/$(id -u)"
 

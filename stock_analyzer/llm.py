@@ -1,6 +1,6 @@
-"""通义千问(Qwen / DashScope) 客户端，用于新闻情绪的 LLM 辅助分析。
+"""DashScope OpenAI 兼容客户端，用于 LLM 辅助分析。
 
-- 通过 DashScope 的 OpenAI 兼容接口调用，模型默认 qwen-plus。
+- 所有大模型调用固定使用 deepseek-v4-flash。
 - API key 来源：函数入参 > 环境变量 DASHSCOPE_API_KEY。
 - 无 key 或调用失败时返回 None，由上层优雅降级到词典打分。
 """
@@ -21,8 +21,8 @@ except Exception:  # noqa: BLE001
 
 _DEFAULT_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 _BATCH_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DEFAULT_MODEL = "qwen-plus"
-_FALLBACK_MODEL = "deepseek-v4-flash"
+DEFAULT_MODEL = "deepseek-v4-flash"
+_FALLBACK_MODEL = DEFAULT_MODEL
 _MODEL_COOLDOWN_SECONDS = 30 * 60
 _MODEL_STATUS_LOCK = threading.Lock()
 _MODEL_UNAVAILABLE_UNTIL: dict[str, float] = {}
@@ -80,20 +80,18 @@ def _split_model_list(raw: str) -> list[str]:
 
 
 def get_model_list() -> list[str]:
-    raw = _setting("DASHSCOPE_MODELS") or _setting("DASHSCOPE_MODEL_LIST")
-    models = _split_model_list(raw)
-    for fallback in (get_model(), get_fallback_model()):
-        if fallback and fallback not in models:
-            models.append(fallback)
-    return models or [get_fallback_model() or DEFAULT_MODEL]
+    """Return the only model permitted for LLM calls."""
+    return [DEFAULT_MODEL]
 
 
 def get_model(override: str = "") -> str:
-    return _normalize_model_name(override or _setting("DASHSCOPE_MODEL", DEFAULT_MODEL))
+    del override
+    return DEFAULT_MODEL
 
 
 def get_fallback_model(override: str = "") -> str:
-    return _normalize_model_name(override or _setting("DASHSCOPE_FALLBACK_MODEL", _FALLBACK_MODEL))
+    del override
+    return DEFAULT_MODEL
 
 
 def _model_available_now(model: str) -> bool:
@@ -139,12 +137,10 @@ def _model_candidates(preferred: str = "") -> list[str]:
     pool = [m for m in get_model_list() if m not in {preferred, fallback} and _model_available_now(m)]
     random.shuffle(pool)
     candidates = []
-    if preferred and _model_available_now(preferred):
-        candidates.append(preferred)
-    candidates.extend(pool)
-    if fallback:
-        candidates.append(fallback)
-    return candidates or [fallback]
+    for candidate in ([preferred] if preferred else []) + pool + ([fallback] if fallback else []):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates or [DEFAULT_MODEL]
 
 
 def available(override: str = "") -> bool:
