@@ -80,6 +80,7 @@ class Cfg:
     paper_v5_sector_neutral_factor = 1.00
     paper_v5_sector_strong_factor = 1.15
     sector_meta_file = ""
+    prediction_max_age_days = 3
     paper_buy_n = 2
     paper_buy_start = 1450
     paper_buy_retry_start = 1453
@@ -194,6 +195,20 @@ def new_cfg(**over):
 
     c.paper_state_files = _paper_state_files
     return c
+
+
+def write_fresh_predictions(path, codes=("000001",)):
+    """写一份能通过 freshness 门禁的最小预测制品。
+
+    预测制品是候选链的信任根：``assert_prediction_fresh`` 要求它存在、可读、有有效
+    日期且不过期，所以场景不能再拿"文件不存在"来表示"预测不贡献候选"。需要预测不额外
+    引入订阅代码时，就把制品的代码限定在该场景本来就期望出现的集合内。
+    """
+    today = _dt.date.today().strftime("%Y-%m-%d")
+    pd.DataFrame(
+        [{"code": code, "date": today, "pred": 0.0} for code in codes]
+    ).to_parquet(path, index=False)
+    return Path(path)
 
 
 # ============================================================================
@@ -408,7 +423,8 @@ def scenario_H():
     root = Path(cfg.ledger_dir)
     cfg.mobile_snapshot_file = root / "mobile_snapshot.json"
     cfg.holdings_file = root / "realtime_holdings.txt"
-    cfg.predictions_file = root / "missing_predictions.parquet"
+    cfg.predictions_file = write_fresh_predictions(
+        root / "predictions.parquet", ("600941",))
     cfg.universe_file = root / "missing_universe.txt"
     cfg.max_subscribe = 1
     Path(cfg.paper_state_file).write_text(json.dumps({
@@ -427,7 +443,8 @@ def scenario_H():
     root30 = Path(cfg30.ledger_dir)
     cfg30.mobile_snapshot_file = root30 / "mobile_snapshot.json"
     cfg30.holdings_file = root30 / "missing_holdings.txt"
-    cfg30.predictions_file = root30 / "missing_predictions.parquet"
+    cfg30.predictions_file = write_fresh_predictions(
+        root30 / "predictions.parquet")
     cfg30.universe_file = root30 / "missing_universe.txt"
     cfg30.max_subscribe = 100
     all_a_rows = [{"code": f"600{index:03d}"} for index in range(30)]
@@ -441,6 +458,36 @@ def scenario_H():
     top30_codes = load_codes(cfg30)
     check(len(top30_codes) == 30 and top30_codes[-1] == "600029",
           "模拟盘订阅完整读取全A Top30，跨组重复代码只保留一次")
+
+    # 门禁本身：持仓、候选、兜底池都不能让订阅链绕过预测制品的新鲜度检查。
+    for label, build in (
+        ("缺失", lambda p: p / "absent.parquet"),
+        ("过期", lambda p: _dated_predictions(p, -30)),
+        ("未来", lambda p: _dated_predictions(p, 5)),
+    ):
+        cfg_gate = new_cfg()
+        gate_root = Path(cfg_gate.ledger_dir)
+        cfg_gate.mobile_snapshot_file = gate_root / "mobile_snapshot.json"
+        cfg_gate.holdings_file = gate_root / "holdings.txt"
+        cfg_gate.universe_file = gate_root / "universe.txt"
+        cfg_gate.predictions_file = build(gate_root)
+        cfg_gate.mobile_snapshot_file.write_text(
+            json.dumps({"groups": {"全A": {"rows": [{"code": "000001"}]}}}), encoding="utf-8")
+        cfg_gate.holdings_file.write_text("600941\n", encoding="utf-8")
+        blocked = False
+        try:
+            load_codes(cfg_gate)
+        except RuntimeError:
+            blocked = True
+        check(blocked, f"预测制品{label}时订阅链 fail-closed，不退回持仓/候选/兜底池")
+
+
+def _dated_predictions(root, day_offset):
+    """写一份日期偏移 day_offset 天的预测制品，用于触发过期/未来两个门禁分支。"""
+    stamp = (_dt.date.today() + _dt.timedelta(days=day_offset)).strftime("%Y-%m-%d")
+    path = root / f"predictions_{day_offset}.parquet"
+    pd.DataFrame([{"code": "000001", "date": stamp, "pred": 0.0}]).to_parquet(path, index=False)
+    return path
 
 
 # ============================================================================
@@ -727,7 +774,8 @@ def scenario_M():
         json.dumps({"cash": 0, "positions": [{"code": "600941"}]}), encoding="utf-8")
     cfg10.mobile_snapshot_file = v2_state.parent / "mobile_snapshot.json"
     cfg10.holdings_file = v2_state.parent / "realtime_holdings.txt"
-    cfg10.predictions_file = v2_state.parent / "missing.parquet"
+    cfg10.predictions_file = write_fresh_predictions(
+        v2_state.parent / "predictions.parquet", ("600941",))
     cfg10.universe_file = v2_state.parent / "missing.txt"
     cfg10.max_subscribe = 1
     cfg10.mobile_snapshot_file.write_text(
@@ -860,7 +908,8 @@ def scenario_N():
         json.dumps({"cash": 0, "positions": [{"code": "600941"}]}), encoding="utf-8")
     cfg_sub.mobile_snapshot_file = root / "mobile_snapshot.json"
     cfg_sub.holdings_file = root / "holdings.txt"
-    cfg_sub.predictions_file = root / "missing.parquet"
+    cfg_sub.predictions_file = write_fresh_predictions(
+        root / "predictions.parquet", ("600941",))
     cfg_sub.universe_file = root / "missing.txt"
     cfg_sub.max_subscribe = 1
     cfg_sub.mobile_snapshot_file.write_text(
@@ -972,7 +1021,8 @@ def scenario_O():
         json.dumps({"cash": 0, "positions": [{"code": "600941"}]}), encoding="utf-8")
     cfg_sub.mobile_snapshot_file = sub_root / "mobile_snapshot.json"
     cfg_sub.holdings_file = sub_root / "holdings.txt"
-    cfg_sub.predictions_file = sub_root / "missing.parquet"
+    cfg_sub.predictions_file = write_fresh_predictions(
+        sub_root / "predictions.parquet", ("600941",))
     cfg_sub.universe_file = sub_root / "missing.txt"
     cfg_sub.max_subscribe = 1
     cfg_sub.mobile_snapshot_file.write_text(
@@ -1105,20 +1155,24 @@ def scenario_Q():
     print("\n== Q. 双融合实时主序（三模型收益门 + pred 百分位排序）==")
     cfg = new_cfg()
     cfg.predictions_file = Path(cfg.ledger_dir) / "predictions.parquet"
+    # 日期相对今日生成：制品早于 prediction_max_age_days 就会被 freshness 门禁拒绝，
+    # 写死日期的夹具会随时间自然过期。
+    prev_day = (_dt.date.today() - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    latest_day = _dt.date.today().strftime("%Y-%m-%d")
     pd.DataFrame([
-        {"code": "000981", "date": "2026-08-04", "ridge_pred": 0.02,
+        {"code": "000981", "date": prev_day, "ridge_pred": 0.02,
          "elastic_pred": None, "extra_trees_pred": None, "pred": 99.0},
-        {"code": "000981", "date": "2026-08-05", "ridge_pred": 0.004,
+        {"code": "000981", "date": latest_day, "ridge_pred": 0.004,
          "elastic_pred": 0.005, "extra_trees_pred": 0.006, "pred": 2.1},
-        {"code": "000982", "date": "2026-08-05", "ridge_pred": 0.009,
+        {"code": "000982", "date": latest_day, "ridge_pred": 0.009,
          "elastic_pred": 0.008, "extra_trees_pred": 0.007, "pred": 1.3},
-        {"code": "000983", "date": "2026-08-05", "ridge_pred": 0.0029,
+        {"code": "000983", "date": latest_day, "ridge_pred": 0.0029,
          "elastic_pred": 0.0029, "extra_trees_pred": 0.0029, "pred": 2.5},
-        {"code": "000984", "date": "2026-08-05", "ridge_pred": 0.004,
+        {"code": "000984", "date": latest_day, "ridge_pred": 0.004,
          "elastic_pred": None, "extra_trees_pred": None, "pred": 0.5},
     ]).to_parquet(cfg.predictions_file, index=False)
     returns, date, components, scores, percentiles = _load_expected_return(cfg)
-    check(date == "2026-08-05" and abs(returns["000982"] - 0.0078) < 1e-12,
+    check(date == latest_day and abs(returns["000982"] - 0.0078) < 1e-12,
           "参考层按 30% Ridge + 20% ElasticNet + 50% ExtraTrees 融合收益")
     check(returns["000984"] == 0.004 and
           components["000984"]["source"] == "single_model_fallback" and
@@ -1173,12 +1227,13 @@ def scenario_R():
 
     cfg_model = new_cfg()
     cfg_model.predictions_file = Path(cfg_model.ledger_dir) / "bad_predictions.parquet"
+    bad_day = _dt.date.today().strftime("%Y-%m-%d")
     pd.DataFrame([
-        {"code": "000991", "date": "2026-08-05", "ridge_pred": float("inf"),
+        {"code": "000991", "date": bad_day, "ridge_pred": float("inf"),
          "elastic_pred": 0.01, "extra_trees_pred": 0.01, "pred": 2.0},
-        {"code": "000992", "date": "2026-08-05", "ridge_pred": float("nan"),
+        {"code": "000992", "date": bad_day, "ridge_pred": float("nan"),
          "elastic_pred": float("inf"), "extra_trees_pred": float("-inf"), "pred": 3.0},
-        {"code": "000993", "date": "2026-08-05", "ridge_pred": 0.004,
+        {"code": "000993", "date": bad_day, "ridge_pred": 0.004,
          "elastic_pred": 0.004, "extra_trees_pred": 0.004, "pred": float("inf")},
     ]).to_parquet(cfg_model.predictions_file, index=False)
     returns, _, components, scores, percentiles = _load_expected_return(cfg_model)
@@ -1458,7 +1513,8 @@ def scenario_V():
     (sub_root / "paper_state_v5.json").write_text(
         json.dumps({"cash": 1, "positions": [{"code": "600998"}]}), encoding="utf-8")
     cfg_sub.mobile_snapshot_file = sub_root / "missing.json"
-    cfg_sub.predictions_file = sub_root / "missing.parquet"
+    cfg_sub.predictions_file = write_fresh_predictions(
+        sub_root / "predictions.parquet", ("600998",))
     cfg_sub.holdings_file = sub_root / "missing.txt"
     cfg_sub.universe_file = sub_root / "missing_universe.txt"
     check(load_codes(cfg_sub) == ["600998"],
@@ -1598,7 +1654,8 @@ def scenario_Y():
     root = Path(cfg.ledger_dir)
     cfg.holdings_file = root / "realtime_holdings.txt"
     cfg.mobile_snapshot_file = root / "missing_mobile_snapshot.json"
-    cfg.predictions_file = root / "missing_predictions.parquet"
+    cfg.predictions_file = write_fresh_predictions(
+        root / "predictions.parquet", ("600664",))
     cfg.universe_file = root / "missing_universe.txt"
     cfg.max_subscribe = 100
     cfg.sector_meta_file = root / "all_a_stock_meta.parquet"
