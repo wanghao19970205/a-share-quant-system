@@ -1205,8 +1205,6 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                   random_forest: bool = False, random_forest_estimators: int = 120,
                   random_forest_max_train_rows: int = 300_000,
                   random_forest_weight: float = 0.0,
-                  rebalance_stride: int = 1,
-                  hold_rank_buffer: int = 0,
                   min_window_completion_ratio: float = 0.90,
                   ridge_only: bool = False,
                   require_selection_provenance: bool = False) -> pd.DataFrame:
@@ -1868,13 +1866,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
     if cache_dir is not None:
         print(f"[train:cache] window cache hits={cache_hits} misses={cache_misses}", flush=True)
     pred = pd.concat(pred_parts, ignore_index=True) if pred_parts else pd.DataFrame()
-    stride = max(int(rebalance_stride), 1)
-    trading_calendar = warehouse.load("trading_calendar") if stride > 1 else None
-    evaluated_pred = backtest._apply_rebalance_stride(
-        pred, stride, trading_calendar=trading_calendar,
-    )
     returns, holdings = backtest.portfolio_from_predictions(
-        evaluated_pred,
+        pred,
         horizon=horizon,
         top_n=top_n,
         max_weight=max_weight if max_weight is not None else 1.0 / max(int(top_n), 1),
@@ -1882,9 +1875,8 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         ridge_quantile=ridge_quantile,
         filter_untradable=True,
         require_tradability=True,
-        hold_rank_buffer=max(int(hold_rank_buffer), 0),
     )
-    periods_per_year = max(1, int(round(252 / max(horizon, stride))))
+    periods_per_year = max(1, int(round(252 / max(horizon, 1))))
     summary = backtest.evaluate_returns(
         returns["ret"] if not returns.empty else pd.Series(dtype=float),
         periods_per_year=periods_per_year,
@@ -1929,9 +1921,6 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
     summary["random_forest_estimators"] = int(random_forest_estimators) if random_forest else None
     summary["random_forest_max_train_rows"] = int(random_forest_max_train_rows) if random_forest else None
     summary["random_forest_weight"] = float(random_forest_weight) if random_forest else 0.0
-    summary["rebalance_stride"] = stride
-    summary["hold_rank_buffer"] = max(int(hold_rank_buffer), 0)
-    summary["authoritative_rebalance_calendar"] = trading_calendar is not None
     summary["n_predictions"] = len(pred)
     summary["n_evaluation_predictions"] = len(evaluated_pred)
     summary_df = pd.DataFrame([{"model": MODEL_NAME, **summary}])
@@ -1973,14 +1962,6 @@ def main() -> None:
     )
     ap.add_argument("--output-prefix", default="full_a_batched_rq04_default_ne200")
     ap.add_argument("--horizon", type=int, default=5)
-    ap.add_argument(
-        "--rebalance-stride", type=int, default=1,
-        help="evaluate every N authoritative exchange sessions; 1 keeps daily evaluation",
-    )
-    ap.add_argument(
-        "--hold-rank-buffer", type=int, default=0,
-        help="retain held names through top_n + buffer rank; 0 disables hysteresis",
-    )
     ap.add_argument("--batch-size", type=int, default=200)
     ap.add_argument("--min-price-rows", type=int, default=1000)
     ap.add_argument("--limit-codes", type=int, default=0, help="debug only; 0 means all eligible codes")
@@ -2144,8 +2125,6 @@ def main() -> None:
         enforce_c30_gates=args.enforce_c30_gates,
         min_adv20=args.min_adv20,
         min_listing_sessions=args.min_listing_sessions,
-        rebalance_stride=args.rebalance_stride,
-        hold_rank_buffer=args.hold_rank_buffer,
     )
 
 

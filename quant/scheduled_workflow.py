@@ -161,16 +161,6 @@ def run_short_grid(output_prefixes: dict[str, str], args: argparse.Namespace,
             watchlist=watchlist,
             positive_only=True,
             neighborhood=champion_params,
-            fixed_params={
-                "rebalance_stride": max(
-                    int(getattr(args, "short_rebalance_stride", 1)), 1
-                ),
-                **(
-                    {"hold_rank_buffer": max(int(args.short_hold_rank_buffer), 0)}
-                    if bool(getattr(args, "short_hold_rank_buffer_explicit", False))
-                    else {}
-                ),
-            },
         )
 
     except Exception as e:  # noqa: BLE001
@@ -181,8 +171,7 @@ def run_short_grid(output_prefixes: dict[str, str], args: argparse.Namespace,
     row = best.iloc[0]
     params: dict = {}
     for k in ("ic_weight", "top_n", "gross_exposure", "slot_weight",
-              "ridge_quantile", "pred_quantile", "naive_weight", "rebalance_stride",
-              "hold_rank_buffer"):
+              "ridge_quantile", "pred_quantile", "naive_weight"):
         if k not in best.columns:
             continue
         v = watchlist_grid._empty_to_none(row.get(k))  # noqa: SLF001
@@ -488,8 +477,6 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
                                      or ([1, 2] if style == "short_1_3" else [7, 10, 15]))]
         kind = "short" if style == "short_1_3" else "swing"
         incumbent_params = dict(cfg.get("champion_score_params") or cfg.get("score_params") or {})
-        incumbent_params.setdefault("rebalance_stride", int(cfg.get("rebalance_stride", 1)))
-        incumbent_params.setdefault("hold_rank_buffer", int(cfg.get("hold_rank_buffer", 0)))
 
         # Select candidate parameters strictly before the untouched holdout period.
         selection_file = quant_dir / f"{output_prefixes[source_style]}_{style}_selection.parquet"
@@ -501,22 +488,6 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
                 for key in ("lgbm_weight", "elastic_weight", "catboost_weight", "extra_trees_weight")
                 if incumbent_params.get(key) is not None
             }
-            fixed_model_params["rebalance_stride"] = max(int(
-                args.short_rebalance_stride if style == "short_1_3"
-                else args.swing_rebalance_stride
-            ), 1)
-            requested_buffer = (
-                getattr(args, "short_hold_rank_buffer", 0)
-                if style == "short_1_3"
-                else getattr(args, "swing_hold_rank_buffer", 0)
-            )
-            buffer_explicit = (
-                bool(getattr(args, "short_hold_rank_buffer_explicit", False))
-                if style == "short_1_3"
-                else bool(getattr(args, "swing_hold_rank_buffer_explicit", False))
-            )
-            if buffer_explicit:
-                fixed_model_params["hold_rank_buffer"] = max(int(requested_buffer), 0)
             _selection_grid, selection_best = watchlist_grid.run_grid(
                 predictions=candidate_path,
                 template=template,
@@ -528,7 +499,6 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
                 positive_only=True,
                 start_date=candidate_start,
                 end_date=holdout_start,
-                fixed_params=fixed_model_params,
             )
         except Exception as exc:  # noqa: BLE001
             reports[style] = {"promote": False, "reason": f"parameter_selection_failed: {type(exc).__name__}"}
@@ -537,8 +507,7 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
             reports[style] = {"promote": False, "reason": "parameter_selection_empty"}
             continue
         param_keys = ("lgbm_weight", "ic_weight", "elastic_weight", "catboost_weight", "extra_trees_weight", "top_n", "gross_exposure",
-                      "slot_weight", "max_weight", "ridge_quantile", "pred_quantile", "naive_weight",
-                      "rebalance_stride", "hold_rank_buffer")
+                      "slot_weight", "max_weight", "ridge_quantile", "pred_quantile", "naive_weight")
 
         candidate_pred, candidate_prepared = watchlist_grid.prepare_fixed_context(
             candidate_path, horizons, watchlist, holdout_start, common_end)
@@ -563,7 +532,7 @@ def _promotion_gate(output_prefixes: dict[str, str], args: argparse.Namespace,
                 value = watchlist_grid._empty_to_none(candidate_row.get(key))  # noqa: SLF001
                 if value is None:
                     candidate_params[key] = None
-                elif key in ("top_n", "rebalance_stride", "hold_rank_buffer"):
+                elif key == "top_n":
                     candidate_params[key] = int(value)
                 else:
                     candidate_params[key] = float(value)
@@ -676,20 +645,12 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
     )
     short_cfg["predictions_file"] = short_active.name
     short_cfg["prediction_horizon"] = int(training_params.get("short_horizon", 1))
-    short_cfg["rebalance_stride"] = int(
-        training_params.get("short_rebalance_stride", 1)
-    )
-    short_cfg["hold_rank_buffer"] = int(
-        training_params.get("short_hold_rank_buffer", 0)
-    )
     short_cfg["horizons"] = list(FINAL_TRADE_STYLES["short_1_3"]["horizons"])
     styles["short_1_3"] = short_cfg
     artifacts = deepcopy(manifest.get("style_artifacts") or {})
     short_artifact = deepcopy(artifacts.get("short_1_3") or {})
     short_artifact.update({
         "horizon": int(training_params.get("short_horizon", 1)),
-        "rebalance_stride": int(training_params.get("short_rebalance_stride", 1)),
-        "hold_rank_buffer": int(training_params.get("short_hold_rank_buffer", 0)),
         "predictions_file": short_active.name,
         "source_predictions_file": source_predictions.name,
         "summary_file": f"{source_prefix}_bt_{MODEL_NAME}_summary.parquet",
@@ -717,18 +678,10 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
         swing_cfg = deepcopy(styles.get("swing_7_15") or FINAL_TRADE_STYLES["swing_7_15"])
         swing_cfg["predictions_file"] = swing_active.name
         swing_cfg["prediction_horizon"] = short_artifact["horizon"]
-        swing_cfg["rebalance_stride"] = int(
-            training_params.get("swing_rebalance_stride", 1)
-        )
-        swing_cfg["hold_rank_buffer"] = int(
-            training_params.get("swing_hold_rank_buffer", 0)
-        )
         styles["swing_7_15"] = swing_cfg
         swing_artifact = deepcopy(artifacts.get("swing_7_15") or {})
         swing_artifact.update({
             "horizon": short_artifact["horizon"],
-            "rebalance_stride": int(training_params.get("swing_rebalance_stride", 1)),
-            "hold_rank_buffer": int(training_params.get("swing_hold_rank_buffer", 0)),
             "predictions_file": swing_active.name,
             "source_predictions_file": source_predictions.name,
             "summary_file": short_artifact["summary_file"],
@@ -1015,24 +968,6 @@ def _uses_extra_trees_training(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "extra_trees", False) or getattr(args, "incumbent_extra_trees", False))
 
 
-def _restore_explicit_portfolio_params(
-    args: argparse.Namespace,
-    cli_values: dict[str, int],
-    argv: list[str],
-) -> None:
-    options = {
-        "short_rebalance_stride": "--short-rebalance-stride",
-        "swing_rebalance_stride": "--swing-rebalance-stride",
-        "short_hold_rank_buffer": "--short-hold-rank-buffer",
-        "swing_hold_rank_buffer": "--swing-hold-rank-buffer",
-    }
-    for attribute, option in options.items():
-        if option not in argv:
-            continue
-        lower = 1 if attribute.endswith("rebalance_stride") else 0
-        setattr(args, attribute, max(int(cli_values[attribute]), lower))
-
-
 def _apply_incumbent_training_config(args: argparse.Namespace) -> None:
     """Keep daily refresh on the last approved training method without invoking the promotion gate."""
     args.incumbent_rolling_factor_select = False
@@ -1052,14 +987,6 @@ def _apply_incumbent_training_config(args: argparse.Namespace) -> None:
             args.model_threads = int(params["model_threads"])
     except Exception:  # noqa: BLE001
         return
-    if params.get("short_rebalance_stride") is not None:
-        args.short_rebalance_stride = max(int(params["short_rebalance_stride"]), 1)
-    if params.get("swing_rebalance_stride") is not None:
-        args.swing_rebalance_stride = max(int(params["swing_rebalance_stride"]), 1)
-    if params.get("short_hold_rank_buffer") is not None:
-        args.short_hold_rank_buffer = max(int(params["short_hold_rank_buffer"]), 0)
-    if params.get("swing_hold_rank_buffer") is not None:
-        args.swing_hold_rank_buffer = max(int(params["swing_hold_rank_buffer"]), 0)
     if bool(params.get("elastic_net")):
         args.incumbent_elastic_net = True
         args.elastic_alpha = float(params.get("elastic_alpha") or args.elastic_alpha)
@@ -1122,14 +1049,6 @@ def run_training(args: argparse.Namespace, env: dict[str, str]) -> None:
     horizons = _horizons(args)
     for style in TRAIN_STYLE_ORDER:
         horizon = horizons[style]
-        rebalance_stride = (
-            args.short_rebalance_stride if style == "short_1_3"
-            else args.swing_rebalance_stride
-        )
-        hold_rank_buffer = (
-            getattr(args, "short_hold_rank_buffer", 0) if style == "short_1_3"
-            else getattr(args, "swing_hold_rank_buffer", 0)
-        )
         prefix = output_prefixes[style]
         panel_name = _training_panel_name(horizon)
         score_params = FINAL_TRADE_STYLES[style].get("score_params", {})
@@ -1166,8 +1085,6 @@ def run_training(args: argparse.Namespace, env: dict[str, str]) -> None:
             "--name", panel_name,
             "--output-prefix", prefix,
             "--horizon", str(horizon),
-            "--rebalance-stride", str(max(int(rebalance_stride), 1)),
-            "--hold-rank-buffer", str(max(int(hold_rank_buffer), 0)),
             "--refresh-months", str(args.refresh_months),
             "--universe-file", config.MAINBOARD_UNIVERSE_FILE,
             "--top-n", str(top_n),
@@ -1234,10 +1151,6 @@ def build_params(args: argparse.Namespace) -> dict:
     return {
         "short_horizon": args.short_horizon,
         "swing_horizon": args.swing_horizon,
-        "short_rebalance_stride": max(int(args.short_rebalance_stride), 1),
-        "swing_rebalance_stride": max(int(args.swing_rebalance_stride), 1),
-        "short_hold_rank_buffer": max(int(getattr(args, "short_hold_rank_buffer", 0)), 0),
-        "swing_hold_rank_buffer": max(int(getattr(args, "swing_hold_rank_buffer", 0)), 0),
         "horizons": _horizons(args),
         "refresh_months": args.refresh_months,
         "n_estimators": args.n_estimators,
@@ -1332,22 +1245,6 @@ def main() -> None:
     ap.add_argument("--horizon", type=int, default=1, help="legacy alias for --short-horizon")
     ap.add_argument("--short-horizon", type=int, default=None, help="短线训练目标天数；默认沿用 --horizon")
     ap.add_argument("--swing-horizon", type=int, default=10, help="波段训练目标天数")
-    ap.add_argument(
-        "--short-rebalance-stride", type=int, default=1,
-        help="短线评估每 N 个权威交易会话调仓；1 保持每日评估",
-    )
-    ap.add_argument(
-        "--swing-rebalance-stride", type=int, default=1,
-        help="波段评估每 N 个权威交易会话调仓；1 保持每日评估",
-    )
-    ap.add_argument(
-        "--short-hold-rank-buffer", type=int, default=0,
-        help="固定短线 Top-N + buffer；省略时训练使用 0、网格搜索已注册维度",
-    )
-    ap.add_argument(
-        "--swing-hold-rank-buffer", type=int, default=0,
-        help="固定波段 Top-N + buffer；省略时训练使用 0、网格搜索已注册维度",
-    )
     ap.add_argument("--refresh-months", type=int, default=1)
     ap.add_argument("--n-estimators", type=int, default=200)
     ap.add_argument("--learning-rate", type=float, default=0.015)
@@ -1397,8 +1294,6 @@ def main() -> None:
     ap.set_defaults(window_cache=True)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
-    args.short_hold_rank_buffer_explicit = "--short-hold-rank-buffer" in sys.argv[1:]
-    args.swing_hold_rank_buffer_explicit = "--swing-hold-rank-buffer" in sys.argv[1:]
     if args.short_horizon is None:
         args.short_horizon = args.horizon
 
@@ -1412,14 +1307,7 @@ def main() -> None:
     print(f"[workflow] quant_data_dir={args.quant_data_dir}", flush=True)
     print(f"[workflow] snapshot_dir={args.snapshot_dir}", flush=True)
     cli_recent_windows = int(args.recent_windows or 0)  # explicit CLI intent, captured before manifest override
-    cli_portfolio_params = {
-        "short_rebalance_stride": int(args.short_rebalance_stride),
-        "swing_rebalance_stride": int(args.swing_rebalance_stride),
-        "short_hold_rank_buffer": int(args.short_hold_rank_buffer),
-        "swing_hold_rank_buffer": int(args.swing_hold_rank_buffer),
-    }
     _apply_incumbent_training_config(args)
-    _restore_explicit_portfolio_params(args, cli_portfolio_params, sys.argv[1:])
     if args.strategy_mode == "incumbent-refresh":
         # Daily/weekly refresh: rolling walk-forward. Default is the latest 24 windows (each a
         # 24-month train slice); peak memory is bounded by ONE window, so this is memory-safe on
