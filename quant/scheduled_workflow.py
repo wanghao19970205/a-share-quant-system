@@ -849,6 +849,8 @@ def run_daily_update(args: argparse.Namespace, env: dict[str, str]) -> None:
         cmd.append("--force-latest")
     if getattr(args, "intraday_spot", False):
         cmd.append("--intraday-spot")
+    if str(getattr(args, "pit_index_code", "")).strip():
+        cmd.append("--refresh-pit-reference")
     print("[run] " + " ".join(cmd), flush=True)
     if args.dry_run:
         return

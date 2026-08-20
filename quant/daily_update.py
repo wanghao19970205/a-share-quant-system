@@ -668,8 +668,14 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
         skip_price: bool = False, skip_valuation: bool = False,
         skip_events: bool = False, skip_fundamentals: bool = False,
         skip_snapshots: bool = False, limit: int = 0, force_latest: bool = False,
-        intraday_spot: bool = False, codes_file: str | None = None) -> dict:
+        intraday_spot: bool = False, codes_file: str | None = None,
+        refresh_pit_reference: bool = False) -> dict:
     config.ensure_dirs()
+    if refresh_pit_reference:
+        pit_summary = refresh_pit_reference_data()
+        print(f"[pit] {pit_summary}", flush=True)
+        if pit_summary.get("status") != "refreshed":
+            raise RuntimeError(f"PIT reference refresh unavailable: {pit_summary}")
     calendar_summary = refresh_trading_calendar()
     u = config.UNIVERSES[universe]
     if codes_file:
@@ -763,13 +769,16 @@ def main() -> None:
                     help="盘中使用一次全市场实时快照覆盖当日临时K线，避免逐股网络请求")
     ap.add_argument("--codes-file", default="",
                     help="仅更新文件中列出的6位股票代码，用于崩溃后的缺口恢复")
+    ap.add_argument("--refresh-pit-reference", action="store_true",
+                    help="训练前刷新证券主数据和指数成分历史；不可用时 fail-closed")
     args = ap.parse_args()
     res = run(universe=args.universe, workers=args.workers, lookback_days=args.lookback_days,
               event_window_days=args.event_window_days, snapshot_dir=args.snapshot_dir or None,
               skip_price=args.skip_price, skip_valuation=args.skip_valuation,
               skip_events=args.skip_events, skip_fundamentals=args.skip_fundamentals,
               skip_snapshots=args.skip_snapshots, limit=args.limit, force_latest=args.force_latest,
-              intraday_spot=args.intraday_spot, codes_file=args.codes_file or None)
+              intraday_spot=args.intraday_spot, codes_file=args.codes_file or None,
+              refresh_pit_reference=args.refresh_pit_reference)
     print("[done]", res)
     # 券商 tgw 原生库在解释器退出（atexit/析构）时可能段错误(SIGSEGV)，此时数据已全部落盘。
     # 用 os._exit(0) 跳过 native 析构直接干净退出，避免非零退出码被上游 check=True 误判为失败、
