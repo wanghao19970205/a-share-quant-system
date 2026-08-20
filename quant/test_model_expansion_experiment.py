@@ -1741,7 +1741,10 @@ class ModelExpansionExperimentTest(unittest.TestCase):
             )
         self.assertIsNotNone(fast)
         self.assertIsNotNone(slow)
-        self.assertEqual(fast["periods"], 3)
+        # dates[1] has nothing buyable, so neither path books it and the holding
+        # from dates[0] carries across it instead of being liquidated.
+        self.assertEqual(fast["periods"], 2)
+        self.assertEqual(slow["periods"], 2)
         for key in ("avg_turnover", "sharpe", "total_return"):
             self.assertAlmostEqual(fast[key], slow[key])
 

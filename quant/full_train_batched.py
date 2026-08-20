@@ -1881,7 +1881,6 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         positive_only=positive_only,
         ridge_quantile=ridge_quantile,
         filter_untradable=True,
-        no_refill=True,
         require_tradability=True,
         hold_rank_buffer=max(int(hold_rank_buffer), 0),
     )

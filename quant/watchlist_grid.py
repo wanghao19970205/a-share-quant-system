@@ -409,16 +409,19 @@ def _fast_combo_metrics(prepared: dict, row: pd.Series, kind: str, horizon: int,
         _empty_to_none(row.get("gross_exposure"))
         or min(max_weight * max(top_n, 1), 1.0)
     )
-    no_refill = True
     pred_quantile = _empty_to_none(row.get("pred_quantile"))
     ridge_quantile = _empty_to_none(row.get("ridge_quantile"))
 
     mask = np.isfinite(score) & np.isfinite(target)
     if positive_only:
         mask &= score > 0
+    # Unbuyable names are removed before ranking, so a blocked candidate is
+    # replaced by the next one and the book always holds top_n. This is the
+    # semantics the live chain runs; evaluating anything else here would rank
+    # parameters under a portfolio the production system never trades.
     buyable = prepared.get("buyable")
     if buyable is not None:
-        buyable = buyable[stride_indices][evaluable_dates]
+        mask &= buyable[stride_indices][evaluable_dates]
     mask = _apply_row_quantile(mask, score, float(pred_quantile) if pred_quantile is not None else None)
     ridge = prepared["ridge"][stride_indices][evaluable_dates]
     if ridge_quantile is not None and np.isfinite(ridge).any():
@@ -444,10 +447,12 @@ def _fast_combo_metrics(prepared: dict, row: pd.Series, kind: str, horizon: int,
             )
             actual = np.zeros(mask.shape[1], dtype=bool)
             actual[indices] = True
-            if no_refill and buyable is not None:
-                actual &= buyable[date_index]
             pick_bool[date_index] = actual
-            previous_codes = set(codes[actual])
+            # Nothing selectable means nothing traded, not a liquidation: the
+            # formal path leaves its holdings untouched on such a day, so the
+            # hysteresis anchor has to survive it too.
+            if actual.any():
+                previous_codes = set(codes[actual])
     else:
         ranked_score = np.where(mask, score, -np.inf)
         order = np.argpartition(-ranked_score, kth=n_pick - 1, axis=1)[:, :n_pick]
@@ -456,11 +461,18 @@ def _fast_combo_metrics(prepared: dict, row: pd.Series, kind: str, horizon: int,
         order = np.take_along_axis(order, sort_idx, axis=1)
         top_score = np.take_along_axis(top_score, sort_idx, axis=1)
         picked = np.isfinite(top_score)
-        if no_refill and buyable is not None:
-            picked &= np.take_along_axis(buyable, order, axis=1)
         row_idx = np.arange(mask.shape[0])[:, None]
         pick_bool[row_idx, order] = picked
     counts = pick_bool.sum(axis=1)
+    # A day with nothing buyable is not a zero-return day: the formal path emits
+    # no row for it, so booking one here would add fictitious observations and a
+    # fictitious unwind to the turnover series.
+    valid_rows = counts > 0
+    if not valid_rows.any():
+        return None
+    pick_bool = pick_bool[valid_rows]
+    target = target[valid_rows]
+    counts = counts[valid_rows]
     weights = np.minimum(max_weight, gross_exposure / np.maximum(counts, 1))
     stock_weights = pick_bool.astype(float) * weights[:, None]
     ret = np.nansum(target * stock_weights, axis=1)
@@ -515,7 +527,6 @@ def _run_combo(pred: pd.DataFrame, row: pd.Series, kind: str, horizon: int, posi
         pred_quantile=float(pred_quantile) if pred_quantile is not None else None,
         ridge_quantile=float(ridge_quantile) if ridge_quantile is not None else None,
         filter_untradable=True,
-        no_refill=True,
         require_tradability=True,
         hold_rank_buffer=_hold_rank_buffer(row),
     )
@@ -662,7 +673,6 @@ def evaluate_prepared_returns(pred: pd.DataFrame, params: dict, horizons: list[i
             pred_quantile=float(pred_quantile) if pred_quantile is not None else None,
             ridge_quantile=float(ridge_quantile) if ridge_quantile is not None else None,
             filter_untradable=True,
-            no_refill=True,
             require_tradability=True,
             hold_rank_buffer=_hold_rank_buffer(normalized),
         )
