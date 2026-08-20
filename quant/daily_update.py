@@ -671,6 +671,7 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
         intraday_spot: bool = False, codes_file: str | None = None,
         refresh_pit_reference: bool = False) -> dict:
     config.ensure_dirs()
+    pit_summary = None
     if refresh_pit_reference:
         pit_summary = refresh_pit_reference_data()
         print(f"[pit] {pit_summary}", flush=True)
@@ -689,6 +690,11 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
         codes = datafeed.universe(u["kind"], u["arg"])
     if limit:
         codes = codes[:limit]
+    if refresh_pit_reference:
+        status_summary = refresh_trading_status_reference(codes, batch_size=200)
+        print(f"[pit-status] {status_summary}", flush=True)
+        if status_summary.get("status") != "refreshed":
+            raise RuntimeError(f"PIT trading-status refresh unavailable: {status_summary}")
     print(f"[universe] {universe} codes={len(codes)} quant_dir={config.QUANT_DIR}")
 
     summary: dict = {
@@ -696,6 +702,9 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
         "n_codes": len(codes),
         "trading_calendar": calendar_summary,
     }
+    if pit_summary is not None:
+        summary["pit_reference"] = pit_summary
+        summary["pit_trading_status"] = status_summary
     if not skip_price:
         if intraday_spot:
             summary["price"] = update_intraday_spot(codes, workers=workers)
