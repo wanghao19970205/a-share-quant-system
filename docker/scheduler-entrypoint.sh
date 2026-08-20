@@ -11,7 +11,9 @@ umask 077
            DASHSCOPE_API_KEY DASHSCOPE_BASE_URL DASHSCOPE_BATCH_BASE_URL DASHSCOPE_MODEL \
            DASHSCOPE_MODELS DASHSCOPE_MODEL_LIST DASHSCOPE_FALLBACK_MODEL \
            AMAZINGDATA_USER AMAZINGDATA_PASSWORD AMAZINGDATA_HOST AMAZINGDATA_PORT AMAZINGDATA_AUTO_LOGIN; do
-    eval v="\${$k:-}"
+    v=$(printenv "$k" 2>/dev/null || true)
+    # Escape single quotes before writing shell-readable cron.env values.
+    v=$(printf '%s' "$v" | sed "s/'/'\\\\''/g")
     printf "export %s='%s'\n" "$k" "$v"
   done
 } > /app/cron.env
