@@ -1,8 +1,10 @@
 """量化选股 · 单数据仓训练评估流水线。
 
+训练/验证/评估边界必须显式给出，禁止用滚动月份隐式推导，避免早停验证段与最终评估段重叠。
+
 用法示例：
-    QUANT_DATA_DIR=quant_data/hs300 python -m quant.pipeline --horizon 5
-    QUANT_DATA_DIR=quant_data/full_a_sample python -m quant.pipeline --horizon 5 --top-n 20
+    QUANT_DATA_DIR=quant_data/hs300 python -m quant.pipeline --horizon 5 \
+        --train-end 2025-12-31 --valid-end 2026-01-31 --predict-start 2026-02-01
 """
 from __future__ import annotations
 

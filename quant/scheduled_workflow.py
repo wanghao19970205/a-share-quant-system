@@ -1395,7 +1395,7 @@ def main() -> None:
                     )
             if not args.skip_swing_grid:
                 print(
-                    "[swing_grid] 当前研究副本无可调用实现，跳过监控网格；"
+                    "[swing_grid] 波段风格无独立网格实现，跳过；"
                     "active swing params 保持 incumbent",
                     flush=True,
                 )

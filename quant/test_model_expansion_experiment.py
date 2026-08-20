@@ -504,6 +504,7 @@ class IntradaySourcePriorityTest(unittest.TestCase):
 
     def test_force_latest_skips_remote_date_probe(self):
         with mock.patch.object(daily_update.config, "ensure_dirs"), \
+                mock.patch.object(daily_update, "refresh_trading_calendar", return_value={}), \
                 mock.patch.object(daily_update, "_refresh_mainboard_universe_isolated"), \
                 mock.patch.object(daily_update.datafeed, "universe", return_value=["600001"]), \
                 mock.patch.object(daily_update, "_probe_latest_price_date") as probe, \
@@ -515,6 +516,7 @@ class IntradaySourcePriorityTest(unittest.TestCase):
                 force_latest=True,
                 skip_valuation=True,
                 skip_events=True,
+                skip_fundamentals=True,
                 skip_snapshots=True,
             )
 
