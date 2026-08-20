@@ -57,7 +57,6 @@ services:
       - SNAPSHOT_DIR=/app/snapshots
       - QUANT_DATA_DIR=/app/quant_data/full_a_2018_wide
       - QUANT_MODEL=active_quant
-      - SCHEDULER_DISABLED=1
       - AMAZINGDATA_AUTO_LOGIN=1
       - AMAZINGDATA_KLINE_BATCH_SIZE=800
       - AMAZINGDATA_KLINE_TIMEOUT=180
