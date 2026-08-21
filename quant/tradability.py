@@ -5,11 +5,13 @@
 ``full_train_batched`` 均从这里取。
 
 口径（主板 ±10%，一字板是其子集；ST ±5% 为已知盲区，不在此处理）：
+- 默认模式沿用历史主板 ±10% 封板启发式，并额外要求当日有成交量；缺少 high/low 或
+  volume 列时不得默认可交易（fail-closed）。
 - ``limit_up_seal``  = (close==high) & (ret1>=0.095)：涨停封板 → **当天尾盘买不进**（挡买入）。
 - ``limit_down_seal``= (close==low)  & (ret1<=-0.095)：跌停封板 → **当天卖不出**（挡卖出）。
 - ``tradable_ret_{h}d``：尾盘 T 买入、T+h 收盘卖出；若卖出日封跌停则顺延到下一可卖日收盘，
   上限 cap 个交易日（含预定日），窗口内均封则末日强制平仓。
-- ``buyable_close``：当日是否可买入（尾盘收盘口径）——涨停封板(含一字)当天买不进。
+- ``buyable_close``：当日是否可买入（尾盘收盘口径）——涨停封板、零成交量或成交量缺失时不可买。
 """
 from __future__ import annotations
 
@@ -69,19 +71,26 @@ def price_tradability(codes: list[str], horizons: list[int],
         if not path.exists():
             continue
         try:
-            px = pd.read_parquet(path, columns=["code", "date", "open", "high", "low", "close"])
+            px = pd.read_parquet(
+                path, columns=["code", "date", "open", "high", "low", "close", "volume"]
+            )
         except Exception:  # noqa: BLE001
-            # 老价格文件可能没有 open/high/low，退回仅 close
+            # 老价格文件可能没有完整 OHLCV，缺 volume 时保持 fail-closed。
             try:
-                px = pd.read_parquet(path, columns=["code", "date", "close"])
+                px = pd.read_parquet(
+                    path, columns=["code", "date", "open", "high", "low", "close"]
+                )
             except Exception:  # noqa: BLE001
-                continue
+                try:
+                    px = pd.read_parquet(path, columns=["code", "date", "close"])
+                except Exception:  # noqa: BLE001
+                    continue
         if px.empty:
             continue
         px = px.copy()
         px["code"] = px["code"].astype(str).str.zfill(6)
         px["date"] = pd.to_datetime(px["date"], errors="coerce")
-        for c in ("open", "high", "low", "close"):
+        for c in ("open", "high", "low", "close", "volume"):
             if c in px.columns:
                 px[c] = pd.to_numeric(px[c], errors="coerce")
         px = px.dropna(subset=["code", "date", "close"]).sort_values("date")
@@ -90,6 +99,12 @@ def price_tradability(codes: list[str], horizons: list[int],
         out = px[["code", "date"]].copy()
         has_open = "open" in px.columns and px["open"].notna().any()
         has_hl = "high" in px.columns and "low" in px.columns
+        has_volume = "volume" in px.columns
+        positive_volume = (
+            px["volume"].fillna(0.0).gt(0).to_numpy(dtype=bool)
+            if has_volume
+            else np.zeros(len(px), dtype=bool)
+        )
         close_arr = px["close"].to_numpy(dtype=float)
         # 收盘封板判定（±10% 主板口径；一字板是其子集）。ST(±5%) 为已知盲区。
         limit_down_seal = None
@@ -101,6 +116,7 @@ def price_tradability(codes: list[str], horizons: list[int],
                 ret1 = close_arr / prev_close - 1
             limit_up_seal = (close_arr == high_arr) & (ret1 >= 0.095)
             limit_down_seal = (close_arr == low_arr) & (ret1 <= -0.095)
+        out["positive_volume"] = positive_volume
         cap = sell_roll_max_days()
         for horizon in horizons:
             # 收盘口径（保留，供方向统计/兜底）
@@ -116,21 +132,26 @@ def price_tradability(codes: list[str], horizons: list[int],
                 sell_close = rolled_sell_close(close_arr, limit_down_seal, horizon, cap)
                 with np.errstate(all="ignore"):
                     out[f"tradable_ret_{horizon}d"] = sell_close / close_arr - 1
-        # 次日是否可买入(次日开盘口径)：一字涨停(high==low 且上涨)当日买不进
+        # 次日是否可买入(次日开盘口径)：一字涨停(high==low 且上涨)当日买不进。
+        # 成交量缺失或为零时 fail-closed，不能把不可执行样本当作可买。
         if has_open and has_hl:
             nxt_high = px["high"].shift(-1)
             nxt_low = px["low"].shift(-1)
             nxt_close = px["close"].shift(-1)
             entry = px["open"].shift(-1)
             one_word_up = (nxt_high == nxt_low) & (nxt_close > px["close"])
-            out["buyable_next"] = (~one_word_up.fillna(False)) & entry.notna()
+            out["buyable_next"] = (
+                (~one_word_up.fillna(False))
+                & entry.notna()
+                & pd.Series(positive_volume, index=px.index).shift(-1, fill_value=False)
+            )
         else:
-            out["buyable_next"] = True
-        # 当日是否可买入(尾盘收盘口径)：涨停封板(含一字涨停)当天尾盘买不进
+            out["buyable_next"] = False
+        # 当日是否可买入(尾盘收盘口径)：涨停封板或无成交量当天尾盘买不进。
         if limit_down_seal is not None:
-            out["buyable_close"] = ~limit_up_seal
+            out["buyable_close"] = (~limit_up_seal) & positive_volume
         else:
-            out["buyable_close"] = True
+            out["buyable_close"] = positive_volume
         frames.append(out)
     if not frames:
         return pd.DataFrame()
