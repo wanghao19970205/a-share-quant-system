@@ -335,6 +335,8 @@ class RealtimeConfig:
 
     # ---- 卖点纪律 ------------------------------------------------------------
     sell_horizon: int = field(default_factory=lambda: _env_int("REALTIME_SELL_HORIZON", 1))
+    prediction_max_age_days: int = field(
+        default_factory=lambda: _env_int("REALTIME_PREDICTION_MAX_AGE_DAYS", 1))
 
     # ---- 交易时段 / 生命周期（本地时间，HHMM 整数）--------------------------
     session_start: int = field(default_factory=lambda: _env_int("REALTIME_SESSION_START", 925))
