@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 
@@ -43,7 +44,10 @@ def _quiet_mini_racer_del() -> None:
 _quiet_mini_racer_del()
 
 from quant import config, datafeed, warehouse
+from quant.logging_utils import install_timestamped_stdout
 
+
+install_timestamped_stdout()
 
 _LOCK = threading.Lock()
 
@@ -92,16 +96,45 @@ def _probe_latest_valuation_date(codes: list[str]) -> dt.date | None:
     return max(latest_dates) if latest_dates else None
 
 
-def _stale_codes(codes: list[str], load_fn, latest_date: dt.date | None, label: str,
-                 force_latest: bool = False) -> list[str]:
+def _stale_codes(
+    codes: list[str],
+    load_fn,
+    latest_date: dt.date | None,
+    label: str,
+    force_latest: bool = False,
+    local_dates_out: dict[str, dt.date | None] | None = None,
+    last_date_fn=None,
+) -> list[str]:
     local_dates: dict[str, dt.date | None] = {}
     local_max: dt.date | None = None
-    for code in codes:
-        local_latest = _last_date(load_fn(code))
+    scan_started = time.perf_counter()
+    print(
+        f"[{label}:scan-start] codes={len(codes)} force_latest={force_latest}",
+        flush=True,
+    )
+    for index, code in enumerate(codes, start=1):
+        if index == 1 or index % 100 == 0:
+            print(
+                f"[{label}:scan-current] index={index}/{len(codes)} code={code} "
+                f"elapsed={time.perf_counter() - scan_started:.2f}s",
+                flush=True,
+            )
+        local_latest = (
+            last_date_fn(code)
+            if last_date_fn is not None
+            else _last_date(load_fn(code))
+        )
         local_dates[code] = local_latest
+        if local_dates_out is not None:
+            local_dates_out[code] = local_latest
         if local_latest is not None and (local_max is None or local_latest > local_max):
             local_max = local_latest
 
+    print(
+        f"[{label}:scan-done] codes={len(codes)} "
+        f"seconds={time.perf_counter() - scan_started:.2f}",
+        flush=True,
+    )
     effective_latest = max([d for d in (latest_date, local_max) if d is not None], default=None)
     if effective_latest is None:
         print(f"[{label}] fresh-skip disabled: unable to determine latest date")
@@ -133,6 +166,32 @@ def _merge_time_series(old: pd.DataFrame, new: pd.DataFrame, keys: list[str]) ->
     return merged.reset_index(drop=True)
 
 
+def _price_merge_changed(old: pd.DataFrame, merged: pd.DataFrame) -> bool:
+    """Return whether a price merge changes persisted rows.
+
+    force_latest still fetches and compares the current trading day, but an
+    unchanged response does not need to rewrite the full historical parquet.
+    """
+    if old is None or old.empty:
+        return True
+    if merged is None or len(old) != len(merged) or list(old.columns) != list(merged.columns):
+        return True
+    try:
+        left = old.sort_values(["code", "date"]).reset_index(drop=True)
+        right = merged.sort_values(["code", "date"]).reset_index(drop=True)
+        pd.testing.assert_frame_equal(
+            left,
+            right,
+            check_dtype=False,
+            check_exact=False,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        return False
+    except (AssertionError, KeyError, TypeError, ValueError):
+        return True
+
+
 def _spot_value(row: pd.Series, name: str, default=None):
     value = pd.to_numeric(pd.Series([row.get(name)]), errors="coerce").iloc[0]
     return default if pd.isna(value) else float(value)
@@ -158,7 +217,8 @@ def _update_one_intraday_spot(code: str, row: pd.Series, trade_date: dt.date) ->
             "pct_change": _spot_value(row, "涨跌幅", (close / previous - 1) * 100 if previous else 0.0),
         }
         merged = _merge_time_series(old, pd.DataFrame([item]), keys=["code", "date"])
-        warehouse.save_price(code, merged)
+        if _price_merge_changed(old, merged):
+            warehouse.save_price(code, merged)
         return code, "ok", 1
     except Exception as e:  # noqa: BLE001
         return code, type(e).__name__, 0
@@ -177,7 +237,8 @@ def _merge_broker_daily(
             new = new.drop(columns=["code"])
         new.insert(0, "code", code)
         merged = _merge_time_series(old, new, keys=["code", "date"])
-        warehouse.save_price(code, merged)
+        if _price_merge_changed(old, merged):
+            warehouse.save_price(code, merged)
         return code, "ok", len(new)
     except Exception as e:  # noqa: BLE001
         return code, type(e).__name__, 0
@@ -288,6 +349,27 @@ def _update_one_valuation(code: str, lookback_days: int = 5) -> tuple[str, str, 
         return code, type(e).__name__, 0
 
 
+def _sync_trading_calendar() -> dict:
+    """从 AmazingData 获取真实交易日历并原子落盘；失败时保留旧文件。"""
+    from stock_analyzer import amazingdata_source
+
+    path = config.TRADING_CALENDAR_FILE
+    try:
+        calendar = amazingdata_source.trading_calendar()
+        latest = pd.Timestamp(calendar["date"].max()).date()
+        today = dt.date.today()
+        # 工作日不能接受落后于今天的日历；节假日/周末允许沿用最近一个交易日。
+        if today.weekday() < 5 and latest < today:
+            raise RuntimeError(f"SDK 日历落后：latest={latest} today={today}")
+        warehouse.save_trading_calendar(calendar)
+        print(f"[calendar] updated path={path} dates={len(calendar)} latest={latest}", flush=True)
+        return {"status": "updated", "path": path, "latest": str(latest),
+                "dates": len(calendar)}
+    except Exception as e:  # noqa: BLE001 - 日历同步失败不阻断价格/训练主链路
+        print(f"[calendar] sync_failed path={path} error={type(e).__name__}: {e}; keep_existing", flush=True)
+        return {"status": "kept_existing", "path": path, "error": type(e).__name__}
+
+
 def _warmup_broker(retries: int = 3) -> bool:
     """批量前预热券商 TGW 连接：先用单只轻量 K 线把 push server 拉起来再发大批量。
 
@@ -309,10 +391,19 @@ def _warmup_broker(retries: int = 3) -> bool:
     return False
 
 
-def _update_prices_batched(codes, lookback_days: int = 5, workers: int = 12,
-                           batch_size: int = 200, gap_threshold_days: int = 45,
-                           batch_retries: int = 2) -> dict:
+def _update_prices_batched(
+    codes,
+    lookback_days: int = 5,
+    workers: int = 12,
+    batch_size: int | None = None,
+    gap_threshold_days: int = 45,
+    batch_retries: int = 2,
+    local_dates: dict[str, dt.date | None] | None = None,
+) -> dict:
     """价格更新：券商批量 K 线做主路径 + 逐股缺口/兜底回退。
+
+    未显式传入批次时读取 AMAZINGDATA_KLINE_BATCH_SIZE，保证 scheduler 的
+    部署配置能够贯穿到外层 daily_update，而不是只影响 SDK 内层分块。
 
     保留逐股路径三个保护：①免费源兜底(批量缺票转单只)②列标准化(_standardize
     补齐 amount/turnover/pct_change)③缺口恢复(缺口超阈值或无本地数据的票走单只全量)。
@@ -323,11 +414,21 @@ def _update_prices_batched(codes, lookback_days: int = 5, workers: int = 12,
     import time as _time
     from stock_analyzer import amazingdata_source
     from stock_analyzer.data import _standardize
+    if batch_size is None:
+        try:
+            batch_size = int(os.environ.get("AMAZINGDATA_KLINE_BATCH_SIZE", "200") or 200)
+        except (TypeError, ValueError):
+            batch_size = 200
+    batch_size = max(1, int(batch_size))
     today = dt.date.today()
     # 按本地最后日期分流：缺口在阈值内走批量(数据驱动窗口)；无本地数据或缺口过大走逐股全量补
     batch_codes, gap_codes, max_gap = [], [], lookback_days
     for code in codes:
-        last = _last_date(warehouse.load_price(code))
+        last = (
+            local_dates.get(code)
+            if local_dates is not None and code in local_dates
+            else _last_date(warehouse.load_price(code))
+        )
         if last is None:
             gap_codes.append(code)
             continue
@@ -347,9 +448,24 @@ def _update_prices_batched(codes, lookback_days: int = 5, workers: int = 12,
     if batch_codes and not _warmup_broker():
         print("[price] broker warmup failed; 批量可能整片降级逐股", flush=True)
     ok = rows = 0
+    local_load_seconds = 0.0
+    local_merge_sort_seconds = 0.0
+    local_save_seconds = 0.0
+    local_compare_seconds = 0.0
     fallback = list(gap_codes)
+    total_batches = (len(batch_codes) + batch_size - 1) // batch_size
     for i in range(0, len(batch_codes), batch_size):
         chunk = batch_codes[i:i + batch_size]
+        batch_no = i // batch_size + 1
+        batch_started = _time.perf_counter()
+        load_before = local_load_seconds
+        merge_before = local_merge_sort_seconds
+        save_before = local_save_seconds
+        print(
+            f"[price:batch-start] batch={batch_no}/{total_batches} "
+            f"codes={len(chunk)}",
+            flush=True,
+        )
         frames = None
         for attempt in range(batch_retries + 1):
             try:
@@ -365,7 +481,18 @@ def _update_prices_batched(codes, lookback_days: int = 5, workers: int = 12,
                     print(f"[price] batch chunk={i // batch_size} failed={type(e).__name__} "
                           f"after {batch_retries + 1} tries; per-stock fallback", flush=True)
                     fallback.extend(chunk)
+        print(
+            f"[price:batch-sdk-done] batch={batch_no}/{total_batches} "
+            f"seconds={_time.perf_counter() - batch_started:.2f} "
+            f"returned={len(frames) if frames is not None else 0}",
+            flush=True,
+        )
         if frames is None:
+            print(
+                f"[price:batch-done] batch={batch_no}/{total_batches} status=fallback "
+                f"seconds={_time.perf_counter() - batch_started:.2f}",
+                flush=True,
+            )
             continue
         for code in chunk:
             fr = frames.get(code)
@@ -377,13 +504,31 @@ def _update_prices_batched(codes, lookback_days: int = 5, workers: int = 12,
                 if "code" in new.columns:
                     new = new.drop(columns=["code"])
                 new.insert(0, "code", code)
-                merged = _merge_time_series(warehouse.load_price(code), new, keys=["code", "date"])
-                if not merged.empty:
+                load_started = _time.perf_counter()
+                old = warehouse.load_price(code)
+                local_load_seconds += _time.perf_counter() - load_started
+                merge_started = _time.perf_counter()
+                merged = _merge_time_series(old, new, keys=["code", "date"])
+                local_merge_sort_seconds += _time.perf_counter() - merge_started
+                compare_started = _time.perf_counter()
+                changed = _price_merge_changed(old, merged)
+                local_compare_seconds += _time.perf_counter() - compare_started
+                if not merged.empty and changed:
+                    save_started = _time.perf_counter()
                     warehouse.save_price(code, merged)
+                    local_save_seconds += _time.perf_counter() - save_started
                 ok += 1
                 rows += len(new)
             except Exception:  # noqa: BLE001 标准化/落盘异常 -> 转单只兜底重试
                 fallback.append(code)
+        print(
+            f"[price:batch-done] batch={batch_no}/{total_batches} status=ok "
+            f"seconds={_time.perf_counter() - batch_started:.2f} "
+            f"local_load={local_load_seconds - load_before:.2f}s "
+            f"local_merge_sort={local_merge_sort_seconds - merge_before:.2f}s "
+            f"local_save={local_save_seconds - save_before:.2f}s",
+            flush=True,
+        )
     failures: list[str] = []
     if fallback:
         print(f"[price] batch ok={ok}; per-stock fallback={len(fallback)}", flush=True)
@@ -392,6 +537,14 @@ def _update_prices_batched(codes, lookback_days: int = 5, workers: int = 12,
         rows += fb["rows"]
         failures = fb["failures"]
     fail = len(codes) - ok
+    print(
+        f"[price:timing] batch_local_load={local_load_seconds:.2f}s "
+        f"batch_local_merge_sort={local_merge_sort_seconds:.2f}s "
+        f"batch_local_compare={local_compare_seconds:.2f}s "
+        f"batch_local_save={local_save_seconds:.2f}s "
+        f"batch_codes={len(batch_codes)}",
+        flush=True,
+    )
     print(f"[price] ok={ok} fail={fail} fetched_rows={rows}" + (f" failures={failures}" if failures else ""))
     return {"ok": ok, "fail": fail, "rows": rows, "failures": failures}
 
@@ -425,30 +578,53 @@ def _recent_report_dates(window_days: int) -> list[str]:
 
 
 def update_recent_events(start: str, end: str, workers: int = 4, fundamentals: bool = True) -> None:
-    print(f"[events] window={start}-{end}")
+    events_started = time.perf_counter()
+    print(f"[events] window={start}-{end}", flush=True)
     for name, fn in (("block_trades", datafeed.block_trades), ("lhb", datafeed.lhb)):
+        item_started = time.perf_counter()
         try:
+            fetch_started = time.perf_counter()
             df = fn(start, end)
+            fetch_seconds = time.perf_counter() - fetch_started
             keys = [k for k in ("code", "date") if k in df.columns]
-            warehouse.upsert(name, df, keys=keys or list(df.columns[:2]))
+            upsert_started = time.perf_counter()
+            merged = warehouse.upsert(name, df, keys=keys or list(df.columns[:2]))
+            upsert_seconds = time.perf_counter() - upsert_started
+            rows = len(merged)
         except Exception as e:  # noqa: BLE001
-            print(f"[{name}] failed: {type(e).__name__}")
-        print(f"[{name}] rows={len(warehouse.load(name))}")
+            fetch_seconds = upsert_seconds = 0.0
+            rows = 0
+            print(f"[{name}] failed: {type(e).__name__}", flush=True)
+        print(
+            f"[events:timing] name={name} fetch={fetch_seconds:.2f}s "
+            f"upsert_write={upsert_seconds:.2f}s total={time.perf_counter() - item_started:.2f}s rows={rows}",
+            flush=True,
+        )
 
-    try:
-        warehouse.upsert("margin_sse", datafeed.margin_sse(start, end), keys=["date"])
-    except Exception as e:  # noqa: BLE001
-        print(f"[margin_sse] failed: {type(e).__name__}")
-    print(f"[margin_sse] rows={len(warehouse.load('margin_sse'))}")
-
-    for name, fn in (("margin_szse", datafeed.margin_szse), ("margin_underlying_szse", datafeed.margin_underlying_szse)):
+    for name, fetch in (("margin_sse", lambda: datafeed.margin_sse(start, end)),
+                        ("margin_szse", lambda: datafeed.margin_szse(end)),
+                        ("margin_underlying_szse", lambda: datafeed.margin_underlying_szse(end))):
+        item_started = time.perf_counter()
         try:
-            df = fn(end)
+            fetch_started = time.perf_counter()
+            df = fetch()
+            fetch_seconds = time.perf_counter() - fetch_started
             keys = ["code", "date"] if "code" in df.columns else ["date"]
-            warehouse.upsert(name, df, keys=keys)
+            upsert_started = time.perf_counter()
+            merged = warehouse.upsert(name, df, keys=keys)
+            upsert_seconds = time.perf_counter() - upsert_started
+            rows = len(merged)
         except Exception as e:  # noqa: BLE001
-            print(f"[{name}] failed: {type(e).__name__}")
-        print(f"[{name}] rows={len(warehouse.load(name))}")
+            fetch_seconds = upsert_seconds = 0.0
+            rows = 0
+            print(f"[{name}] failed: {type(e).__name__}", flush=True)
+        print(
+            f"[events:timing] name={name} fetch={fetch_seconds:.2f}s "
+            f"upsert_write={upsert_seconds:.2f}s total={time.perf_counter() - item_started:.2f}s rows={rows}",
+            flush=True,
+        )
+
+    print(f"[events:timing] total={time.perf_counter() - events_started:.2f}s", flush=True)
 
     if not fundamentals:
         return
@@ -503,6 +679,8 @@ def _refresh_mainboard_universe_isolated() -> None:
     主进程随后照常 datafeed.universe 读该文件，无需回传数据。抓表每轮仅一次(~10s)，
     子进程额外启动开销 ~2s，对整轮日更(目标<10min)可忽略。子进程失败则沿用现有
     universe 文件(股票池变化极慢，晚一轮无害)，不阻断日更。"""
+    started = time.perf_counter()
+    print("[universe-refresh:start] isolated=true timeout=180s", flush=True)
     try:
         r = subprocess.run(
             [sys.executable, "-c",
@@ -510,10 +688,19 @@ def _refresh_mainboard_universe_isolated() -> None:
             capture_output=True, text=True, timeout=180,
         )
     except Exception as e:  # noqa: BLE001 子进程异常(超时等) -> 沿用现有 universe 文件
-        print(f"[universe] 子进程刷新异常 {type(e).__name__}; 沿用现有 universe 文件", flush=True)
+        print(
+            f"[universe-refresh:done] seconds={time.perf_counter() - started:.2f} "
+            f"status=exception error={type(e).__name__}; 沿用现有 universe 文件",
+            flush=True,
+        )
         return
+    tail = (r.stderr or r.stdout or "").strip().splitlines()[-1:]
+    print(
+        f"[universe-refresh:done] seconds={time.perf_counter() - started:.2f} "
+        f"rc={r.returncode} output={tail}",
+        flush=True,
+    )
     if r.returncode != 0:
-        tail = (r.stderr or "").strip().splitlines()[-3:]
         print(f"[universe] 子进程刷新失败 rc={r.returncode}; 沿用现有 universe 文件. {tail}", flush=True)
 
 
@@ -524,19 +711,31 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
         skip_snapshots: bool = False, limit: int = 0, force_latest: bool = False,
         intraday_spot: bool = False, codes_file: str | None = None) -> dict:
     config.ensure_dirs()
+    summary: dict = {"universe": universe, "calendar": _sync_trading_calendar()}
     u = config.UNIVERSES[universe]
     if codes_file:
         with open(codes_file, encoding="utf-8") as fh:
             codes = sorted({line.strip() for line in fh if re.fullmatch(r"\\d{6}", line.strip())})
     else:
         if u["kind"] == "mainboard_active":
-            _refresh_mainboard_universe_isolated()
+            universe_path = config.MAINBOARD_UNIVERSE_FILE
+            try:
+                file_date = dt.datetime.fromtimestamp(os.path.getmtime(universe_path)).date()
+            except OSError:
+                file_date = None
+            if file_date == dt.date.today():
+                print(
+                    f"[universe-refresh:skip] reason=fresh-today path={universe_path}",
+                    flush=True,
+                )
+            else:
+                _refresh_mainboard_universe_isolated()
         codes = datafeed.universe(u["kind"], u["arg"])
     if limit:
         codes = codes[:limit]
     print(f"[universe] {universe} codes={len(codes)} quant_dir={config.QUANT_DIR}")
 
-    summary: dict = {"universe": universe, "n_codes": len(codes)}
+    summary["n_codes"] = len(codes)
     if not skip_price:
         if intraday_spot:
             summary["price"] = update_intraday_spot(codes, workers=workers)
@@ -546,10 +745,29 @@ def run(universe: str = "mainboard_active", workers: int = 12, lookback_days: in
                 else "whole-market-spot"
             )
         else:
-            price_latest = _probe_latest_price_date(codes, lookback_days)
-            price_codes = _stale_codes(codes, warehouse.load_price, price_latest, "price",
-                                       force_latest=force_latest)
-            summary["price"] = _update_prices_batched(price_codes, lookback_days=lookback_days, workers=workers)
+            if force_latest:
+                # force_latest already refreshes every locally present code. Avoid
+                # 20 serial probe requests whose date result cannot change the stale set.
+                price_latest = None
+                print("[price:probe-skip] reason=force-latest", flush=True)
+            else:
+                price_latest = _probe_latest_price_date(codes, lookback_days)
+            local_price_dates: dict[str, dt.date | None] = {}
+            price_codes = _stale_codes(
+                codes,
+                warehouse.load_price,
+                price_latest,
+                "price",
+                force_latest=force_latest,
+                local_dates_out=local_price_dates,
+                last_date_fn=warehouse.latest_price_date,
+            )
+            summary["price"] = _update_prices_batched(
+                price_codes,
+                lookback_days=lookback_days,
+                workers=workers,
+                local_dates=local_price_dates,
+            )
             summary["price"]["skipped_fresh"] = len(codes) - len(price_codes)
             summary["price"]["source_latest"] = str(price_latest or "")
     if not skip_valuation:

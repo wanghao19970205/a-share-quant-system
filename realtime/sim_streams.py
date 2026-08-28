@@ -99,6 +99,7 @@ class Cfg:
     paper_start_equity = 100000.0
     paper_cost = 0.002
     sell_horizon = 1
+    prediction_max_age_days = 1
     paper_stop_loss = 0.05
     paper_take_profit = 0.09
     paper_trail_k = 3.0
@@ -1102,6 +1103,7 @@ def scenario_P():
 def scenario_Q():
     print("\n== Q. 双融合实时主序（三模型收益门 + pred 百分位排序）==")
     cfg = new_cfg()
+    cfg.prediction_max_age_days = 9999  # 场景使用固定历史日期，绕过生产新鲜度门
     cfg.predictions_file = Path(cfg.ledger_dir) / "predictions.parquet"
     pd.DataFrame([
         {"code": "000981", "date": "2026-08-04", "ridge_pred": 0.02,
@@ -1170,6 +1172,7 @@ def scenario_R():
           "Snapshot 适配层屏蔽 NaN/Inf，不把极值送入交易层")
 
     cfg_model = new_cfg()
+    cfg_model.prediction_max_age_days = 9999  # 场景使用固定历史日期，绕过生产新鲜度门
     cfg_model.predictions_file = Path(cfg_model.ledger_dir) / "bad_predictions.parquet"
     pd.DataFrame([
         {"code": "000991", "date": "2026-08-05", "ridge_pred": float("inf"),

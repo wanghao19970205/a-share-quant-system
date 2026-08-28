@@ -195,7 +195,7 @@ class V2PaperTrader(_V1):
         self._notifier.push(
             f"[模拟盘V2] 卖出 {self._label(pos['code'])} @{px:.2f} "
             f"{_EXIT_LABEL_V2.get(reason, reason)}",
-            f"持有T+{held} 收益{ret:+.2%} 盈亏¥{pnl:,.0f}\n{self.summary()}")
+            self._sell_notice(pos, px, held, pnl, ret, reason, proceeds))
 
     # ── 买入：动态分配 + 上限 + 买窗到 14:57 ────────────────────────────
     def _run_buys(self) -> None:

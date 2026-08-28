@@ -43,6 +43,9 @@ class V3PaperTrader(V2PaperTrader):
     def _prefix(self) -> str:
         return "[paper_v3]"
 
+    def _exit_label(self, reason: str) -> str:
+        return _EXIT_LABEL_V3.get(reason, reason)
+
     def _prediction_date(self, code: str) -> Optional[str]:
         ref = self._ctx.ref_of(code) or self._ctx.ref_of(_digits(code))
         value = getattr(ref, "prediction_date", None) if ref is not None else None
@@ -68,6 +71,11 @@ class V3PaperTrader(V2PaperTrader):
         """V3 按可卖买一价估值；无买一时退回 None，由账户估值使用成本价。"""
         _, _, bid, _ = self._quote(code)
         return bid
+
+    def _mark_detail(self, code: str) -> tuple[Optional[float], Optional[float], str]:
+        """V3-V6 按可成交 bid1 估值，并同时记录盘口年龄。"""
+        _, age, bid, _ = self._quote(code)
+        return bid, age, "bid1"
 
     def _entry_quote_detail(self, code: str, exp: float) -> tuple[Optional[str], Optional[dict]]:
         """一次性读取并验证入场盘口，避免校验与记账跨越两条行情。"""
@@ -386,4 +394,4 @@ class V3PaperTrader(V2PaperTrader):
         self._notifier.push(
             f"[{self._PAPER_TITLE}] 卖出 {self._label(pos['code'])} @{px:.2f} "
             f"{_EXIT_LABEL_V3.get(reason, reason)}",
-            f"持有T+{held} 收益{ret:+.2%} 盈亏¥{pnl:,.0f}\n{self.summary()}")
+            self._sell_notice(pos, px, held, pnl, ret, reason, proceeds))

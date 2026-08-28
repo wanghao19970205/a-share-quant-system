@@ -8,6 +8,8 @@ import os
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QUANT_DIR = os.environ.get("QUANT_DATA_DIR", os.path.join(_ROOT, "quant_data"))
+TRADING_CALENDAR_FILE = os.environ.get(
+    "TRADING_CALENDAR_FILE", os.path.join(QUANT_DIR, "trading_calendar.parquet"))
 PRICE_DIR = os.path.join(QUANT_DIR, "price")          # 每股一份日线 parquet
 VALUATION_DIR = os.path.join(QUANT_DIR, "valuation")  # 每股一份估值时序 parquet
 MAINBOARD_UNIVERSE_FILE = os.path.join(QUANT_DIR, "mainboard_active_universe.txt")

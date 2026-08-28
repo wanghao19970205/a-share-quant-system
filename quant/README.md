@@ -318,6 +318,7 @@ V1-V5 的持仓都由 `config.paper_state_files()` 纳入保护性订阅和热�
 | `paper_trades.jsonl` | 每笔平仓的不可变流水，包含成本、卖出净额和盈亏 |
 | `paper_buy_decisions.jsonl` | 每日模型池、重排、过滤和成交快照 |
 | `paper_sell_counterfactuals.jsonl` | 卖出日及后续 3 个交易日反事实 |
+| `trading_calendar.parquet` | AmazingData 同步的交易日历，供 T+N 计算使用 |
 | `paper_*_v2.json(l)` | V2 赛马账户的同名独立副本 |
 | `paper_*_v3.json(l)` | V3 可成交报价与 ATR 规则账户的同名独立副本 |
 | `paper_*_v4.json(l)` | V4 行业ETF弱势回避账户的同名独立副本 |

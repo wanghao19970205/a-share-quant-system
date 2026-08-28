@@ -12,6 +12,7 @@ import os
 import tempfile
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from quant import config
 
@@ -41,6 +42,19 @@ def save(name: str, df: pd.DataFrame) -> None:
 def load(name: str) -> pd.DataFrame:
     p = _p(name)
     return pd.read_parquet(p) if os.path.exists(p) else pd.DataFrame()
+
+
+def save_trading_calendar(df: pd.DataFrame) -> None:
+    """原子保存规范化交易日历；只保留有效唯一 date 列。"""
+    if df is None or "date" not in df.columns:
+        raise ValueError("交易日历必须包含 date 列")
+    out = pd.DataFrame({"date": pd.to_datetime(df["date"], errors="coerce")})
+    out = out.dropna()
+    out["date"] = out["date"].dt.normalize()
+    out = out.drop_duplicates().sort_values("date").reset_index(drop=True)
+    if out.empty:
+        raise ValueError("交易日历为空")
+    _atomic_parquet(out, config.TRADING_CALENDAR_FILE)
 
 
 def upsert(name: str, df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
@@ -90,6 +104,37 @@ def load_price_tail(
 def load_price(code: str) -> pd.DataFrame:
     p = os.path.join(config.PRICE_DIR, f"{code}.parquet")
     return pd.read_parquet(p) if os.path.exists(p) else pd.DataFrame()
+
+
+def latest_price_date(code: str):
+    """Read a price file's latest date from Parquet footer statistics."""
+    path = os.path.join(config.PRICE_DIR, f"{code}.parquet")
+    if not os.path.exists(path):
+        return None
+    try:
+        parquet = pq.ParquetFile(path)
+        date_index = parquet.schema_arrow.get_field_index("date")
+        if date_index < 0:
+            return None
+        maxima = []
+        for group_index in range(parquet.metadata.num_row_groups):
+            statistics = parquet.metadata.row_group(group_index).column(date_index).statistics
+            if statistics is not None and statistics.has_min_max:
+                maxima.append(statistics.max)
+        if maxima:
+            return pd.Timestamp(max(maxima)).date()
+    except Exception:  # noqa: BLE001
+        pass
+    return _last_price_date_from_column(path)
+
+
+def _last_price_date_from_column(path: str):
+    try:
+        frame = pd.read_parquet(path, columns=["date"])
+        dates = pd.to_datetime(frame["date"], errors="coerce").dropna()
+        return dates.max().date() if not dates.empty else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def save_valuation(code: str, df: pd.DataFrame) -> None:

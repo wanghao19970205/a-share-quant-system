@@ -51,6 +51,7 @@ services:
       dockerfile: Dockerfile.scheduler
     platform: linux/amd64
     image: stock-scheduler
+    entrypoint: ["/app/docker/scheduler-entrypoint.sh"]
     env_file:
       - .env            # 券商账号：容器内 Linux 可用 AmazingData 优先源
     environment:
@@ -58,6 +59,7 @@ services:
       - QUANT_DATA_DIR=/app/quant_data/full_a_2018_wide
       - QUANT_MODEL=active_quant
       - AMAZINGDATA_AUTO_LOGIN=1
+      - AMAZINGDATA_KLINE_BATCH_SIZE=800
       - TZ=Asia/Shanghai
       - PYTHONPATH=/app
       - LOG_DIR=/app/logs

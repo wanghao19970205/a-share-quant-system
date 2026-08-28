@@ -222,10 +222,11 @@ class RealtimeConfig:
     # ---- V3 模拟盘（执行确认 + ATR 自适应出场）-------------------------------
     # 与 V2 共用模型池、资金分配、买窗和持仓上限；按 ask1/bid1 模拟可成交报价，
     # 只使用当日预测和新鲜快照，卖出统一采用 ATR 风险单位。
+    # 盘口推送短暂抖动允许最多保留 5 分钟；缺失报价、无效 bid1 或无买一量仍禁止成交。
     paper_v3_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_V3", True))
     paper_v3_quote_max_age_sec: float = field(
         default_factory=lambda: max(
-            1.0, _env_float("REALTIME_PAPER_V3_QUOTE_MAX_AGE_SEC", 90.0)))
+            1.0, _env_float("REALTIME_PAPER_V3_QUOTE_MAX_AGE_SEC", 300.0)))
     paper_v3_atr_k: float = field(
         default_factory=lambda: max(0.1, _env_float("REALTIME_PAPER_V3_ATR_K", 2.0)))
 
@@ -262,6 +263,13 @@ class RealtimeConfig:
         0.0, _env_float("REALTIME_PAPER_V5_SECTOR_NEUTRAL_FACTOR", 1.00))))
     paper_v5_sector_strong_factor: float = field(default_factory=lambda: min(1.5, max(
         0.0, _env_float("REALTIME_PAPER_V5_SECTOR_STRONG_FACTOR", 1.15))))
+
+    # ---- V6 模拟盘（V5 + 当前分钟入场择时）----------------------------------
+    paper_v6_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_V6", True))
+    paper_v6_minute_speed_weight: float = field(default_factory=lambda: max(
+        0.0, _env_float("REALTIME_PAPER_V6_MINUTE_SPEED_WEIGHT", 0.20)))
+    paper_v6_minute_move_scale: float = field(default_factory=lambda: max(
+        0.0005, _env_float("REALTIME_PAPER_V6_MINUTE_MOVE_SCALE", 0.006)))
 
     # ---- 同量纲预期收益融合 + 历史校准 -------------------------------------
     # Ridge / ElasticNet / ExtraTrees 都直接回归 target_ret_{h}d，可融合为收益率；
@@ -372,6 +380,8 @@ class RealtimeConfig:
             files.append(base.parent / f"{base.stem}_v4{base.suffix}")
         if getattr(self, "paper_v5_enabled", False):
             files.append(base.parent / f"{base.stem}_v5{base.suffix}")
+        if getattr(self, "paper_v6_enabled", False):
+            files.append(base.parent / f"{base.stem}_v6{base.suffix}")
         return tuple(files)
 
 

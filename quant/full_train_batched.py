@@ -24,7 +24,10 @@ import pandas as pd
 
 from quant import backtest, config, model as qmodel, select as factor_select, tradability, warehouse
 from quant.factors import engineering
+from quant.logging_utils import install_timestamped_stdout
 
+
+install_timestamped_stdout()
 
 MODEL_NAME = "ridge_lightgbm_ranker_ensemble"
 # Bump when the per-window prediction computation changes in a way that invalidates
@@ -89,6 +92,27 @@ def _window_cache_key(prepared_dir: Path, recipe_sig: str, train_start: pd.Times
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
 
+def _cached_prediction_valid(
+    frame: pd.DataFrame,
+    current: pd.Timestamp,
+    test_end: pd.Timestamp,
+) -> tuple[bool, str]:
+    """Guard window-cache reuse against stale or malformed prediction files."""
+    required = {"code", "date"}
+    if frame.empty:
+        return False, "empty"
+    if not required.issubset(frame.columns):
+        return False, "missing-code-date"
+    dates = pd.to_datetime(frame["date"], errors="coerce")
+    if dates.isna().any():
+        return False, "invalid-date"
+    if (dates < pd.Timestamp(current)).any() or (dates >= pd.Timestamp(test_end)).any():
+        return False, "date-out-of-window"
+    if frame.duplicated(["code", "date"]).any():
+        return False, "duplicate-code-date"
+    return True, "ok"
+
+
 def _chunks(items: list[str], n: int):
     n = max(int(n), 1)
     for i in range(0, len(items), n):
@@ -114,6 +138,18 @@ def _month_key(s: pd.Series) -> pd.Series:
 
 def _prepared_files(prepared_dir: Path) -> list[Path]:
     return sorted(prepared_dir.glob("*.parquet"))
+
+
+def _prepared_source_signatures(prepared_dir: Path) -> dict[str, str]:
+    """Return stable monthly versions for persisted factor-IC cache entries."""
+    signatures = {}
+    for path in _prepared_files(prepared_dir):
+        try:
+            stat = path.stat()
+            signatures[path.stem] = f"{stat.st_size}:{stat.st_mtime_ns}"
+        except OSError:
+            continue
+    return signatures
 
 
 def _month_floor(ts: pd.Timestamp) -> pd.Timestamp:
@@ -223,21 +259,45 @@ def _purged_end(dates: pd.Series, boundary: pd.Timestamp, horizon: int) -> pd.Ti
 
 
 class DailyICCache:
-    """Reuse date-local factor IC values across overlapping walk-forward windows."""
+    """Reuse date-local factor IC values across windows and daily runs."""
 
-    def __init__(self, workers: int = 8):
+    def __init__(self, workers: int = 8, path: Path | None = None,
+                 source_signatures: dict[str, str] | None = None):
         self.workers = max(int(workers), 1)
+        self.path = path
+        self.source_signatures = source_signatures or {}
         self._frames: dict[tuple[int, tuple[str, ...]], pd.DataFrame] = {}
+        if path is not None and path.exists():
+            try:
+                saved = pd.read_parquet(path)
+                if {"horizon", "factor_set", "date", "factor", "ic", "source_sig"}.issubset(saved.columns):
+                    for (saved_horizon, factor_set), frame in saved.groupby(
+                        ["horizon", "factor_set"], sort=False
+                    ):
+                        factors = tuple(str(f) for f in str(factor_set).split("|"))
+                        self._frames[(int(saved_horizon), factors)] = frame.copy()
+            except Exception:  # noqa: BLE001
+                # A corrupt/stale auxiliary cache must never block training.
+                self._frames = {}
 
     def get(self, train: pd.DataFrame, factors: list[str], horizon: int) -> tuple[pd.DataFrame, int, int]:
         use = tuple(factors)
         key = (int(horizon), use)
-        desired_dates = pd.Index(pd.to_datetime(train["date"], errors="coerce").dropna().unique())
-        cached = self._frames.get(key, pd.DataFrame(columns=["date", "factor", "ic"]))
-        cached_dates = pd.Index(pd.to_datetime(cached["date"], errors="coerce").dropna().unique())
+        desired = pd.to_datetime(train["date"], errors="coerce")
+        desired_dates = pd.Index(desired.dropna().unique())
+        cached = self._frames.get(
+            key,
+            pd.DataFrame(columns=["horizon", "factor_set", "date", "factor", "ic", "source_sig"]),
+        )
+        if not cached.empty:
+            cached = cached.copy()
+            cached["date"] = pd.to_datetime(cached["date"], errors="coerce")
+            valid = cached["date"].dt.strftime("%Y-%m").map(self.source_signatures)
+            cached = cached[valid.eq(cached["source_sig"])].copy()
+        cached_dates = pd.Index(cached["date"].dropna().unique())
         missing_dates = desired_dates.difference(cached_dates)
         if len(missing_dates):
-            missing = train[pd.to_datetime(train["date"], errors="coerce").isin(missing_dates)]
+            missing = train[desired.isin(missing_dates)]
             calculated = factor_select.daily_ic(
                 missing,
                 list(use),
@@ -245,15 +305,30 @@ class DailyICCache:
                 workers=self.workers,
             )
             if not calculated.empty:
-                cached = (
-                    calculated.copy()
-                    if cached.empty
-                    else pd.concat([cached, calculated], ignore_index=True)
-                )
+                calculated = calculated.copy()
+                calculated["horizon"] = int(horizon)
+                calculated["factor_set"] = "|".join(use)
+                calculated["source_sig"] = pd.to_datetime(
+                    calculated["date"], errors="coerce"
+                ).dt.strftime("%Y-%m").map(self.source_signatures)
+                cached = pd.concat([cached, calculated], ignore_index=True)
                 cached = cached.drop_duplicates(["date", "factor"], keep="last")
                 self._frames[key] = cached
         result = cached[pd.to_datetime(cached["date"], errors="coerce").isin(desired_dates)].copy()
         return result, int(len(desired_dates) - len(missing_dates)), int(len(missing_dates))
+
+    def save(self) -> None:
+        if self.path is None or not self._frames:
+            return
+        frames = [frame for frame in self._frames.values() if not frame.empty]
+        if not frames:
+            return
+        payload = pd.concat(frames, ignore_index=True).drop_duplicates(
+            ["horizon", "factor_set", "date", "factor"], keep="last"
+        )
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        payload.to_parquet(tmp, index=False)
+        tmp.replace(self.path)
 
 
 def _rolling_factor_selection(train: pd.DataFrame, factors: list[str], horizon: int,
@@ -395,6 +470,8 @@ def build_monthly_panel(name: str, horizon: int, batch_size: int,
     )
 
     for bi, batch in _chunks(codes, batch_size):
+        batch_started = time.perf_counter()
+        raw_write_seconds = 0.0
         raw = engineering.build_panel(
             codes=batch,
             horizon=horizon,
@@ -415,7 +492,14 @@ def build_monthly_panel(name: str, horizon: int, batch_size: int,
                 continue
             month_dir = raw_dir / str(month)
             month_dir.mkdir(parents=True, exist_ok=True)
+            write_started = time.perf_counter()
             part.to_parquet(month_dir / f"part_{bi:05d}.parquet", index=False)
+            raw_write_seconds += time.perf_counter() - write_started
+        print(
+            f"[panel:raw:timing] batch={bi} total={time.perf_counter() - batch_started:.2f}s "
+            f"write={raw_write_seconds:.2f}s codes={len(batch)} rows={len(raw)}",
+            flush=True,
+        )
         print(f"[panel:raw] batch={bi} codes={len(batch)} rows={len(raw)}", flush=True)
         del raw
         gc.collect()
@@ -425,11 +509,15 @@ def build_monthly_panel(name: str, horizon: int, batch_size: int,
         month_dirs = [p for p in month_dirs if p.name in refresh_keys]
 
     def prepare_month(month_dir: Path) -> tuple[str, int, int, pd.DataFrame]:
+        month_started = time.perf_counter()
         out_path = prepared_dir / f"{month_dir.name}.parquet"
         part_files = sorted(month_dir.glob("*.parquet"))
         if not part_files:
             return month_dir.name, 0, 0, pd.DataFrame()
+        read_started = time.perf_counter()
         raw = pd.concat((pd.read_parquet(p) for p in part_files), ignore_index=True)
+        read_seconds = time.perf_counter() - read_started
+        feature_started = time.perf_counter()
         prepared, feats = engineering.prepare_features(
             raw,
             horizon=horizon,
@@ -437,10 +525,19 @@ def build_monthly_panel(name: str, horizon: int, batch_size: int,
             add_onehot=False,
             drop_target_na=False,
         )
+        feature_seconds = time.perf_counter() - feature_started
+        write_started = time.perf_counter()
         prepared.to_parquet(out_path, index=False)
+        write_seconds = time.perf_counter() - write_started
         summary = engineering.summarize_features(feats)
         rows = len(prepared)
         cols = len(prepared.columns)
+        print(
+            f"[panel:prepared:timing] month={month_dir.name} read={read_seconds:.2f}s "
+            f"features={feature_seconds:.2f}s write={write_seconds:.2f}s "
+            f"total={time.perf_counter() - month_started:.2f}s rows={rows} cols={cols}",
+            flush=True,
+        )
         del raw, prepared
         gc.collect()
         return month_dir.name, rows, cols, summary
@@ -635,7 +732,7 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
     side_cols = ["volatility_10", "turnover", "rule_score"]
     windows = 0
     month_cache = MonthFrameCache(month_cache_size)
-    daily_ic_cache = DailyICCache(workers=min(model_threads or 8, 8))
+    daily_ic_cache: DailyICCache | None = None
 
     recipe_sig = None
     legacy_recipe_sig = None
@@ -668,7 +765,15 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         legacy_recipe_sig = _legacy_recipe_signature(**recipe_params)
         cache_dir = Path(window_cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
+        daily_ic_cache = DailyICCache(
+            workers=min(model_threads or 8, 8),
+            path=cache_dir / "daily_ic_cache.parquet",
+            source_signatures=_prepared_source_signatures(prepared_dir),
+        )
         print(f"[train:cache] window cache enabled dir={cache_dir} recipe={recipe_sig[:12]}", flush=True)
+
+    if daily_ic_cache is None:
+        daily_ic_cache = DailyICCache(workers=min(model_threads or 8, 8))
 
     print(
         f"[train] factors={len(factors)} date_range={dates.min().date()}..{dates.max().date()} "
@@ -709,6 +814,16 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                     print(f"[train:cache] window={windows} read failed, recomputing: {exc}", flush=True)
                     cached = None
                 if cached is not None:
+                    cache_valid, cache_reason = _cached_prediction_valid(
+                        cached, current, test_end
+                    )
+                    if not cache_valid:
+                        print(
+                            f"[train:cache] window={windows} invalid reason={cache_reason}; recomputing",
+                            flush=True,
+                        )
+                        cached = None
+                if cached is not None:
                     if read_path != cache_path:
                         cached.to_parquet(cache_path, index=False)
                         print(
@@ -727,6 +842,12 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                     current = test_end
                     continue
             cache_misses += 1
+            if cache_dir is not None:
+                print(
+                    f"[train:cache] window={windows} miss test={current.date()}..{test_end.date()} "
+                    f"reason=signature-or-missing key={window_cache_key[:12]}",
+                    flush=True,
+                )
         need_cols = ["code", "date", target] + sorted(set(factors + side_cols))
         window = _load_window(
             prepared_dir,
@@ -1059,6 +1180,9 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
         print(f"[train:cache] final {month_cache.stats()}", flush=True)
     if cache_dir is not None:
         print(f"[train:cache] window cache hits={cache_hits} misses={cache_misses}", flush=True)
+    if daily_ic_cache is not None and cache_dir is not None:
+        daily_ic_cache.save()
+        print("[train:factor-ic-cache] persisted=true", flush=True)
     pred = pd.concat(pred_parts, ignore_index=True) if pred_parts else pd.DataFrame()
     returns, holdings = backtest.portfolio_from_predictions(
         pred,
@@ -1116,7 +1240,12 @@ def main() -> None:
     ap.add_argument("--selection", default="factor_selection_lh1000_cont")
     ap.add_argument("--output-prefix", default="full_a_batched_rq04_default_ne200")
     ap.add_argument("--horizon", type=int, default=5)
-    ap.add_argument("--batch-size", type=int, default=200)
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=int(os.environ.get("PANEL_BATCH_SIZE", "200") or 200),
+        help="panel stock batch size; larger batches reduce repeated factor setup",
+    )
     ap.add_argument("--min-price-rows", type=int, default=1000)
     ap.add_argument("--limit-codes", type=int, default=0, help="debug only; 0 means all eligible codes")
     ap.add_argument("--universe-file", default="", help="optional six-digit code list restricting panel construction")

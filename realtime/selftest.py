@@ -58,6 +58,13 @@ def main() -> int:
 
     cfg = load()
 
+    # V3-V6 共用报价年龄门；5 分钟内允许继续做盘口有效性检查。
+    if abs(cfg.paper_v3_quote_max_age_sec - 300.0) < 1e-9:
+        _ok("V3-V6 报价年龄默认阈值为 300 秒")
+    else:
+        _fail(f"V3-V6 报价年龄阈值异常: {cfg.paper_v3_quote_max_age_sec}")
+        errors += 1
+
     # 1a) 默认只保留低层 Top/模拟盘 push；通用 Signal 被抑制但不影响后续账本链路。
     notifier_probe = Notifier(cfg)
     pushed: list[tuple[str, str]] = []

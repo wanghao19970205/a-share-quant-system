@@ -34,6 +34,7 @@ from .v2 import V2PaperTrader
 from .v3 import V3PaperTrader
 from .v4 import V4PaperTrader
 from .v5 import V5PaperTrader
+from .v6 import V6PaperTrader
 from .rankboard import RankBoard
 from .sector_etf import SectorETFContext
 from .snapshot import Snapshot
@@ -67,6 +68,7 @@ class Engine:
         self._paper_v3 = None  # 实时模拟盘 V3（执行确认 + ATR 出场）
         self._paper_v4 = None  # 实时模拟盘 V4（V3 + 行业 ETF 弱势回避）
         self._paper_v5 = None  # 实时模拟盘 V5（V4 + 行业相对强度动态仓位）
+        self._paper_v6 = None  # 实时模拟盘 V6（V5 + 当前分钟入场择时）
         self._sector_ctx = SectorETFContext(self._cfg)
         self._sector_recv = 0
         self._feed: feed_mod.BaseFeed | None = None
@@ -353,6 +355,17 @@ class Engine:
                 self._paper_v5 = None
                 print(f"[engine] 模拟盘V5装配失败(降级跳过，V1-V4 不受影响)："
                       f"{type(e).__name__}: {e}", flush=True)
+        if getattr(self._cfg, "paper_v6_enabled", True):
+            try:
+                self._paper_v6 = V6PaperTrader(
+                    self._cfg, self._ctx, self._notifier, self._sector_ctx, name_map)
+                print(f"[engine] 模拟盘V6就绪：{self._paper_v6.summary()}，"
+                      f"当前分钟急变权重={self._paper_v6._scorer._w_minute_speed:.2f} "
+                      f"尺度={self._paper_v6._scorer._minute_move_scale:.2%}", flush=True)
+            except Exception as e:  # noqa: BLE001 - V6 独立降级，不影响 V1-V5
+                self._paper_v6 = None
+                print(f"[engine] 模拟盘V6装配失败(降级跳过，V1-V5 不受影响)："
+                      f"{type(e).__name__}: {e}", flush=True)
         print(f"[engine] 启动实时层：股票 {len(codes)} 只 + 行业ETF/基准 "
               f"{len(sector_codes)} 只，同一会话共 {len(subscription_codes)} 只；"
               f"时段 {self._cfg.session_start}-{self._cfg.session_end}，"
@@ -402,12 +415,24 @@ class Engine:
                         self._paper_v5.maybe_trade(t)
                     except Exception as e:  # noqa: BLE001
                         print(f"[engine] 模拟盘V5交易异常: {type(e).__name__}", flush=True)
+                if self._paper_v6 is not None:
+                    try:
+                        self._paper_v6.maybe_trade(t)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[engine] 模拟盘V6交易异常: {type(e).__name__}", flush=True)
             else:
                 self._stop_feed("非交易时段/规避窗")
 
             now = time.time()
             if now - last_heartbeat >= self._cfg.heartbeat_sec:
                 last_heartbeat = now
+                for trader in (self._paper, self._paper_v2, self._paper_v3,
+                               self._paper_v4, self._paper_v5, self._paper_v6):
+                    if trader is not None:
+                        try:
+                            trader.record_position_snapshot()
+                        except Exception as e:  # noqa: BLE001 - 观测失败不影响引擎
+                            print(f"[engine] 持仓明细记录异常: {type(e).__name__}", flush=True)
                 print(f"[engine] 心跳 {datetime.now():%H:%M:%S} "
                       f"active={self._active} recv={self._recv} sector_recv={self._sector_recv} "
                       f"sector={self._sector_ctx.summary()} signals={self._signals} "

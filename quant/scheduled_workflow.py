@@ -25,6 +25,10 @@ import pyarrow.parquet as pq
 from quant import config
 from quant import datafeed
 from quant import watchlist_grid
+from quant.logging_utils import install_timestamped_stdout
+
+
+install_timestamped_stdout()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_NAME = "ridge_lightgbm_ranker_ensemble"
@@ -181,7 +185,13 @@ def _run(cmd: list[str], env: dict[str, str], dry_run: bool = False) -> None:
     print("[run] " + " ".join(cmd), flush=True)
     if dry_run:
         return
+    started = time.perf_counter()
     subprocess.run(cmd, cwd=PROJECT_ROOT, env=env, check=True)
+    print(
+        f"[workflow:timing] command={cmd[cmd.index('-m') + 1] if '-m' in cmd else cmd[0]} "
+        f"seconds={time.perf_counter() - started:.2f}",
+        flush=True,
+    )
 
 
 def _quant_dir() -> Path:
@@ -566,10 +576,11 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
             merge_started = time.perf_counter()
             merge_active_predictions(
                 short_active, source_predictions, short_active, fresh_frame=fresh)
-            merge_active_predictions(
-                legacy_active, source_predictions, legacy_active, fresh_frame=fresh)
+            # legacy is a compatibility filename for the short active artifact; copying the
+            # already-merged file preserves identical history without a second pandas merge.
+            _atomic_copy(short_active, legacy_active)
             print(
-                f"[publish:timing] stage=short_legacy_merge "
+                f"[publish:timing] stage=short_merge_legacy_copy "
                 f"seconds={time.perf_counter() - merge_started:.2f}",
                 flush=True,
             )
@@ -606,10 +617,12 @@ def publish_short_champion(source_predictions: Path, source_prefix: str,
         swing_active = quant_dir / ACTIVE_STYLE_FILES["swing_7_15"]
         if merge_history:
             swing_started = time.perf_counter()
-            merge_active_predictions(
-                swing_active, source_predictions, swing_active, fresh_frame=fresh)
+            # Swing predictions are derived from the same fresh short source and
+            # keep frozen swing parameters in the manifest. Reuse the already
+            # merged short history instead of performing a second pandas merge.
+            _atomic_copy(short_active, swing_active)
             print(
-                f"[publish:timing] stage=swing_merge "
+                f"[publish:timing] stage=swing_history_copy "
                 f"seconds={time.perf_counter() - swing_started:.2f}",
                 flush=True,
             )
@@ -749,9 +762,28 @@ def run_daily_update(args: argparse.Namespace, env: dict[str, str]) -> None:
     if args.dry_run:
         return
     before = _latest_price_date()
+    daily_started = time.perf_counter()
+    print("[workflow:timing] stage=daily_update_start", flush=True)
     rc = subprocess.run(cmd, cwd=PROJECT_ROOT, env=env).returncode
+    print(
+        f"[workflow:timing] stage=daily_update_done seconds={time.perf_counter() - daily_started:.2f} rc={rc}",
+        flush=True,
+    )
     if rc == 0:
         return
+    if rc in (-signal.SIGSEGV, 128 + int(signal.SIGSEGV)):
+        # Native SDK crashes cannot be caught inside daily_update. A fresh child process
+        # resets the SDK objects and performs a new login before the coverage fallback.
+        retry_env = dict(env)
+        retry_env["AMAZINGDATA_AUTO_LOGIN"] = "1"
+        print(
+            f"[daily_update] tgw SIGSEGV rc={rc}; starting fresh-process relogin retry",
+            flush=True,
+        )
+        retry_rc = subprocess.run(cmd, cwd=PROJECT_ROOT, env=retry_env).returncode
+        if retry_rc == 0:
+            return
+        rc = retry_rc
     # 券商 tgw 原生库常在解释器退出(atexit/析构)时段错误(SIGSEGV, rc=-11 或 128+11=139)，
     # 此时行情/事件数据其实已全部落盘。但段错误也可能发生在拉取中途（大量个股仍停在旧交易日），
     # 因此不能只看全库最新日期，必须叠加「最新交易日覆盖率」判断：达标才算完备、可安全训练；

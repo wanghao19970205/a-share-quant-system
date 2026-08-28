@@ -62,6 +62,7 @@ _login_failed = False
 _last_error = ""
 _base = None
 _market = None
+_calendar_raw = None
 
 
 def sdk_call(fn, *args, timeout: float | None = None, **kwargs):
@@ -95,7 +96,7 @@ def sdk_call(fn, *args, timeout: float | None = None, **kwargs):
 def set_credentials(username: str = "", password: str = "",
                     host: str = "", port: int = 0) -> None:
     """设置券商账号（供 UI/环境变量配置）。变更会强制下次重新登录。"""
-    global _logged_in, _login_failed, _last_error, _base, _market
+    global _logged_in, _login_failed, _last_error, _base, _market, _calendar_raw
     _CREDS.update({
         "username": (username or os.environ.get("AMAZINGDATA_USER", "")).strip(),
         "password": (password or os.environ.get("AMAZINGDATA_PASSWORD", "")).strip(),
@@ -105,7 +106,8 @@ def set_credentials(username: str = "", password: str = "",
     _logged_in = False
     _login_failed = False
     _last_error = ""
-    _base = _market = None
+    _base = _market = _calendar_raw = None
+
 
 
 def _load_env_if_empty():
@@ -127,7 +129,7 @@ def available() -> bool:
 
 
 def _ensure_login() -> bool:
-    global _logged_in, _login_failed, _last_error, _base, _market
+    global _logged_in, _login_failed, _last_error, _base, _market, _calendar_raw
     if _logged_in:
         return True
     if _login_failed:            # 上次已失败，账号变更前不重复尝试
@@ -142,7 +144,10 @@ def _ensure_login() -> bool:
             _ad.login(username=_CREDS["username"], password=_CREDS["password"],
                       host=_CREDS["host"], port=_CREDS["port"])
             _base = _ad.BaseData()
-            _market = _ad.MarketData(_base.get_calendar())
+            _calendar_raw = sdk_call(
+                _base.get_calendar,
+                timeout=float(os.environ.get("AMAZINGDATA_CALENDAR_TIMEOUT", "30") or 30))
+            _market = _ad.MarketData(_calendar_raw)
             _logged_in = True
             _last_error = ""
             return True
@@ -150,6 +155,43 @@ def _ensure_login() -> bool:
             _last_error = f"{type(e).__name__}: {e}"
             _login_failed = True
             return False
+
+
+def _normalize_calendar(raw) -> pd.DataFrame:
+    """规范化 SDK 日历为唯一、升序的 date 列，拒绝空或异常日期。"""
+    if isinstance(raw, pd.DataFrame):
+        if raw.empty:
+            return pd.DataFrame(columns=["date"])
+        values = raw.iloc[:, 0]
+    else:
+        values = pd.Series(list(raw) if raw is not None else [])
+    text = values.astype(str).str.strip()
+    ymd = text.str.fullmatch(r"\d{8}")
+    dates = pd.Series(pd.NaT, index=text.index, dtype="datetime64[ns]")
+    if ymd.any():
+        dates.loc[ymd] = pd.to_datetime(
+            text.loc[ymd], format="%Y%m%d", errors="coerce")
+    if (~ymd).any():
+        dates.loc[~ymd] = pd.to_datetime(
+            text.loc[~ymd], errors="coerce", format="mixed")
+    dates = dates.dropna().dt.normalize().drop_duplicates().sort_values()
+    if dates.empty:
+        return pd.DataFrame(columns=["date"])
+    return pd.DataFrame({"date": dates.reset_index(drop=True)})
+
+
+def trading_calendar() -> pd.DataFrame:
+    """获取当前进程已登录 SDK 的真实交易日历；失败由调用方决定是否降级。"""
+    if not _ensure_login():
+        raise RuntimeError(_last_error or "AmazingData 登录失败")
+    raw = _calendar_raw
+    if raw is None:
+        raw = sdk_call(_base.get_calendar, timeout=float(
+            os.environ.get("AMAZINGDATA_CALENDAR_TIMEOUT", "30") or 30))
+    calendar = _normalize_calendar(raw)
+    if calendar.empty:
+        raise RuntimeError("AmazingData 返回空交易日历")
+    return calendar
 
 
 def status() -> str:
@@ -232,17 +274,24 @@ def _normalize_kline(df: pd.DataFrame | None) -> pd.DataFrame | None:
     if df is None or len(df) == 0:
         return None
     out = df.reset_index() if df.index.name else df.copy()
-    out = out.rename(columns={
+    rename_map = {
         c: _KL_COLMAP.get(str(c).lower(), _KL_COLMAP.get(str(c), c))
         for c in out.columns
-    })
+    }
+    if any(k != v for k, v in rename_map.items()):
+        out = out.rename(columns=rename_map)
     need = {"open", "high", "low", "close"}
     if not need.issubset(set(out.columns)):
         raise ValueError(f"K线列不匹配，实际列：{list(out.columns)}（请用 raw_kline 联调）")
     if "date" not in out.columns:
         out["date"] = pd.RangeIndex(len(out))
-    out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    return out.sort_values("date").reset_index(drop=True)
+    if not pd.api.types.is_datetime64_any_dtype(out["date"]):
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    # AmazingData normally returns chronological rows. Avoid a full sort on the
+    # common path, while retaining correctness for an out-of-order response.
+    if not out["date"].is_monotonic_increasing:
+        out = out.sort_values("date")
+    return out.reset_index(drop=True)
 
 
 def fetch_daily_batch(symbols: list[str], start_date: str, end_date: str,
@@ -311,10 +360,12 @@ def _apply_adjust(frame: pd.DataFrame | None, factor: "pd.Series | None",
     if factor is None or factor.empty:
         return frame
     out = frame.copy()
-    dates = pd.to_datetime(out["date"])
-    # 因子按交易日 ffill 对齐到 K 线日期（停牌日无因子则沿用前值）
-    aligned = factor.reindex(factor.index.union(dates.values)).ffill().reindex(dates.values)
-    aligned = aligned.to_numpy()
+    dates = frame["date"]
+    if not pd.api.types.is_datetime64_any_dtype(dates):
+        dates = pd.to_datetime(dates, errors="coerce")
+    # 因子按交易日 ffill 对齐到 K 线日期（停牌日无因子则沿用前值）。
+    # reindex(method=...) 避免为每只股票构造 union 日期索引和二次切片。
+    aligned = factor.reindex(pd.DatetimeIndex(dates), method="ffill").to_numpy()
     if pd.isna(aligned).all():
         return frame
     if adjust == "qfq":

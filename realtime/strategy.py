@@ -54,6 +54,9 @@ class _CodeState:
     prev_ts: Optional[float] = None             # 上一条快照的接收时刻（算涨速）
     prev_last: Optional[float] = None           # 上一条快照的最新价（算涨速）
     vol_rate_ref: Optional[float] = None        # 成交速率基线（首个正的额增量）
+    minute_key: Optional[int] = None           # 当前本地分钟桶（仅用于盘中择时）
+    minute_anchor_last: Optional[float] = None # 当前分钟起始价
+    minute_anchor_amount: Optional[float] = None  # 当前分钟起始累计成交额
 
     @property
     def vwap(self) -> Optional[float]:
@@ -125,6 +128,26 @@ class StrategyContext:
             return None
         return max(0.0, (time.time() if now is None else now) - st.cur_ts)
 
+    def minute_return_of(self, code: str) -> Optional[float]:
+        """当前分钟相对分钟起点的收益；只读内存态，不读取历史数据。"""
+        st = self._state(code)
+        if st is None or st.minute_anchor_last is None or st.last_snap is None:
+            return None
+        last = st.last_snap.last
+        if last is None or st.minute_anchor_last <= 0:
+            return None
+        return last / st.minute_anchor_last - 1.0
+
+    def minute_amount_delta_of(self, code: str) -> Optional[float]:
+        """当前分钟累计成交额增量；数据缺失或倒退时返回 None。"""
+        st = self._state(code)
+        if st is None or st.minute_anchor_amount is None or st.last_snap is None:
+            return None
+        amount = st.last_snap.amount
+        if amount is None or amount < st.minute_anchor_amount:
+            return None
+        return amount - st.minute_anchor_amount
+
     def state_of(self, code: str) -> _CodeState:
         return self._by_code.setdefault(code or "?", _CodeState())
 
@@ -157,6 +180,13 @@ class StrategyContext:
                 st.open_price = snap.open if snap.open is not None else snap.last
         if snap.is_limit_up:
             st.ever_limit_up = True
+        # 保留当前本地分钟的起点，供 V6 盘中入场择时使用；跨分钟只更新锚点，
+        # 不保留完整 tick 历史，避免实时进程内存随交易日增长。
+        minute_key = int(now // 60)
+        if (st.minute_key != minute_key or st.minute_anchor_last is None):
+            st.minute_key = minute_key
+            st.minute_anchor_last = snap.last
+            st.minute_anchor_amount = snap.amount
         st.cur_ts = now
         st.last_snap = snap
         return st

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import datetime as _dt
 import math
 from pathlib import Path
 from typing import Optional
@@ -329,11 +330,12 @@ def _trading_days_between(start, end) -> int:
                         if c in cal.columns), None)
             if col is not None:
                 days = pd.to_datetime(cal[col], errors="coerce").dt.date.dropna()
-                n = int(((days > start) & (days <= end)).sum())
-                return n
+                if len(days) and end <= max(days):
+                    return int(((days > start) & (days <= end)).sum())
+                # 日历文件可能只更新到最近一个交易日；对超出覆盖范围的尾部，
+                # 退回工作日近似，避免日历过期把所有持仓误判为 T+0。
     except Exception:  # noqa: BLE001 - 无日历则退回工作日近似
         pass
-    import datetime as _dt
     n, cur = 0, start
     while cur < end:
         cur = cur + _dt.timedelta(days=1)

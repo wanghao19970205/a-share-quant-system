@@ -22,7 +22,8 @@ T+N 到期腿在 14:50 后执行，全部按【触发时的实时价】成交，
 
 落盘四份（均在 logs/realtime，容器已挂载）：
   - paper_state.json：账户当前态（现金 + 持仓列表[含持仓期最高价 peak] + 最近买入日）。
-  - paper_trades.jsonl：每笔平仓一行不可变成交流水。
+  - paper_position_snapshots.jsonl：按心跳记录逐票成本、估值价、行情年龄和浮动盈亏。
+  - paper_trades.jsonl：每笔平仓一行不可变成交流水，包含成本、卖出净额和盈亏。
   - paper_buy_decisions.jsonl：每日模型池、重排、过滤和成交决策快照。
   - paper_sell_counterfactuals.jsonl：卖出日及后续 3 日的收益/机会损益标记。
 """
@@ -118,6 +119,8 @@ class PaperTrader:
         self._trades_file = self._suffixed(base_state.with_name("paper_trades.jsonl"))
         self._decisions_file = self._suffixed(
             base_state.with_name("paper_buy_decisions.jsonl"))
+        self._position_snapshots_file = self._suffixed(
+            base_state.with_name("paper_position_snapshots.jsonl"))
         self._counterfactuals_file = self._suffixed(
             base_state.with_name("paper_sell_counterfactuals.jsonl"))
         self._acted_today = False  # 当日买入腿是否已跑过（进程内哨兵，防同日重复建仓）
@@ -285,6 +288,60 @@ class PaperTrader:
         except (TypeError, ValueError):
             return None
         return price if math.isfinite(price) and price > 0 else None
+
+    def _mark_detail(self, code: str) -> tuple[Optional[float], Optional[float], str]:
+        """返回估值价、行情年龄和估值来源；子类可改为可成交的 bid1。"""
+        return self._price_of(code), self._ctx.quote_age_of(code), "last"
+
+    def position_details(self) -> list[dict]:
+        """生成当前持仓逐票估值明细，缺行情时保留空估值，不虚构盈亏。"""
+        details = []
+        for pos in self._state.get("positions", []):
+            shares = float(pos.get("shares") or 0.0)
+            cost_basis = float(pos.get("cost_basis") or 0.0)
+            mark, age, source = self._mark_detail(pos["code"])
+            market_value = mark * shares if mark is not None else None
+            pnl = (market_value * (1 - self._cost / 2.0) - cost_basis
+                   if market_value is not None else None)
+            details.append({
+                "code": pos["code"], "name": pos.get("name") or self._name_map.get(
+                    _digits(pos["code"]), ""),
+                "buy_date": pos.get("buy_date"), "buy_price": pos.get("buy_price"),
+                "shares": int(shares), "cost_basis": round(cost_basis, 2),
+                "mark_price": round(mark, 3) if mark is not None else None,
+                "mark_source": source, "quote_age_sec": round(age, 1) if age is not None else None,
+                "market_value": round(market_value, 2) if market_value is not None else None,
+                "unrealized_pnl": round(pnl, 2) if pnl is not None else None,
+                "unrealized_return": round(pnl / cost_basis, 6)
+                if pnl is not None and cost_basis else None,
+            })
+        return details
+
+    def record_position_snapshot(self) -> None:
+        """按心跳追加逐票估值，供盘中查看和复盘，不影响交易流程。"""
+        try:
+            self._position_snapshots_file.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "schema_version": 1, "event_type": "paper_position_snapshot",
+                "account": self._FILE_SUFFIX or "v1",
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "summary": self.summary(), "positions": self.position_details(),
+            }
+            with open(self._position_snapshots_file, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:  # noqa: BLE001 - 观测失败不影响交易
+            print(f"[paper] 写持仓明细失败：{type(e).__name__}", flush=True)
+
+    def _exit_label(self, reason: str) -> str:
+        return _EXIT_LABEL.get(reason, reason)
+
+    def _sell_notice(self, pos: dict, px: float, held: int, pnl: float,
+                     ret: float, reason: str, proceeds: float) -> str:
+        cost_basis = float(pos.get("cost_basis") or pos["buy_price"] * pos["shares"])
+        return (f"买入成本¥{cost_basis:,.2f}（{pos['buy_price']:.3f}×{int(pos['shares'])}股）"
+                f"\\n卖出价¥{px:.3f} 卖出净额¥{proceeds:,.2f}"
+                f"\\n持有T+{held} 盈亏¥{pnl:,.2f}（{ret:+.2%}）"
+                f"\\n原因：{self._exit_label(reason)}\\n{self.summary()}")
 
     def _atr_of(self, code: str) -> Optional[float]:
         """该票 ATR 绝对值（元）：优先 ref.atr，缺则 atr_pct*pre_close 兜底，都无则 None。
@@ -454,7 +511,7 @@ class PaperTrader:
             sold = True
             self._notifier.push(
                 f"[模拟盘] 卖出 {self._label(pos['code'])} @{px:.2f} {_EXIT_LABEL.get(reason, reason)}",
-                f"持有T+{held} 收益{ret:+.2%} 盈亏¥{pnl:,.0f}\n{self.summary()}")
+                self._sell_notice(pos, px, held, pnl, ret, reason, proceeds))
         if changed:
             self._save_state()
         if sold:
