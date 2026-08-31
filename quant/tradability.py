@@ -4,14 +4,17 @@
 与「回测选参」共用同一份实现、杜绝口径分裂，抽到本模块。``watchlist_grid`` 与
 ``full_train_batched`` 均从这里取。
 
-口径（主板 ±10%，一字板是其子集；ST ±5% 为已知盲区，不在此处理）：
-- 默认模式沿用历史主板 ±10% 封板启发式，并额外要求当日有成交量；缺少 high/low 或
-  volume 列时不得默认可交易（fail-closed）。
-- ``limit_up_seal``  = (close==high) & (ret1>=0.095)：涨停封板 → **当天尾盘买不进**（挡买入）。
-- ``limit_down_seal``= (close==low)  & (ret1<=-0.095)：跌停封板 → **当天卖不出**（挡卖出）。
+口径（按板块合法涨跌停档位判定；主板同时考虑 10% 与 ST 的 5%）：
+- 默认模式要求当日有成交量；缺少 high/low 或 volume 列时不得默认可交易（fail-closed）。
+- ``limit_up_seal``  ：收盘触及涨停价，或一字板上涨 → **当天尾盘买不进**（挡买入）。
+- ``limit_down_seal``：收盘触及跌停价，或一字板下跌 → **当天卖不出**（挡卖出）。
+- 前收盘缺失或非正时两者均 fail-closed，避免坏价格数据被当成可成交样本。
 - ``tradable_ret_{h}d``：尾盘 T 买入、T+h 收盘卖出；若卖出日封跌停则顺延到下一可卖日收盘，
   上限 cap 个交易日（含预定日），窗口内均封则末日强制平仓。
 - ``buyable_close``：当日是否可买入（尾盘收盘口径）——涨停封板、零成交量或成交量缺失时不可买。
+
+已知局限：价格文件不含 ST 状态，主板保留 5% 档会把"非 ST 股恰好以当日最高价收在 +5%"
+误判为封板。评测口径上宁可保守（少算可成交），彻底解决需要引入 ST 状态数据。
 """
 from __future__ import annotations
 
@@ -52,6 +55,54 @@ def rolled_sell_close(close: np.ndarray, sell_blocked: np.ndarray, horizon: int,
 
 def _quant_dir() -> Path:
     return Path(config.QUANT_DIR)
+
+
+def limit_tiers(code: str) -> tuple[float, ...]:
+    """该股票可能适用的涨跌幅档位。
+
+    代码里拿不到 ST 状态，因此主板同时保留 10% 与 5% 两档（ST 为 5%），
+    宁可把可能封板的样本判为不可交易，也不要把买不进的封板票算成可成交。
+    """
+    c = str(code).zfill(6)
+    if c.startswith(("300", "301", "688")):
+        return (0.20,)
+    if c.startswith(("4", "8")):
+        return (0.30,)
+    return (0.10, 0.05)
+
+
+def seal_masks(px: pd.DataFrame, code: str) -> tuple[np.ndarray, np.ndarray]:
+    """收盘封板判定，返回 (涨停封板, 跌停封板)。
+
+    两条判据：
+    - 收盘位于当日最高/最低价，且当日涨跌幅命中该板块的合法涨跌停档位；
+    - 一字板（``high == low``）当日有方向性涨跌时，全天单一价格，无论幅度都开不了仓/平不了仓。
+    前收盘缺失或非正时 fail-closed，视为封板，避免坏价格数据被当成可成交样本。
+    """
+    n = len(px)
+    close = px["close"].to_numpy(dtype=float)
+    high = px["high"].to_numpy(dtype=float)
+    low = px["low"].to_numpy(dtype=float)
+    prev = px["close"].shift(1).to_numpy(dtype=float)
+    with np.errstate(all="ignore"):
+        ret1 = np.where(prev > 0, close / prev - 1.0, np.nan)
+    # 涨跌停价按分四舍五入，低价股的档位误差更大，留 0.4% 匹配容差。
+    tol = 0.004
+    at_tier_up = np.zeros(n, dtype=bool)
+    at_tier_down = np.zeros(n, dtype=bool)
+    for tier in limit_tiers(code):
+        with np.errstate(all="ignore"):
+            at_tier_up |= np.abs(ret1 - tier) <= tol
+            at_tier_down |= np.abs(ret1 + tier) <= tol
+    at_high = close >= high - 1e-9
+    at_low = close <= low + 1e-9
+    one_word = high <= low + 1e-9
+    up_move = np.where(np.isfinite(ret1), ret1 > 0, False)
+    down_move = np.where(np.isfinite(ret1), ret1 < 0, False)
+    bad_prev = ~np.isfinite(ret1)
+    limit_up_seal = (at_high & at_tier_up) | (one_word & up_move) | bad_prev
+    limit_down_seal = (at_low & at_tier_down) | (one_word & down_move) | bad_prev
+    return limit_up_seal, limit_down_seal
 
 
 def price_tradability(codes: list[str], horizons: list[int],
@@ -106,16 +157,10 @@ def price_tradability(codes: list[str], horizons: list[int],
             else np.zeros(len(px), dtype=bool)
         )
         close_arr = px["close"].to_numpy(dtype=float)
-        # 收盘封板判定（±10% 主板口径；一字板是其子集）。ST(±5%) 为已知盲区。
+        # 收盘封板判定：按板块合法涨跌停档位匹配，并把一字板无条件视为封板。
         limit_down_seal = None
         if has_hl:
-            high_arr = px["high"].to_numpy(dtype=float)
-            low_arr = px["low"].to_numpy(dtype=float)
-            prev_close = px["close"].shift(1).to_numpy(dtype=float)
-            with np.errstate(all="ignore"):
-                ret1 = close_arr / prev_close - 1
-            limit_up_seal = (close_arr == high_arr) & (ret1 >= 0.095)
-            limit_down_seal = (close_arr == low_arr) & (ret1 <= -0.095)
+            limit_up_seal, limit_down_seal = seal_masks(px, code)
         out["positive_volume"] = positive_volume
         cap = sell_roll_max_days()
         for horizon in horizons:
