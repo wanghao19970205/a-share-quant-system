@@ -104,46 +104,77 @@ def rebalance_grid(df: pd.DataFrame, signal: str, h: int) -> set:
     return set(dates[::h])
 
 
-def simulate(df: pd.DataFrame, signal: str, h: int, target_n: int,
-             entry_q: float, exit_q: float, cost: float,
-             ascending: bool = True,
-             entry_lo: float = 0.0, exit_lo: float = 0.0) -> pd.DataFrame:
-    """按 h 个交易日调仓、带进出缓冲带的等权组合。
+def prepare(df: pd.DataFrame, signal: str, h: int,
+            ascending: bool = True) -> list[tuple]:
+    """预计算各调仓日的截面，输出按日期升序的 ``(date, ids, q, buyable, ret)`` 列表。
 
-    ``ascending=True`` 表示信号值越小越优（如低波动）。分位区间为半开的 ``(lo, q]``，
-    这样相邻分桶不会在边界上重复收票；持仓落到 ``(exit_lo, exit_q]`` 之外才卖出，
-    新进标的必须落在 ``(entry_lo, entry_q]`` 内且当日 ``buyable_close``；
-    已持仓不要求可买。``lo`` 默认 0，因分位数恒大于 0，等价于传统的取头部。
+    两处提速都在这里：同一 ``(signal, h, ascending)`` 下所有参数组合共用这份结果
+    （分位排名要扫全表）；``ids`` 是全表统一的整数编号且逐日升序，回测循环即可用
+    ``searchsorted`` 做集合运算，不必反复对字符串代码做哈希对齐。
     """
     ret_col = f"tradable_ret_{h}d"
     if ret_col not in df.columns:
         raise KeyError(f"缺少收益列 {ret_col}；构建特征时需包含 horizon={h}")
-    pool = df.dropna(subset=[signal]).copy()
-    pool["q"] = pool.groupby("date")[signal].rank(pct=True, ascending=ascending)
     rb = rebalance_grid(df, signal, h)
-    by_date = {d: g.set_index("code") for d, g in pool[pool["date"].isin(rb)].groupby("date")}
-    held: list[str] = []
+    pool = df.dropna(subset=[signal])
+    pool = pool[pool["date"].isin(rb)][["code", "date", signal, "buyable_close", ret_col]]
+    pool = pool.copy()
+    # 分位是逐日截面内的排名，先筛调仓日再排名不改变取值，但省掉非调仓日的排序开销。
+    pool["q"] = pool.groupby("date")[signal].rank(pct=True, ascending=ascending)
+    pool["cid"] = pd.factorize(pool["code"])[0]
+    out = []
+    for d, g in pool.groupby("date", sort=True):
+        g = g.sort_values("cid")
+        out.append((d, g["cid"].to_numpy(np.int64), g["q"].to_numpy(float),
+                    g["buyable_close"].to_numpy(bool), g[ret_col].to_numpy(float)))
+    return out
+
+
+def simulate(sections: list[tuple], target_n: int, entry_q: float, exit_q: float,
+             cost: float, entry_lo: float = 0.0, exit_lo: float = 0.0) -> pd.DataFrame:
+    """在 ``prepare`` 产出的截面上跑带进出缓冲带的等权组合。
+
+    分位区间为半开的 ``(lo, q]``，这样相邻分桶不会在边界上重复收票；持仓落到
+    ``(exit_lo, exit_q]`` 之外才卖出，新进标的必须落在 ``(entry_lo, entry_q]`` 内
+    且当日 ``buyable_close``；已持仓不要求可买。``lo`` 默认 0，因分位数恒大于 0，
+    等价于传统的取头部。信号方向由 ``prepare(ascending=...)`` 决定。
+    """
+    held = np.empty(0, dtype=np.int64)
     rows = []
-    for d in sorted(by_date):
-        info = by_date[d]
-        prev = list(held)
-        stay = [c for c in prev
-                if c in info.index and exit_lo < info.at[c, "q"] <= exit_q]
-        need = target_n - len(stay)
+    for d, ids, q, buyable, ret in sections:
+        prev = held
+        # ids 已升序，用 searchsorted 定位持仓；当日退市/停牌的持仓自然落不到位。
+        pos = np.searchsorted(ids, prev)
+        ok = pos < ids.size
+        pos = np.where(ok, pos, 0)
+        ok &= ids[pos] == prev
+        pq = np.where(ok, q[pos], np.nan)
+        stay = prev[ok & (pq > exit_lo) & (pq <= exit_q)]
+        need = target_n - stay.size
         if need > 0:
-            cand = info[(info["q"] > entry_lo) & (info["q"] <= entry_q)
-                        & info["buyable_close"] & (~info.index.isin(stay))]
-            stay += cand.sort_values("q").index[:need].tolist()
-        cur = [c for c in stay if c in info.index and pd.notna(info.at[c, ret_col])]
-        if not cur:
+            cand = (q > entry_lo) & (q <= entry_q) & buyable
+            if stay.size:
+                cand &= ~np.isin(ids, stay, assume_unique=True)
+            ci = np.flatnonzero(cand)
+            if ci.size:
+                take = ci[np.argsort(q[ci], kind="stable")[:need]]
+                stay = np.concatenate([stay, ids[np.sort(take)]])
+        spos = np.searchsorted(ids, stay)
+        rv = ret[spos]
+        good = np.isfinite(rv)
+        if not good.any():
             continue
-        w = 1.0 / len(cur)
-        gross = float(sum(float(info.at[c, ret_col]) for c in cur) * w)
-        sp, sc = set(prev), set(cur)
-        turnover = 1.0 if not sp else len(sp ^ sc) / max(len(sp | sc), 1)
+        cur = stay[good]
+        gross = float(rv[good].mean())
+        if prev.size:
+            inter = np.intersect1d(prev, cur, assume_unique=True).size
+            turnover = (prev.size + cur.size - 2 * inter) / max(
+                prev.size + cur.size - inter, 1)
+        else:
+            turnover = 1.0
         rows.append({"date": d, "gross_ret": gross, "ret": gross - turnover * cost,
-                     "turnover": turnover, "n": len(cur)})
-        held = cur
+                     "turnover": turnover, "n": int(cur.size)})
+        held = np.sort(cur)
     return pd.DataFrame(rows)
 
 
@@ -276,6 +307,7 @@ def main() -> None:
     for h in horizons:
         bench = benchmark(df, h, signal)
         ppy = max(1, int(round(252 / h)))
+        sections = prepare(df, signal, h, ascending)
         bs = backtest.evaluate_returns(bench, periods_per_year=ppy)
         rows.append({"strategy": "BENCH equal-weight", "h": h,
                      "periods": int(bs.get("periods", 0)),
@@ -287,8 +319,7 @@ def main() -> None:
                      "win": round(float(bs.get("win_rate", np.nan)), 4),
                      "turnover": 0.0, "holdings": np.nan})
         for label, n, e_lo, e_hi, x_lo, x_hi in _specs(args, df["code"].nunique(), target_ns):
-            r = simulate(df, signal, h, n, e_hi, x_hi, cost, ascending,
-                         entry_lo=e_lo, exit_lo=x_lo)
+            r = simulate(sections, n, e_hi, x_hi, cost, entry_lo=e_lo, exit_lo=x_lo)
             if r.empty:
                 continue
             row = report(label, r, bench, h)
