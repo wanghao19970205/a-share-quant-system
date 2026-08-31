@@ -151,20 +151,38 @@ def benchmark(df: pd.DataFrame, h: int, signal: str) -> pd.Series:
     return pool[pool["date"].isin(rb)].groupby("date")[ret_col].mean()
 
 
+def excess_series(r: pd.DataFrame, bench: pd.Series) -> pd.Series:
+    """逐调仓日的净超额。只保留策略与基准都有值的日期，避免半边缺失污染均值。"""
+    aligned = r.set_index("date")["ret"].reindex(bench.index).dropna()
+    return aligned - bench.reindex(aligned.index)
+
+
+def _excess_stats(ex: pd.Series, ppy: int) -> tuple[float, float, float]:
+    """返回（年化超额, 信息比, t 值）。t 用超额均值的标准误，不做自相关修正。"""
+    if len(ex) < 2:
+        return np.nan, np.nan, np.nan
+    sd = float(ex.std(ddof=1))
+    ann = float((1 + ex.mean()) ** ppy - 1)
+    if not sd > 0:
+        return ann, np.nan, np.nan
+    ir = float(ex.mean() / sd * np.sqrt(ppy))
+    t = float(ex.mean() / sd * np.sqrt(len(ex)))
+    return ann, ir, t
+
+
 def report(label: str, r: pd.DataFrame, bench: pd.Series, h: int) -> dict:
     ppy = max(1, int(round(252 / h)))
     net = backtest.evaluate_returns(r["ret"], periods_per_year=ppy)
     gross = backtest.evaluate_returns(r["gross_ret"], periods_per_year=ppy)
-    aligned = r.set_index("date")["ret"].reindex(bench.index).dropna()
-    ex = aligned - bench.reindex(aligned.index)
-    ex_ann = float((1 + ex.mean()) ** ppy - 1) if len(ex) else np.nan
-    ir = float(ex.mean() / ex.std(ddof=1) * np.sqrt(ppy)) if ex.std(ddof=1) > 0 else np.nan
+    ex = excess_series(r, bench)
+    ex_ann, ir, t = _excess_stats(ex, ppy)
     row = {
         "strategy": label, "h": h, "periods": int(net.get("periods", 0)),
         "net_annual": round(float(net.get("annual_return", np.nan)), 4),
         "gross_annual": round(float(gross.get("annual_return", np.nan)), 4),
         "excess_annual": round(ex_ann, 4) if np.isfinite(ex_ann) else np.nan,
         "info_ratio": round(ir, 3) if np.isfinite(ir) else np.nan,
+        "t": round(t, 2) if np.isfinite(t) else np.nan,
         "sharpe": round(float(net.get("sharpe", np.nan)), 3),
         "max_dd": round(float(net.get("max_drawdown", np.nan)), 4),
         "win": round(float(net.get("win_rate", np.nan)), 4),
@@ -172,6 +190,21 @@ def report(label: str, r: pd.DataFrame, bench: pd.Series, h: int) -> dict:
         "holdings": round(float(r["n"].mean()), 1),
     }
     return row
+
+
+def yearly_excess(ex: pd.Series, ppy: int) -> pd.DataFrame:
+    """分年度超额。单年样本 < 10 个调仓日时 t 值无意义，仍照实列出供人工判读。"""
+    if not len(ex):
+        return pd.DataFrame()
+    rows = []
+    for year, seg in ex.groupby(pd.DatetimeIndex(ex.index).year):
+        ann, ir, t = _excess_stats(seg, ppy)
+        rows.append({"year": int(year), "periods": int(len(seg)),
+                     "excess_annual": round(ann, 4) if np.isfinite(ann) else np.nan,
+                     "info_ratio": round(ir, 3) if np.isfinite(ir) else np.nan,
+                     "t": round(t, 2) if np.isfinite(t) else np.nan,
+                     "win": round(float((seg > 0).mean()), 4)})
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
@@ -185,6 +218,9 @@ def main() -> None:
     ap.add_argument("--cost", type=float, default=None)
     ap.add_argument("--universe", default=None)
     ap.add_argument("--refresh", action="store_true", help="强制重建特征缓存")
+    ap.add_argument("--reverse", action="store_true",
+                    help="反转信号方向（低波动 → 高波动），用于检验超额是否来自真实截面价差")
+    ap.add_argument("--yearly", action="store_true", help="额外输出分年度超额，检验稳定性")
     args = ap.parse_args()
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
@@ -195,13 +231,17 @@ def main() -> None:
     sig_map = {"low_vol": ("vol_10", True), "low_vol20": ("vol_20", True),
                "low_turnover": ("dollar_vol_20", True)}
     signal, ascending = sig_map[args.signal]
+    if args.reverse:
+        ascending = not ascending
 
     codes = _universe(args.universe)
     df = build_frame(codes, horizons, refresh=args.refresh)
     print(f"[lowfreq] rows={len(df)} codes={df['code'].nunique()} "
-          f"dates={df['date'].nunique()} signal={signal} cost={cost}", flush=True)
+          f"dates={df['date'].nunique()} signal={signal} ascending={ascending} "
+          f"cost={cost}", flush=True)
 
     rows = []
+    yearly: list[tuple[str, pd.DataFrame]] = []
     for h in horizons:
         bench = benchmark(df, h, signal)
         ppy = max(1, int(round(252 / h)))
@@ -210,7 +250,7 @@ def main() -> None:
                      "periods": int(bs.get("periods", 0)),
                      "net_annual": round(float(bs.get("annual_return", np.nan)), 4),
                      "gross_annual": round(float(bs.get("annual_return", np.nan)), 4),
-                     "excess_annual": 0.0, "info_ratio": 0.0,
+                     "excess_annual": 0.0, "info_ratio": 0.0, "t": 0.0,
                      "sharpe": round(float(bs.get("sharpe", np.nan)), 3),
                      "max_dd": round(float(bs.get("max_drawdown", np.nan)), 4),
                      "win": round(float(bs.get("win_rate", np.nan)), 4),
@@ -230,16 +270,24 @@ def main() -> None:
                     continue
                 row = report(f"{label} n={n}", r, bench, h)
                 rows.append(row)
+                if args.yearly:
+                    yb = yearly_excess(excess_series(r, bench), ppy)
+                    if not yb.empty:
+                        yearly.append((f"{row['strategy']} h={h}", yb))
                 print(f"  {row['strategy']:26s} h={h:2d} periods={row['periods']:4d} "
                       f"net={row['net_annual']:+.4f} gross={row['gross_annual']:+.4f} "
                       f"excess={row['excess_annual']:+.4f} IR={row['info_ratio']:+.3f} "
+                      f"t={row['t']:+.2f} "
                       f"maxDD={row['max_dd']:+.4f} turnover={row['turnover']:.4f}", flush=True)
 
     out = pd.DataFrame(rows)
     print("\n== 汇总（excess = 对同调仓日等权基准的年化超额，IR = 超额信息比）==", flush=True)
     print(out.to_string(index=False), flush=True)
-    print("\n判读：只有 excess_annual > 0 且 IR 显著才算跑赢基准；"
-          "periods 太少时 sharpe/IR 无统计意义。", flush=True)
+    for label, yb in yearly:
+        print(f"\n-- 分年度超额 {label} --", flush=True)
+        print(yb.to_string(index=False), flush=True)
+    print("\n判读：只有 excess_annual > 0 且 |t| > 2 才算跑赢基准；"
+          "periods 太少时 sharpe/IR/t 无统计意义。", flush=True)
 
 
 if __name__ == "__main__":
