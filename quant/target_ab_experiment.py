@@ -134,7 +134,10 @@ def _evaluate_leg(prefix: str, cost: float, top_n: int) -> dict:
         r["date"] = pd.to_datetime(r["date"], errors="coerce")
         r = r.dropna(subset=["date"])
         if not r.empty:
-            m = r.set_index("date")["ret"].resample("M").apply(lambda s: (1 + s).prod() - 1 if len(s) else float("nan"))
+            # 按月分组用 Period 别名，避免 pandas 2.2 起 resample("M") 被废弃报错。
+            m = r.set_index("date")["ret"].groupby(
+                lambda ts: ts.to_period("M")
+            ).apply(lambda s: (1 + s).prod() - 1 if len(s) else float("nan"))
             m = m.dropna()
             if len(m):
                 monthly_win = float((m > 0).mean())
