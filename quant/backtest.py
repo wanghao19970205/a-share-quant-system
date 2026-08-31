@@ -114,6 +114,13 @@ def portfolio_from_predictions(pred: pd.DataFrame, horizon: int = 5, top_n: int 
     buy_col = "buyable_next" if use_open_fill else "buyable_close"
     if buy_col not in pred.columns and "buyable_next" in pred.columns:
         buy_col = "buyable_next"
+    if filter_untradable and not use_open_fill:
+        # 列缺失时上面的口径选择会静默退回乐观标签、且过滤条件整段失效（见下方 buy_col in pool.columns）。
+        # 这曾让 baseline 腿的训练内摘要与统一评测差出一个量级，必须让它可见而不是静默降级。
+        missing = [c for c in (tradable_col, buy_col) if c not in pred.columns]
+        if missing:
+            print(f"[backtest] WARN filter_untradable=1 但缺列 {missing}；"
+                  f"实际口径退回 ret_col={ret_col} 且不做可买过滤，结果偏乐观", flush=True)
     holdings = []
     returns = []
     last_codes: set[str] = set()
