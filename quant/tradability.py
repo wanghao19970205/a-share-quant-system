@@ -70,9 +70,10 @@ def limit_tiers(code: str) -> tuple[float, ...]:
     宁可把可能封板的样本判为不可交易，也不要把买不进的封板票算成可成交。
     """
     c = str(code).zfill(6)
-    if c.startswith(("300", "301", "688")):
+    if c.startswith(("300", "301", "688", "689")):
         return (0.20,)
-    if c.startswith(("4", "8")):
+    # 北交所：430xxx / 83xxxx / 87xxxx / 88xxxx / 920xxx 均为 ±30%
+    if c.startswith(("430", "83", "87", "88", "920")):
         return (0.30,)
     return (0.10, 0.05)
 
