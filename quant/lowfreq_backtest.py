@@ -28,8 +28,18 @@ FEATURE_CACHE = "lowfreq_features.parquet"
 
 
 def _universe(path: str | None) -> list[str]:
+    """读股票池文件。每行形如 ``000001 平安银行``，允许 ``#`` 注释行。"""
     p = Path(path or config.MAINBOARD_UNIVERSE_FILE)
-    codes = [ln.strip().zfill(6) for ln in p.read_text().splitlines() if ln.strip()]
+    codes = []
+    for line in p.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        token = line.split()[0].strip()
+        if token.isdigit():
+            codes.append(token.zfill(6))
+    if not codes:
+        raise SystemExit(f"股票池为空或格式不符：{p}")
     return sorted(set(codes))
 
 
