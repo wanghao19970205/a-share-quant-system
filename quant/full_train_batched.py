@@ -36,7 +36,10 @@ WINDOW_CACHE_VERSION = 1
 
 
 def _recipe_signature_payload(ignore_universe: bool, **kwargs) -> str:
-    payload = {"_v": WINDOW_CACHE_VERSION, "model": MODEL_NAME}
+    # tradability.SEAL_VERSION 参与签名：封板口径变化会改变 tradable_ret / buyable_close，
+    # 进而改变标签、掩码和窗口内回测，必须让旧 window cache 失效。
+    payload = {"_v": WINDOW_CACHE_VERSION, "model": MODEL_NAME,
+               "seal_v": tradability.SEAL_VERSION}
     for key, value in kwargs.items():
         if ignore_universe and key == "universe_codes":
             continue

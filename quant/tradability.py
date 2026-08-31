@@ -25,6 +25,12 @@ import pandas as pd
 
 from quant import backtest, config
 
+# 封板/可交易判定的口径版本。**修改 seal_masks / price_tradability 的判定语义时必须 +1**，
+# 否则 full_train_batched 的 window cache 会静默复用旧口径算出的窗口预测。
+# v1: (close==high) & ret1>=0.095 的主板启发式。
+# v2: 按板块合法涨跌停档位匹配 + 一字板无条件封板 + 前收盘非正 fail-closed。
+SEAL_VERSION = 2
+
 
 def sell_roll_max_days() -> int:
     """跌停顺延卖出的上限交易日数（含预定卖出日）。单一真源在 backtest.bt_sell_roll_max_days()。"""
