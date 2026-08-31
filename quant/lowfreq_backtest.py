@@ -98,7 +98,9 @@ def build_frame(codes: list[str], horizons: list[int], refresh: bool = False) ->
     return df
 
 
-def _rebalance_dates(dates: np.ndarray, h: int) -> set:
+def rebalance_grid(df: pd.DataFrame, signal: str, h: int) -> set:
+    """调仓日网格。策略与基准必须共用同一网格，否则超额无法对齐。"""
+    dates = np.array(sorted(df.dropna(subset=[signal])["date"].unique()))
     return set(dates[::h])
 
 
@@ -111,10 +113,11 @@ def simulate(df: pd.DataFrame, signal: str, h: int, target_n: int,
     新进标的必须落在 ``entry_q`` 内且当日 ``buyable_close``；已持仓不要求可买。
     """
     ret_col = f"tradable_ret_{h}d"
+    if ret_col not in df.columns:
+        raise KeyError(f"缺少收益列 {ret_col}；构建特征时需包含 horizon={h}")
     pool = df.dropna(subset=[signal]).copy()
     pool["q"] = pool.groupby("date")[signal].rank(pct=True, ascending=ascending)
-    dates = np.array(sorted(pool["date"].unique()))
-    rb = _rebalance_dates(dates, h)
+    rb = rebalance_grid(df, signal, h)
     by_date = {d: g.set_index("code") for d, g in pool[pool["date"].isin(rb)].groupby("date")}
     held: list[str] = []
     rows = []
@@ -140,12 +143,11 @@ def simulate(df: pd.DataFrame, signal: str, h: int, target_n: int,
     return pd.DataFrame(rows)
 
 
-def benchmark(df: pd.DataFrame, h: int) -> pd.Series:
-    """同调仓日的全可买样本等权收益，作为超额基准。"""
+def benchmark(df: pd.DataFrame, h: int, signal: str) -> pd.Series:
+    """同调仓日网格上的全可买样本等权收益，作为超额基准。"""
     ret_col = f"tradable_ret_{h}d"
     pool = df[df["buyable_close"]].dropna(subset=[ret_col])
-    dates = np.array(sorted(df["date"].unique()))
-    rb = _rebalance_dates(dates, h)
+    rb = rebalance_grid(df, signal, h)
     return pool[pool["date"].isin(rb)].groupby("date")[ret_col].mean()
 
 
@@ -201,7 +203,7 @@ def main() -> None:
 
     rows = []
     for h in horizons:
-        bench = benchmark(df, h)
+        bench = benchmark(df, h, signal)
         ppy = max(1, int(round(252 / h)))
         bs = backtest.evaluate_returns(bench, periods_per_year=ppy)
         rows.append({"strategy": "BENCH equal-weight", "h": h,
