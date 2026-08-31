@@ -695,12 +695,15 @@ def train_batched(name: str, output_prefix: str, selection_name: str, horizon: i
                   universe_file: str | None = None,
                   train_target_mode: str = "baseline") -> pd.DataFrame:
     _, _, prepared_dir = _panel_dirs(name)
-    if train_target_mode not in ("baseline", "buyin-mask", "tradable-label"):
+    if train_target_mode not in ("baseline", "buyin-mask", "tradable-label", "tradable-mask"):
         raise ValueError(f"unknown train_target_mode: {train_target_mode}")
     # A/B 训练口径：baseline=现役（target_ret 标签、全样本）；
-    #   buyin-mask=剔训练段封涨停买入日；tradable-label=用跌停顺延后的可实现收益作标签。
-    ab_label_col = f"tradable_ret_{horizon}d" if train_target_mode == "tradable-label" else None
-    ab_mask_col = "buyable_close" if train_target_mode == "buyin-mask" else None
+    #   buyin-mask=剔训练段封涨停买入日；tradable-label=用跌停顺延后的可实现收益作标签；
+    #   tradable-mask=同时对齐买入端与卖出端（可实现收益标签 + 剔除买不进样本）。
+    ab_label_col = (f"tradable_ret_{horizon}d"
+                    if train_target_mode in ("tradable-label", "tradable-mask") else None)
+    ab_mask_col = ("buyable_close"
+                   if train_target_mode in ("buyin-mask", "tradable-mask") else None)
     universe_codes: set[str] | None = None
     if universe_file:
         with open(universe_file, encoding="utf-8") as f:
@@ -1295,9 +1298,10 @@ def main() -> None:
                     help="cache per-window predictions keyed by recipe + month-file signature; "
                          "unchanged historical windows are reused so only the refreshed tail is recomputed")
     ap.add_argument("--train-target-mode", default="baseline",
-                    choices=["baseline", "buyin-mask", "tradable-label"],
+                    choices=["baseline", "buyin-mask", "tradable-label", "tradable-mask"],
                     help="A/B 训练目标口径：baseline=现役(target_ret 标签、全样本)；"
-                         "buyin-mask=剔训练段封涨停买入日；tradable-label=用跌停顺延可实现收益作标签")
+                         "buyin-mask=剔训练段封涨停买入日；tradable-label=用跌停顺延可实现收益作标签；"
+                         "tradable-mask=可实现收益标签 + 剔除买不进样本（买卖两端同时对齐）")
     args = ap.parse_args()
 
     config.ensure_dirs()

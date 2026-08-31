@@ -1,8 +1,14 @@
 """A/B 训练目标口径对齐实验编排器（task #5）。
 
-串行训练三条腿（baseline / buyin-mask / tradable-label），唯一变量 = 训练目标口径，
-其余超参全部对齐现役冠军。三腿训完后，用**同一把可交易回测尺子**（cost=0.002、
+串行训练四条腿（baseline / buyin-mask / tradable-label / tradable-mask），唯一变量 = 训练目标口径，
+其余超参全部对齐现役冠军。训完后，用**同一把可交易尺子**（cost=0.002、
 filter_untradable=1、top_n=2）统一评测，输出对比表，看哪条腿在真实成本+可交易口径下最优。
+
+四条腿分别补足乐观标签（close(T)→close(T+h)）的不同短板：
+- baseline：控制组，假设买得进也卖得掉；
+- buyin-mask：只补买入端（剔除封涨停买不进的训练样本）；
+- tradable-label：只补卖出端（跌停封板顺延后的可实现收益作标签）；
+- tradable-mask：买卖两端同时补足。
 
 **只读实验，不改冠军 / manifest / 每日发布名单。** 详见 OPS_AB_TARGET_ALIGN_2026-07-25.md。
 
@@ -26,7 +32,7 @@ import pandas as pd
 from quant import backtest, config, tradability, warehouse
 
 MODEL_NAME = "ridge_lightgbm_ranker_ensemble"
-MODES = ["baseline", "buyin-mask", "tradable-label"]
+MODES = ["baseline", "buyin-mask", "tradable-label", "tradable-mask"]
 HORIZON = 1
 
 
@@ -185,7 +191,7 @@ def main() -> None:
                 print(f"!! {mode} 训练失败 rc={rc}，中止（前面成功的腿产物保留）", flush=True)
                 sys.exit(rc)
 
-    print("\n== 统一可交易评测（三腿同尺：filter_untradable=1, cost, top_n）==", flush=True)
+    print("\n== 统一可交易评测（四腿同尺：filter_untradable=1, cost, top_n）==", flush=True)
     rows = []
     for mode in MODES:
         prefix = f"ab_{mode.replace('-', '_')}"
