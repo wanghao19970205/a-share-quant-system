@@ -29,7 +29,8 @@ from quant import backtest, config
 # 否则 full_train_batched 的 window cache 会静默复用旧口径算出的窗口预测。
 # v1: (close==high) & ret1>=0.095 的主板启发式。
 # v2: 按板块合法涨跌停档位匹配 + 一字板无条件封板 + 前收盘非正 fail-closed。
-SEAL_VERSION = 2
+# v3: 板块档位补齐北交所/科创 CDR；坏价格行（非正收盘、超涨跌停限制的跳变）前向收益置空。
+SEAL_VERSION = 3
 
 
 def sell_roll_max_days() -> int:
@@ -112,6 +113,25 @@ def seal_masks(px: pd.DataFrame, code: str) -> tuple[np.ndarray, np.ndarray]:
     return limit_up_seal, limit_down_seal
 
 
+def price_valid_mask(px: pd.DataFrame, code: str) -> np.ndarray:
+    """逐行价格可用性：收盘价为正，且日涨跌幅未超出该板块物理上限。
+
+    审计发现约 0.03% 的行存在非正收盘价、``-100%`` 伪收益和超出涨跌停限制的跳变
+    （多为复权除权残差）。这些值物理上不可能，会主导树模型分裂和标签尾部，
+    因此由本掩码统一标记，供前向收益列置空使用。首行无前收盘时视为可用
+    （只是无法校验涨跌幅），其收益列本身会因缺少前值而为空。
+    """
+    close = px["close"].to_numpy(dtype=float)
+    prev = px["close"].shift(1).to_numpy(dtype=float)
+    with np.errstate(all="ignore"):
+        ret1 = np.where(prev > 0, close / prev - 1.0, np.nan)
+    # 容差覆盖分位取整与复权残差；超过它的跳变只能是数据错误。
+    cap = max(limit_tiers(code)) + 0.01
+    with np.errstate(all="ignore"):
+        move_ok = ~(np.isfinite(ret1) & (np.abs(ret1) > cap))
+    return (close > 0) & move_ok
+
+
 def price_tradability(codes: list[str], horizons: list[int],
                       quant_dir: Path | None = None) -> pd.DataFrame:
     """从 price/{code}.parquet 读 OHLC，返回按 code+date 的可交易口径列。
@@ -169,21 +189,27 @@ def price_tradability(codes: list[str], horizons: list[int],
         if has_hl:
             limit_up_seal, limit_down_seal = seal_masks(px, code)
         out["positive_volume"] = positive_volume
+        # 坏价格行不参与任何前向收益：入场行或卖出行不可用时该收益置空。
+        valid = pd.Series(price_valid_mask(px, code), index=px.index)
         cap = sell_roll_max_days()
         for horizon in horizons:
+            ok = valid & valid.shift(-horizon, fill_value=False)
             # 收盘口径（保留，供方向统计/兜底）
-            out[f"target_ret_{horizon}d"] = px["close"].shift(-horizon) / px["close"] - 1
+            out[f"target_ret_{horizon}d"] = (
+                px["close"].shift(-horizon) / px["close"] - 1).where(ok)
             # 次日开盘买入、持有 horizon 日后开盘卖出（更贴近实盘）
             if has_open:
                 entry = px["open"].shift(-1)
                 exit_ = px["open"].shift(-(1 + horizon))
-                out[f"open_ret_{horizon}d"] = exit_ / entry - 1
+                out[f"open_ret_{horizon}d"] = (exit_ / entry - 1).where(
+                    valid & valid.shift(-(1 + horizon), fill_value=False))
             # 尾盘 T 买入、T+horizon 收盘卖出；若卖出日一字/收盘跌停封板，顺延到下一可卖日收盘，
             # 上限 cap 个交易日，仍封则第 cap 日强制平仓。收益 = 实际卖出日收盘 / 买入日收盘 - 1。
             if limit_down_seal is not None:
                 sell_close = rolled_sell_close(close_arr, limit_down_seal, horizon, cap)
                 with np.errstate(all="ignore"):
-                    out[f"tradable_ret_{horizon}d"] = sell_close / close_arr - 1
+                    out[f"tradable_ret_{horizon}d"] = pd.Series(
+                        sell_close / close_arr - 1, index=px.index).where(ok)
         # 次日是否可买入(次日开盘口径)：一字涨停(high==low 且上涨)当日买不进。
         # 成交量缺失或为零时 fail-closed，不能把不可执行样本当作可买。
         if has_open and has_hl:
@@ -199,11 +225,11 @@ def price_tradability(codes: list[str], horizons: list[int],
             )
         else:
             out["buyable_next"] = False
-        # 当日是否可买入(尾盘收盘口径)：涨停封板或无成交量当天尾盘买不进。
+        # 当日是否可买入(尾盘收盘口径)：涨停封板或无成交量当天尾盘买不进；坏价格行不可买。
         if limit_down_seal is not None:
-            out["buyable_close"] = (~limit_up_seal) & positive_volume
+            out["buyable_close"] = (~limit_up_seal) & positive_volume & valid.to_numpy()
         else:
-            out["buyable_close"] = positive_volume
+            out["buyable_close"] = positive_volume & valid.to_numpy()
         frames.append(out)
     if not frames:
         return pd.DataFrame()
