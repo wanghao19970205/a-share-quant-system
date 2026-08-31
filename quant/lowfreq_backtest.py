@@ -106,11 +106,14 @@ def rebalance_grid(df: pd.DataFrame, signal: str, h: int) -> set:
 
 def simulate(df: pd.DataFrame, signal: str, h: int, target_n: int,
              entry_q: float, exit_q: float, cost: float,
-             ascending: bool = True) -> pd.DataFrame:
+             ascending: bool = True,
+             entry_lo: float = 0.0, exit_lo: float = 0.0) -> pd.DataFrame:
     """按 h 个交易日调仓、带进出缓冲带的等权组合。
 
-    ``ascending=True`` 表示信号值越小越优（如低波动）。持仓跌出 ``exit_q`` 才卖出，
-    新进标的必须落在 ``entry_q`` 内且当日 ``buyable_close``；已持仓不要求可买。
+    ``ascending=True`` 表示信号值越小越优（如低波动）。分位区间为半开的 ``(lo, q]``，
+    这样相邻分桶不会在边界上重复收票；持仓落到 ``(exit_lo, exit_q]`` 之外才卖出，
+    新进标的必须落在 ``(entry_lo, entry_q]`` 内且当日 ``buyable_close``；
+    已持仓不要求可买。``lo`` 默认 0，因分位数恒大于 0，等价于传统的取头部。
     """
     ret_col = f"tradable_ret_{h}d"
     if ret_col not in df.columns:
@@ -124,11 +127,12 @@ def simulate(df: pd.DataFrame, signal: str, h: int, target_n: int,
     for d in sorted(by_date):
         info = by_date[d]
         prev = list(held)
-        stay = [c for c in prev if c in info.index and info.at[c, "q"] <= exit_q]
+        stay = [c for c in prev
+                if c in info.index and exit_lo < info.at[c, "q"] <= exit_q]
         need = target_n - len(stay)
         if need > 0:
-            cand = info[(info["q"] <= entry_q) & info["buyable_close"]
-                        & (~info.index.isin(stay))]
+            cand = info[(info["q"] > entry_lo) & (info["q"] <= entry_q)
+                        & info["buyable_close"] & (~info.index.isin(stay))]
             stay += cand.sort_values("q").index[:need].tolist()
         cur = [c for c in stay if c in info.index and pd.notna(info.at[c, ret_col])]
         if not cur:
@@ -207,6 +211,31 @@ def yearly_excess(ex: pd.Series, ppy: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _specs(args, n_codes: int, target_ns: list[int]) -> list[tuple]:
+    """生成 (label, target_n, entry_lo, entry_q, exit_lo, exit_q) 组合清单。"""
+    if args.buckets:
+        b = args.buckets
+        pad = 0.5 / b   # 缓冲带宽度取桶宽的一半，进出对称
+        out = []
+        for i in range(b):
+            lo, hi = i / b, (i + 1) / b
+            out.append((f"VOLQ {lo:.2f}-{hi:.2f}", 10 ** 9,
+                        lo, hi, max(0.0, lo - pad), min(1.0, hi + pad)))
+        return out
+    out = []
+    for n in target_ns:
+        for band in args.bands.split(","):
+            band = band.strip()
+            if band == "hard":
+                q = min(1.0, n / max(n_codes, 1))
+                out.append((f"HARD-CUT n={n}", n, 0.0, q, 0.0, q))
+            else:
+                entry_q, exit_q = (float(x) for x in band.split("/"))
+                out.append((f"BUFFER {entry_q:.2f}/{exit_q:.2f} n={n}", n,
+                            0.0, entry_q, 0.0, exit_q))
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--signal", default="low_vol",
@@ -221,6 +250,8 @@ def main() -> None:
     ap.add_argument("--reverse", action="store_true",
                     help="反转信号方向（低波动 → 高波动），用于检验超额是否来自真实截面价差")
     ap.add_argument("--yearly", action="store_true", help="额外输出分年度超额，检验稳定性")
+    ap.add_argument("--buckets", type=int, default=0,
+                    help="改为按信号分位分桶（如 5），映射信号与收益的形状而非只取头部")
     args = ap.parse_args()
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
@@ -255,30 +286,22 @@ def main() -> None:
                      "max_dd": round(float(bs.get("max_drawdown", np.nan)), 4),
                      "win": round(float(bs.get("win_rate", np.nan)), 4),
                      "turnover": 0.0, "holdings": np.nan})
-        for n in target_ns:
-            for band in args.bands.split(","):
-                band = band.strip()
-                if band == "hard":
-                    q = min(1.0, n / max(df["code"].nunique(), 1))
-                    entry_q = exit_q = q
-                    label = "HARD-CUT"
-                else:
-                    entry_q, exit_q = (float(x) for x in band.split("/"))
-                    label = f"BUFFER {entry_q:.2f}/{exit_q:.2f}"
-                r = simulate(df, signal, h, n, entry_q, exit_q, cost, ascending)
-                if r.empty:
-                    continue
-                row = report(f"{label} n={n}", r, bench, h)
-                rows.append(row)
-                if args.yearly:
-                    yb = yearly_excess(excess_series(r, bench), ppy)
-                    if not yb.empty:
-                        yearly.append((f"{row['strategy']} h={h}", yb))
-                print(f"  {row['strategy']:26s} h={h:2d} periods={row['periods']:4d} "
-                      f"net={row['net_annual']:+.4f} gross={row['gross_annual']:+.4f} "
-                      f"excess={row['excess_annual']:+.4f} IR={row['info_ratio']:+.3f} "
-                      f"t={row['t']:+.2f} "
-                      f"maxDD={row['max_dd']:+.4f} turnover={row['turnover']:.4f}", flush=True)
+        for label, n, e_lo, e_hi, x_lo, x_hi in _specs(args, df["code"].nunique(), target_ns):
+            r = simulate(df, signal, h, n, e_hi, x_hi, cost, ascending,
+                         entry_lo=e_lo, exit_lo=x_lo)
+            if r.empty:
+                continue
+            row = report(label, r, bench, h)
+            rows.append(row)
+            if args.yearly:
+                yb = yearly_excess(excess_series(r, bench), ppy)
+                if not yb.empty:
+                    yearly.append((f"{row['strategy']} h={h}", yb))
+            print(f"  {row['strategy']:26s} h={h:2d} periods={row['periods']:4d} "
+                  f"net={row['net_annual']:+.4f} gross={row['gross_annual']:+.4f} "
+                  f"excess={row['excess_annual']:+.4f} IR={row['info_ratio']:+.3f} "
+                  f"t={row['t']:+.2f} maxDD={row['max_dd']:+.4f} "
+                  f"turnover={row['turnover']:.4f} n={row['holdings']:.0f}", flush=True)
 
     out = pd.DataFrame(rows)
     print("\n== 汇总（excess = 对同调仓日等权基准的年化超额，IR = 超额信息比）==", flush=True)
