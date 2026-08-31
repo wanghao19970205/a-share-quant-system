@@ -242,6 +242,17 @@ def yearly_excess(ex: pd.Series, ppy: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _side(spec: str) -> tuple[float, float]:
+    """解析一侧分位区间。``0.40`` 表示 (0, 0.40]，``0.20-0.60`` 表示 (0.20, 0.60]。"""
+    if "-" in spec:
+        lo, hi = (float(x) for x in spec.split("-", 1))
+    else:
+        lo, hi = 0.0, float(spec)
+    if not 0.0 <= lo < hi <= 1.0:
+        raise SystemExit(f"分位区间非法：{spec}（需满足 0 <= lo < hi <= 1）")
+    return lo, hi
+
+
 def _specs(args, n_codes: int, target_ns: list[int]) -> list[tuple]:
     """生成 (label, target_n, entry_lo, entry_q, exit_lo, exit_q) 组合清单。"""
     if args.buckets:
@@ -261,9 +272,12 @@ def _specs(args, n_codes: int, target_ns: list[int]) -> list[tuple]:
                 q = min(1.0, n / max(n_codes, 1))
                 out.append((f"HARD-CUT n={n}", n, 0.0, q, 0.0, q))
             else:
-                entry_q, exit_q = (float(x) for x in band.split("/"))
-                out.append((f"BUFFER {entry_q:.2f}/{exit_q:.2f} n={n}", n,
-                            0.0, entry_q, 0.0, exit_q))
+                e_spec, x_spec = band.split("/", 1)
+                e_lo, e_hi = _side(e_spec)
+                x_lo, x_hi = _side(x_spec)
+                if x_lo > e_lo or x_hi < e_hi:
+                    raise SystemExit(f"卖出区间必须包住买入区间：{band}")
+                out.append((f"BAND {e_spec}/{x_spec} n={n}", n, e_lo, e_hi, x_lo, x_hi))
     return out
 
 
@@ -274,7 +288,8 @@ def main() -> None:
     ap.add_argument("--horizons", default="1,2,5,10", help="调仓间隔（交易日），上限 10")
     ap.add_argument("--target-n", default="50,100")
     ap.add_argument("--bands", default="hard,0.10/0.30,0.15/0.40",
-                    help="缓冲带 entry/exit 分位；hard 表示无缓冲的硬切")
+                    help="进/出分位区间；hard 表示无缓冲的硬切。"
+                         "一侧可写 0.30（即 (0,0.30]）或 0.20-0.30（即 (0.20,0.30]）")
     ap.add_argument("--cost", type=float, default=None)
     ap.add_argument("--universe", default=None)
     ap.add_argument("--refresh", action="store_true", help="强制重建特征缓存")
