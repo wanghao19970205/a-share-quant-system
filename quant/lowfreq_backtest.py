@@ -198,14 +198,17 @@ def _excess_stats(ex: pd.Series, ppy: int) -> tuple[float, float, float]:
         return np.nan, np.nan, np.nan
     sd = float(ex.std(ddof=1))
     ann = float((1 + ex.mean()) ** ppy - 1)
-    if not sd > 0:
+    # 退化序列（如常数超额）的 std 只剩浮点噪声，直接除会算出 1e16 量级的假 t 值。
+    # 真实日度超额的 std 在 1e-3 量级，1e-12 作为下限足够安全。
+    if not sd > 1e-12:
         return ann, np.nan, np.nan
     ir = float(ex.mean() / sd * np.sqrt(ppy))
     t = float(ex.mean() / sd * np.sqrt(len(ex)))
     return ann, ir, t
 
 
-def report(label: str, r: pd.DataFrame, bench: pd.Series, h: int) -> dict:
+def report(label: str, r: pd.DataFrame, bench: pd.Series, h: int,
+           split: pd.Timestamp | None = None) -> dict:
     ppy = max(1, int(round(252 / h)))
     net = backtest.evaluate_returns(r["ret"], periods_per_year=ppy)
     gross = backtest.evaluate_returns(r["gross_ret"], periods_per_year=ppy)
@@ -224,6 +227,13 @@ def report(label: str, r: pd.DataFrame, bench: pd.Series, h: int) -> dict:
         "turnover": round(float(r["turnover"].mean()), 4),
         "holdings": round(float(r["n"].mean()), 1),
     }
+    if split is not None:
+        # 选参只能看 _is 列，_oos 列是留出期；同时看两边就等于又一次全样本挑选。
+        for tag, seg in (("is", ex[ex.index < split]), ("oos", ex[ex.index >= split])):
+            s_ann, _, s_t = _excess_stats(seg, ppy)
+            row[f"periods_{tag}"] = int(len(seg))
+            row[f"excess_{tag}"] = round(s_ann, 4) if np.isfinite(s_ann) else np.nan
+            row[f"t_{tag}"] = round(s_t, 2) if np.isfinite(s_t) else np.nan
     return row
 
 
@@ -298,11 +308,14 @@ def main() -> None:
     ap.add_argument("--yearly", action="store_true", help="额外输出分年度超额，检验稳定性")
     ap.add_argument("--buckets", type=int, default=0,
                     help="改为按信号分位分桶（如 5），映射信号与收益的形状而非只取头部")
+    ap.add_argument("--split", default=None,
+                    help="样本内/样本外切分日（如 2023-01-01）；选参只许看 _is 列")
     args = ap.parse_args()
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
     if max(horizons) > 10:
         raise SystemExit("调仓间隔上限为 10 个交易日")
+    split = pd.Timestamp(args.split) if args.split else None
     target_ns = [int(x) for x in args.target_n.split(",") if x.strip()]
     cost = args.cost if args.cost is not None else backtest.bt_cost_roundtrip()
     sig_map = {"low_vol": ("vol_10", True), "low_vol20": ("vol_20", True),
@@ -337,17 +350,21 @@ def main() -> None:
             r = simulate(sections, n, e_hi, x_hi, cost, entry_lo=e_lo, exit_lo=x_lo)
             if r.empty:
                 continue
-            row = report(label, r, bench, h)
+            row = report(label, r, bench, h, split=split)
             rows.append(row)
             if args.yearly:
                 yb = yearly_excess(excess_series(r, bench), ppy)
                 if not yb.empty:
                     yearly.append((f"{row['strategy']} h={h}", yb))
+            tail = ""
+            if split is not None:
+                tail = (f" | IS excess={row['excess_is']:+.4f} t={row['t_is']:+.2f}"
+                        f" | OOS excess={row['excess_oos']:+.4f} t={row['t_oos']:+.2f}")
             print(f"  {row['strategy']:26s} h={h:2d} periods={row['periods']:4d} "
                   f"net={row['net_annual']:+.4f} gross={row['gross_annual']:+.4f} "
                   f"excess={row['excess_annual']:+.4f} IR={row['info_ratio']:+.3f} "
                   f"t={row['t']:+.2f} maxDD={row['max_dd']:+.4f} "
-                  f"turnover={row['turnover']:.4f} n={row['holdings']:.0f}", flush=True)
+                  f"turnover={row['turnover']:.4f} n={row['holdings']:.0f}{tail}", flush=True)
 
     out = pd.DataFrame(rows)
     print("\n== 汇总（excess = 对同调仓日等权基准的年化超额，IR = 超额信息比）==", flush=True)
@@ -357,6 +374,9 @@ def main() -> None:
         print(yb.to_string(index=False), flush=True)
     print("\n判读：只有 excess_annual > 0 且 |t| > 2 才算跑赢基准；"
           "periods 太少时 sharpe/IR/t 无统计意义。", flush=True)
+    if split is not None:
+        print(f"切分日={split.date()}：选参只许看 excess_is/t_is，"
+              f"excess_oos/t_oos 是留出期结果，用来判定选出来的东西是否存活。", flush=True)
 
 
 if __name__ == "__main__":
