@@ -129,6 +129,23 @@ def restrict_vol_band(df: pd.DataFrame, lo: float, hi: float) -> pd.DataFrame:
     return kept
 
 
+def smooth_signal(df: pd.DataFrame, signal: str, window: int,
+                  ascending: bool) -> pd.DataFrame:
+    """把信号换成「过去 window 个交易日截面分位的滚动均值」，用来压低换手。
+
+    动机：模型 pred 逐日跳动，同样一套缓冲带下换手是波动率信号的 2.5 倍，
+    成本把 gross 优势全部吃掉。先按日度截面转成分位再平滑，避免 pred 的量纲
+    逐日漂移。只用当日及之前的分位，不引入未来信息。
+
+    返回后信号语义统一为「越小越优」，调用方需用 ``ascending=True``。
+    """
+    q = df.groupby("date")[signal].rank(pct=True, ascending=ascending)
+    out = df.assign(_q=q).sort_values(["code", "date"])
+    out[signal] = out.groupby("code")["_q"].transform(
+        lambda s: s.rolling(window, min_periods=1).mean())
+    return out.drop(columns=["_q"])
+
+
 def rebalance_grid(df: pd.DataFrame, signal: str, h: int) -> set:
     """调仓日网格。策略与基准必须共用同一网格，否则超额无法对齐。"""
     dates = np.array(sorted(df.dropna(subset=[signal])["date"].unique()))
@@ -346,6 +363,8 @@ def main() -> None:
     ap.add_argument("--pred-model", default="ridge_lightgbm_ranker_ensemble")
     ap.add_argument("--vol-band", default=None,
                     help="先按波动率分位带筛股票池再选股，如 0.20-0.60；基准仍为全可买池")
+    ap.add_argument("--smooth", type=int, default=1,
+                    help="把信号换成过去 N 日截面分位的滚动均值，用于压低换手（1 表示不平滑）")
     args = ap.parse_args()
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
@@ -371,6 +390,11 @@ def main() -> None:
     if args.vol_band:
         lo, hi = parse_band(args.vol_band)
         df = restrict_vol_band(df, lo, hi)
+    if args.smooth > 1:
+        # 平滑后信号统一为「越小越优」，方向已折进分位里。
+        df = smooth_signal(df, signal, args.smooth, ascending)
+        ascending = True
+        print(f"[lowfreq] smooth={args.smooth} 已把 {signal} 换成滚动分位均值", flush=True)
     print(f"[lowfreq] rows={len(df)} codes={df['code'].nunique()} "
           f"dates={df['date'].nunique()} signal={signal} ascending={ascending} "
           f"cost={cost}", flush=True)
@@ -378,6 +402,11 @@ def main() -> None:
     rows = []
     yearly: list[tuple[str, pd.DataFrame]] = []
     for h in horizons:
+        # 策略与基准必须落在同一网格上，否则超额是两条不同时间轴相减（曾经踩过）。
+        g_sig, g_bench = rebalance_grid(df, signal, h), rebalance_grid(bench_df, signal, h)
+        if g_sig != g_bench:
+            raise SystemExit(f"h={h} 策略与基准调仓日网格不一致："
+                             f"{len(g_sig)} vs {len(g_bench)}，超额无法对齐")
         bench = benchmark(bench_df, h, signal)
         ppy = max(1, int(round(252 / h)))
         sections = prepare(df, signal, h, ascending)
