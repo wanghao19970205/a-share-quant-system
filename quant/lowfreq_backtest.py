@@ -27,7 +27,7 @@ from quant import backtest, config, tradability, warehouse
 
 FEATURE_CACHE = "lowfreq_features.parquet"
 # 波动率窗口 -> 最少观测数。窗口越长排名越稳、换手越低，实测 20 天优于 10 天。
-VOL_WINDOWS = {10: 8, 20: 15, 40: 30, 60: 45}
+VOL_WINDOWS = {10: 8, 20: 15, 40: 30, 60: 45, 120: 90}
 
 
 def _universe(path: str | None) -> list[str]:
@@ -209,6 +209,7 @@ def simulate(sections: list[tuple], target_n: int, entry_q: float, exit_q: float
     换手率（对称差/并集）反而升高，实测如此。当日退市/停牌的持仓不受上限保护。
     """
     held = np.empty(0, dtype=np.int64)
+    seen: set[int] = set()
     rows = []
     for d, ids, q, buyable, ret in sections:
         prev = held
@@ -251,8 +252,12 @@ def simulate(sections: list[tuple], target_n: int, entry_q: float, exit_q: float
                 prev.size + cur.size - inter, 1)
         else:
             turnover = 1.0
+        # 记录首次出现的只数：换手压得越低，组合越接近一个固定篮子，
+        # 而固定篮子恰恰是存活偏差最容易吃到的形态，必须能看见这个数。
+        fresh = int(sum(1 for c in cur.tolist() if c not in seen))
+        seen.update(cur.tolist())
         rows.append({"date": d, "gross_ret": gross, "ret": gross - turnover * cost,
-                     "turnover": turnover, "n": int(cur.size)})
+                     "turnover": turnover, "n": int(cur.size), "new_names": fresh})
         held = np.sort(cur)
     return pd.DataFrame(rows)
 
@@ -306,6 +311,11 @@ def report(label: str, r: pd.DataFrame, bench: pd.Series, h: int,
         "turnover": round(float(r["turnover"].mean()), 4),
         "holdings": round(float(r["n"].mean()), 1),
     }
+    if "new_names" in r.columns:
+        uniq = int(r["new_names"].sum())
+        row["uniq_codes"] = uniq
+        # 平均持有期（单位：调仓期）。数值接近总期数说明组合近乎静态。
+        row["avg_tenure"] = round(float(r["n"].sum() / uniq), 1) if uniq else np.nan
     if split is not None:
         # 选参只能看 _is 列，_oos 列是留出期；同时看两边就等于又一次全样本挑选。
         for tag, seg in (("is", ex[ex.index < split]), ("oos", ex[ex.index >= split])):
