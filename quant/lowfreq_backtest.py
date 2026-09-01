@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,8 @@ import pandas as pd
 from quant import backtest, config, tradability, warehouse
 
 FEATURE_CACHE = "lowfreq_features.parquet"
+# 波动率窗口 -> 最少观测数。窗口越长排名越稳、换手越低，实测 20 天优于 10 天。
+VOL_WINDOWS = {10: 8, 20: 15, 40: 30, 60: 45}
 
 
 def _universe(path: str | None) -> list[str]:
@@ -65,8 +68,8 @@ def _price_features(codes: list[str]) -> pd.DataFrame:
             continue
         r = px["close"].pct_change()
         out = pd.DataFrame({"code": code, "date": px["date"].to_numpy()})
-        out["vol_10"] = r.rolling(10, min_periods=8).std().to_numpy()
-        out["vol_20"] = r.rolling(20, min_periods=15).std().to_numpy()
+        for w, mp in VOL_WINDOWS.items():
+            out[f"vol_{w}"] = r.rolling(w, min_periods=mp).std().to_numpy()
         out["mom_20"] = (px["close"] / px["close"].shift(20) - 1).to_numpy()
         if "volume" in px.columns:
             v = pd.to_numeric(px["volume"], errors="coerce")
@@ -76,15 +79,21 @@ def _price_features(codes: list[str]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def build_frame(codes: list[str], horizons: list[int], refresh: bool = False) -> pd.DataFrame:
-    """特征 + 可交易口径的合并长表，缓存到研究数据目录避免重复全量扫盘。"""
+def build_frame(codes: list[str], horizons: list[int], refresh: bool = False,
+                need_cols: tuple[str, ...] = ()) -> pd.DataFrame:
+    """特征 + 可交易口径的合并长表，缓存到研究数据目录避免重复全量扫盘。
+
+    ``need_cols`` 里的列缺一个就重建：老缓存没有新加的波动率窗口，若沿用会在
+    后面才以 KeyError 暴露，或更糟——被误当成"信号全缺"而静默跳过。
+    """
     cache = Path(config.QUANT_DIR) / FEATURE_CACHE
-    want = {f"tradable_ret_{h}d" for h in horizons}
+    want = {f"tradable_ret_{h}d" for h in horizons} | set(need_cols)
     if cache.exists() and not refresh:
         df = pd.read_parquet(cache)
         if want.issubset(df.columns):
             print(f"[lowfreq] 复用缓存 {cache.name} rows={len(df)}", flush=True)
             return df
+        print(f"[lowfreq] 缓存缺列 {sorted(want - set(df.columns))}，重建", flush=True)
     print(f"[lowfreq] 构建特征 codes={len(codes)} horizons={horizons}", flush=True)
     feat = _price_features(codes)
     trad = tradability.price_tradability(codes, horizons)
@@ -92,7 +101,10 @@ def build_frame(codes: list[str], horizons: list[int], refresh: bool = False) ->
     trad = trad[[c for c in keep if c in trad.columns]].drop_duplicates(["code", "date"])
     df = feat.merge(trad, on=["code", "date"], how="inner")
     df["buyable_close"] = df["buyable_close"].fillna(False).astype(bool)
-    df.to_parquet(cache, index=False)
+    # 原子落盘：缓存有几百 MB，重建期间若有别的实验在读，非原子写会读到半个文件。
+    tmp = cache.with_suffix(".tmp.parquet")
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, cache)
     print(f"[lowfreq] 缓存写入 {cache.name} rows={len(df)} "
           f"seal_v={tradability.SEAL_VERSION}", flush=True)
     return df
@@ -119,13 +131,17 @@ def join_predictions(df: pd.DataFrame, prefix: str, model: str) -> pd.DataFrame:
     return out
 
 
-def restrict_vol_band(df: pd.DataFrame, lo: float, hi: float) -> pd.DataFrame:
+def restrict_vol_band(df: pd.DataFrame, lo: float, hi: float,
+                      col: str = "vol_10") -> pd.DataFrame:
     """按日度截面把样本限制在波动率分位带 ``(lo, hi]`` 内；缺波动率的样本剔除。"""
-    q = df.groupby("date")["vol_10"].rank(pct=True, ascending=True)
+    if col not in df.columns:
+        raise SystemExit(f"缺少波动率列 {col}")
+    q = df.groupby("date")[col].rank(pct=True, ascending=True)
     kept = df[(q > lo) & (q <= hi)]
     if kept.empty:
         raise SystemExit(f"波动率带 ({lo},{hi}] 内没有样本")
-    print(f"[lowfreq] vol_band=({lo:.2f},{hi:.2f}] rows {len(df)} -> {len(kept)}", flush=True)
+    print(f"[lowfreq] vol_band={col}({lo:.2f},{hi:.2f}] rows {len(df)} -> {len(kept)}",
+          flush=True)
     return kept
 
 
@@ -179,13 +195,18 @@ def prepare(df: pd.DataFrame, signal: str, h: int,
 
 
 def simulate(sections: list[tuple], target_n: int, entry_q: float, exit_q: float,
-             cost: float, entry_lo: float = 0.0, exit_lo: float = 0.0) -> pd.DataFrame:
+             cost: float, entry_lo: float = 0.0, exit_lo: float = 0.0,
+             max_out: int | None = None) -> pd.DataFrame:
     """在 ``prepare`` 产出的截面上跑带进出缓冲带的等权组合。
 
     分位区间为半开的 ``(lo, q]``，这样相邻分桶不会在边界上重复收票；持仓落到
     ``(exit_lo, exit_q]`` 之外才卖出，新进标的必须落在 ``(entry_lo, entry_q]`` 内
     且当日 ``buyable_close``；已持仓不要求可买。``lo`` 默认 0，因分位数恒大于 0，
     等价于传统的取头部。信号方向由 ``prepare(ascending=...)`` 决定。
+
+    ``max_out`` 限制每期主动卖出只数：掉出退出带的持仓按分位排序，只卖最差的
+    那几只，其余暂留。卖出侧才是换手的源头——只限制补仓会让组合越卖越空、
+    换手率（对称差/并集）反而升高，实测如此。当日退市/停牌的持仓不受上限保护。
     """
     held = np.empty(0, dtype=np.int64)
     rows = []
@@ -197,7 +218,17 @@ def simulate(sections: list[tuple], target_n: int, entry_q: float, exit_q: float
         pos = np.where(ok, pos, 0)
         ok &= ids[pos] == prev
         pq = np.where(ok, q[pos], np.nan)
-        stay = prev[ok & (pq > exit_lo) & (pq <= exit_q)]
+        inside = ok & (pq > exit_lo) & (pq <= exit_q)
+        if max_out is not None:
+            dropping = np.flatnonzero(ok & ~inside)
+            if dropping.size > max_out:
+                # 分位越大越差，只卖最差的 max_out 只
+                worst = dropping[np.argsort(-pq[dropping], kind="stable")[:max_out]]
+                reprieve = np.zeros(prev.size, dtype=bool)
+                reprieve[dropping] = True
+                reprieve[worst] = False
+                inside = inside | reprieve
+        stay = prev[inside]
         need = target_n - stay.size
         if need > 0:
             cand = (q > entry_lo) & (q <= entry_q) & buyable
@@ -342,7 +373,8 @@ def _specs(args, n_codes: int, target_ns: list[int]) -> list[tuple]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--signal", default="low_vol",
-                    choices=["low_vol", "low_vol20", "low_turnover", "pred"])
+                    choices=["low_vol", "low_vol20", "low_vol40", "low_vol60",
+                             "low_turnover", "mom", "pred"])
     ap.add_argument("--horizons", default="1,2,5,10", help="调仓间隔（交易日），上限 10")
     ap.add_argument("--target-n", default="50,100")
     ap.add_argument("--bands", default="hard,0.10/0.30,0.15/0.40",
@@ -365,6 +397,10 @@ def main() -> None:
                     help="先按波动率分位带筛股票池再选股，如 0.20-0.60；基准仍为全可买池")
     ap.add_argument("--smooth", type=int, default=1,
                     help="把信号换成过去 N 日截面分位的滚动均值，用于压低换手（1 表示不平滑）")
+    ap.add_argument("--vol-band-col", default="vol_10",
+                    help="波动率带用哪一列做池过滤，默认 vol_10")
+    ap.add_argument("--max-out-frac", type=float, default=None,
+                    help="每期主动卖出上限占 target_n 的比例，如 0.05；不给则不限制")
     args = ap.parse_args()
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
@@ -374,22 +410,26 @@ def main() -> None:
     target_ns = [int(x) for x in args.target_n.split(",") if x.strip()]
     cost = args.cost if args.cost is not None else backtest.bt_cost_roundtrip()
     sig_map = {"low_vol": ("vol_10", True), "low_vol20": ("vol_20", True),
-               "low_turnover": ("dollar_vol_20", True), "pred": ("pred", False)}
+               "low_vol40": ("vol_40", True), "low_vol60": ("vol_60", True),
+               "low_turnover": ("dollar_vol_20", True), "mom": ("mom_20", False),
+               "pred": ("pred", False)}
     signal, ascending = sig_map[args.signal]
     if args.reverse:
         ascending = not ascending
     if args.signal == "pred" and not args.pred_prefix:
         raise SystemExit("--signal pred 需要同时给 --pred-prefix")
 
+    need = {signal} | ({args.vol_band_col} if args.vol_band else set())
     codes = _universe(args.universe)
-    df = build_frame(codes, horizons, refresh=args.refresh)
+    df = build_frame(codes, horizons, refresh=args.refresh,
+                     need_cols=tuple(c for c in sorted(need) if c != "pred"))
     if args.pred_prefix:
         df = join_predictions(df, args.pred_prefix, args.pred_model)
     # 基准始终是全可买池，只有选股池被波动率带收窄；两者共用同一调仓日网格。
     bench_df = df
     if args.vol_band:
         lo, hi = parse_band(args.vol_band)
-        df = restrict_vol_band(df, lo, hi)
+        df = restrict_vol_band(df, lo, hi, col=args.vol_band_col)
     if args.smooth > 1:
         # 平滑后信号统一为「越小越优」，方向已折进分位里。
         df = smooth_signal(df, signal, args.smooth, ascending)
@@ -421,7 +461,12 @@ def main() -> None:
                      "win": round(float(bs.get("win_rate", np.nan)), 4),
                      "turnover": 0.0, "holdings": np.nan})
         for label, n, e_lo, e_hi, x_lo, x_hi in _specs(args, df["code"].nunique(), target_ns):
-            r = simulate(sections, n, e_hi, x_hi, cost, entry_lo=e_lo, exit_lo=x_lo)
+            max_out = None
+            if args.max_out_frac is not None and n < 10 ** 8:
+                max_out = max(1, int(round(args.max_out_frac * n)))
+                label = f"{label} out<={max_out}"
+            r = simulate(sections, n, e_hi, x_hi, cost, entry_lo=e_lo, exit_lo=x_lo,
+                         max_out=max_out)
             if r.empty:
                 continue
             row = report(label, r, bench, h, split=split)
