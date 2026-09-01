@@ -252,7 +252,7 @@ def yearly_excess(ex: pd.Series, ppy: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _side(spec: str) -> tuple[float, float]:
+def parse_band(spec: str) -> tuple[float, float]:
     """解析一侧分位区间。``0.40`` 表示 (0, 0.40]，``0.20-0.60`` 表示 (0.20, 0.60]。"""
     if "-" in spec:
         lo, hi = (float(x) for x in spec.split("-", 1))
@@ -283,8 +283,8 @@ def _specs(args, n_codes: int, target_ns: list[int]) -> list[tuple]:
                 out.append((f"HARD-CUT n={n}", n, 0.0, q, 0.0, q))
             else:
                 e_spec, x_spec = band.split("/", 1)
-                e_lo, e_hi = _side(e_spec)
-                x_lo, x_hi = _side(x_spec)
+                e_lo, e_hi = parse_band(e_spec)
+                x_lo, x_hi = parse_band(x_spec)
                 if x_lo > e_lo or x_hi < e_hi:
                     raise SystemExit(f"卖出区间必须包住买入区间：{band}")
                 out.append((f"BAND {e_spec}/{x_spec} n={n}", n, e_lo, e_hi, x_lo, x_hi))
