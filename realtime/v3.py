@@ -218,6 +218,10 @@ class V3PaperTrader(V2PaperTrader):
                 "entry_atr": entry_atr, "prediction_date": self._prediction_date(code),
                 "buy_quote_age_sec": age, "buy_fill_source": "ask1",
                 "buy_ask_volume1_raw": quote["ask_volume1"],
+                # 与卖出侧同理：留下成交瞬间的 last/bid1/ask1 才能事后拆分价差与漂移。
+                # 注意 V3 的 _price_of 已被改成返回 bid1，取 last 必须走基类实现。
+                "buy_last": super()._price_of(code), "buy_bid1": bid,
+                "buy_ask1": quote.get("ask"),
             }
             position.update(self._entry_extra(code, quote))
             self._state.setdefault("positions", []).append(position)
@@ -374,6 +378,10 @@ class V3PaperTrader(V2PaperTrader):
         self._state["cash"] = self._state.get("cash", 0.0) + proceeds
         self._state["realized_pnl"] = self._state.get("realized_pnl", 0.0) + pnl
         sell_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        # 成交瞬间的最新价与买卖一价：回测按收盘计价，实盘按 bid1/ask1 成交，
+        # 两者之差既含买卖价差也含 14:50 到收盘的漂移。只有把 last 一起记下来，
+        # 事后才能把这两个成分拆开——否则成本假设只能靠猜。
+        snap, sell_age, sell_bid, sell_ask = self._quote(pos["code"])
         trade_rec = {
             "action": "sell", "time": sell_time,
             "trade_id": str(pos.get("position_id") or self._stable_id(
@@ -384,6 +392,8 @@ class V3PaperTrader(V2PaperTrader):
             "buy_price": pos["buy_price"], "sell_date": _today(),
             "sell_price": round(px, 3), "sell_fill_source": "bid1",
             "sell_bid_volume1_raw": bid_volume, "held_days": held,
+            "sell_last": super()._price_of(pos["code"]), "sell_bid1": sell_bid,
+            "sell_ask1": sell_ask, "sell_quote_age_sec": sell_age,
             "exit_reason": reason, "peak": pos.get("peak_bid"), "exp": pos.get("exp"),
             "entry_atr": pos.get("entry_atr"), "prediction_date": pos.get("prediction_date"),
             "shares": pos["shares"], "pnl": round(pnl, 2), "return": round(ret, 4),
