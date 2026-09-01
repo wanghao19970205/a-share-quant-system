@@ -383,7 +383,7 @@ def _specs(args, n_codes: int, target_ns: list[int]) -> list[tuple]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--signal", default="low_vol",
-                    choices=["low_vol", "low_vol20", "low_vol40", "low_vol60",
+                    choices=["low_vol", "low_vol20", "low_vol40", "low_vol60", "low_vol120",
                              "low_turnover", "mom", "pred"])
     ap.add_argument("--horizons", default="1,2,5,10", help="调仓间隔（交易日），上限 10")
     ap.add_argument("--target-n", default="50,100")
@@ -421,6 +421,7 @@ def main() -> None:
     cost = args.cost if args.cost is not None else backtest.bt_cost_roundtrip()
     sig_map = {"low_vol": ("vol_10", True), "low_vol20": ("vol_20", True),
                "low_vol40": ("vol_40", True), "low_vol60": ("vol_60", True),
+               "low_vol120": ("vol_120", True),
                "low_turnover": ("dollar_vol_20", True), "mom": ("mom_20", False),
                "pred": ("pred", False)}
     signal, ascending = sig_map[args.signal]
