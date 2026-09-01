@@ -764,6 +764,11 @@ def scenario_N():
     check(held and held[0]["buy_price"] == round(expected_ask, 3) and
           held[0]["buy_fill_source"] == "ask1",
           "V3 按卖一 ask1 买入，不再按 last 虚拟成交")
+    snap_buy = trader._ctx.snapshot_of("000961")
+    check(held and held[0]["buy_last"] == snap_buy.last and
+          held[0]["buy_bid1"] == snap_buy.bid_price1 and
+          held[0]["buy_ask1"] == snap_buy.ask_price1,
+          "V3 买入记录留下成交瞬间的 last/bid1/ask1，供事后拆分价差与收盘漂移")
     decision = json.loads(trader._decisions_file.read_text().splitlines()[0])
     by_code = {r["code"]: r for r in decision["candidates"]}
     check(by_code["000960"]["entry_decision"] == "filtered" and
@@ -806,6 +811,12 @@ def scenario_N():
     check(trade["sell_price"] == round(sell_bid, 3) and
           trade["sell_fill_source"] == "bid1",
           "V3 按买一 bid1 卖出，不再按 last 虚拟成交")
+    snap_exit = ctx_exit.snapshot_of("000962")
+    check(trade["sell_last"] == snap_exit.last and
+          trade["sell_bid1"] == snap_exit.bid_price1 and
+          trade["sell_ask1"] == snap_exit.ask_price1 and
+          trade["sell_quote_age_sec"] is not None,
+          "V3 卖出记录留下成交瞬间的 last/bid1/ask1，供事后拆分价差与收盘漂移")
 
     ctx_trail = build_ctx(
         {"000963": RefRow(expected_return=0.05, atr=0.2, prediction_date=today)},
