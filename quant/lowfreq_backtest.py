@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from quant import backtest, config, tradability
+from quant import backtest, config, tradability, warehouse
 
 FEATURE_CACHE = "lowfreq_features.parquet"
 
@@ -96,6 +96,37 @@ def build_frame(codes: list[str], horizons: list[int], refresh: bool = False) ->
     print(f"[lowfreq] 缓存写入 {cache.name} rows={len(df)} "
           f"seal_v={tradability.SEAL_VERSION}", flush=True)
     return df
+
+
+def join_predictions(df: pd.DataFrame, prefix: str, model: str) -> pd.DataFrame:
+    """把已有预测文件的 ``pred`` 并进长表，只保留有预测的 (code, date)。
+
+    用途：模型信号也要过同一套「缓冲带 + 低频 + 可交易口径」的检验。日频 top_n
+    评测里模型换手 0.85、成本吃掉一切，看不出信号本身有没有用。
+    """
+    name = f"{prefix}_bt_{model}_predictions"
+    pred = warehouse.load(name)
+    if pred.empty:
+        raise SystemExit(f"没有预测文件：{name}.parquet")
+    pred = pred[["code", "date", "pred"]].copy()
+    pred["code"] = pred["code"].astype(str).str.zfill(6)
+    pred["date"] = pd.to_datetime(pred["date"], errors="coerce")
+    pred = pred.dropna(subset=["code", "date", "pred"]).drop_duplicates(["code", "date"])
+    out = df.merge(pred, on=["code", "date"], how="inner")
+    if out.empty:
+        raise SystemExit(f"{name} 与特征表没有交集，检查股票池/日期范围")
+    print(f"[lowfreq] join {name} rows={len(out)} dates={out['date'].nunique()}", flush=True)
+    return out
+
+
+def restrict_vol_band(df: pd.DataFrame, lo: float, hi: float) -> pd.DataFrame:
+    """按日度截面把样本限制在波动率分位带 ``(lo, hi]`` 内；缺波动率的样本剔除。"""
+    q = df.groupby("date")["vol_10"].rank(pct=True, ascending=True)
+    kept = df[(q > lo) & (q <= hi)]
+    if kept.empty:
+        raise SystemExit(f"波动率带 ({lo},{hi}] 内没有样本")
+    print(f"[lowfreq] vol_band=({lo:.2f},{hi:.2f}] rows {len(df)} -> {len(kept)}", flush=True)
+    return kept
 
 
 def rebalance_grid(df: pd.DataFrame, signal: str, h: int) -> set:
@@ -294,7 +325,7 @@ def _specs(args, n_codes: int, target_ns: list[int]) -> list[tuple]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--signal", default="low_vol",
-                    choices=["low_vol", "low_vol20", "low_turnover"])
+                    choices=["low_vol", "low_vol20", "low_turnover", "pred"])
     ap.add_argument("--horizons", default="1,2,5,10", help="调仓间隔（交易日），上限 10")
     ap.add_argument("--target-n", default="50,100")
     ap.add_argument("--bands", default="hard,0.10/0.30,0.15/0.40",
@@ -310,6 +341,11 @@ def main() -> None:
                     help="改为按信号分位分桶（如 5），映射信号与收益的形状而非只取头部")
     ap.add_argument("--split", default=None,
                     help="样本内/样本外切分日（如 2023-01-01）；选参只许看 _is 列")
+    ap.add_argument("--pred-prefix", default=None,
+                    help="--signal pred 时的预测文件前缀，如 ab_tradable_mask")
+    ap.add_argument("--pred-model", default="ridge_lightgbm_ranker_ensemble")
+    ap.add_argument("--vol-band", default=None,
+                    help="先按波动率分位带筛股票池再选股，如 0.20-0.60；基准仍为全可买池")
     args = ap.parse_args()
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
@@ -319,13 +355,22 @@ def main() -> None:
     target_ns = [int(x) for x in args.target_n.split(",") if x.strip()]
     cost = args.cost if args.cost is not None else backtest.bt_cost_roundtrip()
     sig_map = {"low_vol": ("vol_10", True), "low_vol20": ("vol_20", True),
-               "low_turnover": ("dollar_vol_20", True)}
+               "low_turnover": ("dollar_vol_20", True), "pred": ("pred", False)}
     signal, ascending = sig_map[args.signal]
     if args.reverse:
         ascending = not ascending
+    if args.signal == "pred" and not args.pred_prefix:
+        raise SystemExit("--signal pred 需要同时给 --pred-prefix")
 
     codes = _universe(args.universe)
     df = build_frame(codes, horizons, refresh=args.refresh)
+    if args.pred_prefix:
+        df = join_predictions(df, args.pred_prefix, args.pred_model)
+    # 基准始终是全可买池，只有选股池被波动率带收窄；两者共用同一调仓日网格。
+    bench_df = df
+    if args.vol_band:
+        lo, hi = parse_band(args.vol_band)
+        df = restrict_vol_band(df, lo, hi)
     print(f"[lowfreq] rows={len(df)} codes={df['code'].nunique()} "
           f"dates={df['date'].nunique()} signal={signal} ascending={ascending} "
           f"cost={cost}", flush=True)
@@ -333,7 +378,7 @@ def main() -> None:
     rows = []
     yearly: list[tuple[str, pd.DataFrame]] = []
     for h in horizons:
-        bench = benchmark(df, h, signal)
+        bench = benchmark(bench_df, h, signal)
         ppy = max(1, int(round(252 / h)))
         sections = prepare(df, signal, h, ascending)
         bs = backtest.evaluate_returns(bench, periods_per_year=ppy)
