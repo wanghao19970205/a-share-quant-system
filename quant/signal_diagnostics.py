@@ -49,31 +49,33 @@ def _buyable(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["buyable_close"].fillna(False).astype(bool)]
 
 
-def restrict_vol_band(df: pd.DataFrame, lo: float, hi: float) -> pd.DataFrame:
+def restrict_vol_band(df: pd.DataFrame, lo: float, hi: float,
+                      col: str = "vol_60") -> pd.DataFrame:
     """把样本限制在波动率分位带 ``(lo, hi]`` 内（分位按日度截面升序排名）。
 
     动机：全池 rank IC 被高波动段污染——分桶实测最高波动 20% 的年化超额是 -27%、
     t=-9.8，模型只要沾上这一段，IC 就被这段的噪声压平。这里回答的是"把高波动段
     先剔掉之后，模型在剩下的池子里还有没有信号"。
 
+    默认取 ``vol_60``：窗口扫描实测 60 日排名最稳，10 日排名自身的抖动就是噪声源。
     波动率复用 ``lowfreq_backtest`` 的特征缓存；缓存缺失直接报错，不静默跳过过滤。
     """
     cache = Path(config.QUANT_DIR) / lowfreq_backtest.FEATURE_CACHE
     if not cache.exists():
         raise SystemExit(f"缺少波动率特征缓存 {cache}；先跑一次 quant.lowfreq_backtest 生成")
-    vol = pd.read_parquet(cache, columns=["code", "date", "vol_10"])
+    vol = pd.read_parquet(cache, columns=["code", "date", col])
     vol["code"] = vol["code"].astype(str).str.zfill(6)
     vol["date"] = pd.to_datetime(vol["date"], errors="coerce")
     out = df.merge(vol.drop_duplicates(["code", "date"]), on=["code", "date"], how="left")
-    missing = float(out["vol_10"].isna().mean())
-    out = out.dropna(subset=["vol_10"])
-    q = out.groupby("date")["vol_10"].rank(pct=True, ascending=True)
+    missing = float(out[col].isna().mean())
+    out = out.dropna(subset=[col])
+    q = out.groupby("date")[col].rank(pct=True, ascending=True)
     kept = out[(q > lo) & (q <= hi)]
-    print(f"[diag] vol_band=({lo:.2f},{hi:.2f}] rows {len(df)} -> {len(kept)} "
+    print(f"[diag] vol_band={col}({lo:.2f},{hi:.2f}] rows {len(df)} -> {len(kept)} "
           f"（波动率缺失剔除比例={missing:.4f}）", flush=True)
     if kept.empty:
         raise SystemExit("波动率带内没有样本，检查带宽或特征缓存覆盖范围")
-    return kept.drop(columns=["vol_10"])
+    return kept.drop(columns=[col])
 
 
 def ic_table(df: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
@@ -169,6 +171,8 @@ def main() -> None:
                     help="单边往返成本，默认取 backtest.bt_cost_roundtrip()")
     ap.add_argument("--vol-band", default=None,
                     help="先把样本限制在波动率分位带内再做诊断，如 0.20-0.60")
+    ap.add_argument("--vol-band-col", default="vol_60",
+                    help="波动率带用哪一列，默认 vol_60")
     args = ap.parse_args()
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
@@ -181,7 +185,7 @@ def main() -> None:
     df = _join_tradability(pred, horizons)
     if args.vol_band:
         lo, hi = lowfreq_backtest.parse_band(args.vol_band)
-        df = restrict_vol_band(df, lo, hi)
+        df = restrict_vol_band(df, lo, hi, col=args.vol_band_col)
     buyable_rate = float(df["buyable_close"].fillna(False).astype(bool).mean())
     print(f"[diag] buyable_close_rate={buyable_rate:.4f}", flush=True)
 
