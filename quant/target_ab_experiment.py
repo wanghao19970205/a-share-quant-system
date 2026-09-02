@@ -166,7 +166,20 @@ def main() -> None:
     ap.add_argument("--top-n", type=int, default=2, help="统一评测的 top_n")
     ap.add_argument("--skip-preflight", action="store_true", help="跳过 /proc 自检（仅调试）")
     ap.add_argument("--eval-only", action="store_true", help="跳过训练，直接对已有产物评测")
+    ap.add_argument("--modes", default=",".join(MODES),
+                    help="只跑指定腿，逗号分隔；默认四腿全跑")
+    ap.add_argument("--tag", default="",
+                    help="产物前缀后缀，用于与已有短样本产物并存，如 full")
     args = ap.parse_args()
+
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    unknown = [m for m in modes if m not in MODES]
+    if unknown:
+        raise SystemExit(f"未知腿 {unknown}，可选 {MODES}")
+
+    def _prefix(mode: str) -> str:
+        base = f"ab_{mode.replace('-', '_')}"
+        return f"{base}_{args.tag}" if args.tag else base
 
     cost = backtest.bt_cost_roundtrip()
     print(f"== A/B 实验 · cost_roundtrip={cost} · recent_windows={args.recent_windows} "
@@ -177,8 +190,8 @@ def main() -> None:
 
     cache_root = _quant_dir() / "window_cache"
     if not args.eval_only:
-        for mode in MODES:
-            prefix = f"ab_{mode.replace('-', '_')}"
+        for mode in modes:
+            prefix = _prefix(mode)
             cache_dir = cache_root / prefix
             pred_file = _quant_dir() / f"{_pred_path_name(prefix)}.parquet"
             if pred_file.exists():
@@ -193,14 +206,15 @@ def main() -> None:
 
     print("\n== 统一可交易评测（四腿同尺：filter_untradable=1, cost, top_n）==", flush=True)
     rows = []
-    for mode in MODES:
-        prefix = f"ab_{mode.replace('-', '_')}"
+    for mode in modes:
+        prefix = _prefix(mode)
         res = _evaluate_leg(prefix, cost, args.top_n)
         res["mode"] = mode
         rows.append(res)
     table = pd.DataFrame(rows)
-    cols = ["mode", "sharpe", "annual_return", "max_drawdown", "win_rate", "monthly_win_rate", "periods"]
-    cols = [c for c in cols if c in table.columns] + [c for c in table.columns if c not in cols and c != "prefix"]
+    cols = ["mode", "prefix", "sharpe", "annual_return", "max_drawdown", "win_rate",
+            "monthly_win_rate", "periods"]
+    cols = [c for c in cols if c in table.columns] + [c for c in table.columns if c not in cols]
     with pd.option_context("display.width", 200, "display.max_columns", 20):
         print(table[cols].to_string(index=False), flush=True)
     print("\n判读：baseline 是控制组；某变体 sharpe/月胜率显著高于 baseline 才值得考虑升级冠军"
