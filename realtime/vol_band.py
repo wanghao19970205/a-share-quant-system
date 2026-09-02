@@ -54,15 +54,29 @@ def universe(path: Optional[str] = None) -> list[str]:
 
 
 def _vol_of(px, window: int) -> Optional[float]:
-    """尾部 window 段日收益率的标准差；有效观测不足则返回 None。"""
-    closes = px["close"].astype(float)
-    closes = closes[closes > 0]
-    if len(closes) < VOL_MIN_PERIODS + 1:
+    """尾部 window 段日收益率的标准差，口径与 ``quant.lowfreq_backtest._price_features``
+    逐行对齐：先按日期排序、丢掉无效收盘，再 ``pct_change().rolling(window,
+    min_periods=VOL_MIN_PERIODS).std()`` 取最后一个值。
+
+    不要"先筛正收盘再算收益"这类看似更稳的写法——那会把停牌/异常价前后的样本拼到
+    一起，算出研究口径里不存在的收益，实测会让个别标的的分位偏离 0.8 以上。
+    """
+    try:
+        import pandas as pd
+    except Exception:  # noqa: BLE001
         return None
-    rets = closes.pct_change().dropna().tail(window)
-    if len(rets) < VOL_MIN_PERIODS:
+    px = px.copy()
+    px["date"] = pd.to_datetime(px["date"], errors="coerce")
+    px["close"] = pd.to_numeric(px["close"], errors="coerce")
+    px = px.dropna(subset=["date", "close"]).sort_values("date")
+    if len(px) < 30:
         return None
-    sd = float(rets.std(ddof=1))
+    sd = px["close"].pct_change().rolling(
+        window, min_periods=VOL_MIN_PERIODS).std().iloc[-1]
+    try:
+        sd = float(sd)
+    except (TypeError, ValueError):
+        return None
     if sd != sd or sd <= 0:      # NaN 或退化
         return None
     return sd
@@ -88,8 +102,7 @@ def volatility(codes: list[str], window: int = VOL_WINDOW) -> dict[str, float]:
             continue
         if px is None or px.empty or "close" not in px.columns:
             continue
-        px = px.dropna(subset=["close"]).tail(_TAIL_ROWS)
-        sd = _vol_of(px, window)
+        sd = _vol_of(px.tail(_TAIL_ROWS), window)
         if sd is not None:
             out[code] = sd
     return out
