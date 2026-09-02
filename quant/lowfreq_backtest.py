@@ -456,12 +456,18 @@ def main() -> None:
     rows = []
     yearly: list[tuple[str, pd.DataFrame]] = []
     for h in horizons:
-        # 网格由策略侧决定，基准跟随；基准缺日期说明全池反而比选股池少，属数据异常。
+        # 网格由策略侧决定，基准跟随。基准可以缺最尾部的日期——那些日子还没有前向
+        # 收益，策略同样交易不了；但缺在中间就是真错位（换排序信号时踩过），必须拦住。
         grid = rebalance_grid(df, signal, h)
         bench = benchmark(bench_df, h, grid)
-        missing = len(grid) - len(bench)
-        if missing > 0:
-            raise SystemExit(f"h={h} 基准缺 {missing} 个调仓日，无法对齐超额")
+        if bench.empty:
+            raise SystemExit(f"h={h} 基准为空，检查 buyable_close 与前向收益列")
+        gap = sorted(d for d in grid if d not in set(bench.index))
+        if gap and min(gap) < bench.index.max():
+            raise SystemExit(f"h={h} 基准在 {min(gap)} 等 {len(gap)} 个调仓日缺失且不在尾部，"
+                             f"超额无法对齐")
+        if gap:
+            print(f"[lowfreq] h={h} 尾部 {len(gap)} 个调仓日无前向收益，已剔除", flush=True)
         ppy = max(1, int(round(252 / h)))
         sections = prepare(df, signal, h, ascending)
         bs = backtest.evaluate_returns(bench, periods_per_year=ppy)
