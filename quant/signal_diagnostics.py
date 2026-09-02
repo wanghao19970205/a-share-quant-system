@@ -24,9 +24,13 @@ DEFAULT_MODEL = "ridge_lightgbm_ranker_ensemble"
 
 
 def _load_predictions(prefix: str, model: str) -> pd.DataFrame:
-    df = warehouse.load(f"{prefix}_bt_{model}_predictions")
+    # 生产在用的 active_quant_predictions 不带 _bt_{model} 中缀，允许直接给全名。
+    for name in (f"{prefix}_bt_{model}_predictions", prefix):
+        df = warehouse.load(name)
+        if not df.empty:
+            break
     if df.empty:
-        raise SystemExit(f"没有预测文件：{prefix}_bt_{model}_predictions.parquet")
+        raise SystemExit(f"没有预测文件：{prefix}_bt_{model}_predictions.parquet 或 {prefix}.parquet")
     df = df.copy()
     df["code"] = df["code"].astype(str).str.zfill(6)
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
