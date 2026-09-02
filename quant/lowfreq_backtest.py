@@ -262,12 +262,15 @@ def simulate(sections: list[tuple], target_n: int, entry_q: float, exit_q: float
     return pd.DataFrame(rows)
 
 
-def benchmark(df: pd.DataFrame, h: int, signal: str) -> pd.Series:
-    """同调仓日网格上的全可买样本等权收益，作为超额基准。"""
+def benchmark(df: pd.DataFrame, h: int, grid: set) -> pd.Series:
+    """给定调仓日网格上的全可买样本等权收益，作为超额基准。
+
+    网格必须由策略侧传入而不是在这里另算一遍：股票池被波动率带收窄后，策略的
+    有效日期会比全池少（早期 vol_60 尚未成形），各自算网格就会错位到无法相减。
+    """
     ret_col = f"tradable_ret_{h}d"
     pool = df[df["buyable_close"]].dropna(subset=[ret_col])
-    rb = rebalance_grid(df, signal, h)
-    return pool[pool["date"].isin(rb)].groupby("date")[ret_col].mean()
+    return pool[pool["date"].isin(grid)].groupby("date")[ret_col].mean()
 
 
 def excess_series(r: pd.DataFrame, bench: pd.Series) -> pd.Series:
@@ -453,12 +456,12 @@ def main() -> None:
     rows = []
     yearly: list[tuple[str, pd.DataFrame]] = []
     for h in horizons:
-        # 策略与基准必须落在同一网格上，否则超额是两条不同时间轴相减（曾经踩过）。
-        g_sig, g_bench = rebalance_grid(df, signal, h), rebalance_grid(bench_df, signal, h)
-        if g_sig != g_bench:
-            raise SystemExit(f"h={h} 策略与基准调仓日网格不一致："
-                             f"{len(g_sig)} vs {len(g_bench)}，超额无法对齐")
-        bench = benchmark(bench_df, h, signal)
+        # 网格由策略侧决定，基准跟随；基准缺日期说明全池反而比选股池少，属数据异常。
+        grid = rebalance_grid(df, signal, h)
+        bench = benchmark(bench_df, h, grid)
+        missing = len(grid) - len(bench)
+        if missing > 0:
+            raise SystemExit(f"h={h} 基准缺 {missing} 个调仓日，无法对齐超额")
         ppy = max(1, int(round(252 / h)))
         sections = prepare(df, signal, h, ascending)
         bs = backtest.evaluate_returns(bench, periods_per_year=ppy)
