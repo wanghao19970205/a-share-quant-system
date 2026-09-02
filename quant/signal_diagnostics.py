@@ -173,6 +173,8 @@ def main() -> None:
                     help="先把样本限制在波动率分位带内再做诊断，如 0.20-0.60")
     ap.add_argument("--vol-band-col", default="vol_60",
                     help="波动率带用哪一列，默认 vol_60")
+    ap.add_argument("--start", default=None, help="只用该日期起的预测，如 2025-03-17")
+    ap.add_argument("--end", default=None, help="只用该日期止的预测")
     args = ap.parse_args()
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
@@ -180,6 +182,18 @@ def main() -> None:
     cost = args.cost if args.cost is not None else backtest.bt_cost_roundtrip()
 
     pred = _load_predictions(args.prefix, args.model)
+    if args.start or args.end:
+        # 对齐两份预测的日期区间：口径差异与样本长度差异必须分开看，
+        # 否则"新口径没有反向"可能只是样本短到测不出来。
+        n0 = len(pred)
+        if args.start:
+            pred = pred[pred["date"] >= pd.Timestamp(args.start)]
+        if args.end:
+            pred = pred[pred["date"] <= pd.Timestamp(args.end)]
+        if pred.empty:
+            raise SystemExit(f"日期区间 {args.start}..{args.end} 内没有预测样本")
+        print(f"[diag] 日期区间 {args.start or '-'}..{args.end or '-'} "
+              f"rows {n0} -> {len(pred)}", flush=True)
     print(f"[diag] prefix={args.prefix} rows={len(pred)} dates={pred['date'].nunique()} "
           f"cost={cost}", flush=True)
     df = _join_tradability(pred, horizons)
