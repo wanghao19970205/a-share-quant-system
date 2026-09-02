@@ -168,6 +168,29 @@ def rebalance_grid(df: pd.DataFrame, signal: str, h: int) -> set:
     return set(dates[::h])
 
 
+def combo_signal(df: pd.DataFrame, specs: list[str], sig_map: dict) -> pd.DataFrame:
+    """把多个信号折成一条复合分位分数，写入 ``_combo`` 列（越小越优）。
+
+    各信号先按自身方向转成日度截面分位再等权平均。用复合分数而不是"波动率带做池
+    过滤 + 池内另排序"的两层结构：实测两层约束会互相打架——标的漂出池子被迫换手，
+    换手从 0.024 涨到 0.099，把 gross 的增益全部吃掉。复合分数只有一条排名，
+    缓冲带因此仍然有效。
+
+    ``!`` 前缀表示反向使用该信号，例如 ``!pred``。任一分量缺失即整体缺失（fail-closed）。
+    """
+    parts = []
+    for key in specs:
+        rev = key.startswith("!")
+        col, asc = sig_map[key.lstrip("!")]
+        if col not in df.columns:
+            raise SystemExit(f"复合信号缺少列 {col}")
+        parts.append(df.groupby("date")[col].rank(pct=True, ascending=asc != rev))
+    out = df.copy()
+    out["_combo"] = sum(parts) / len(parts)
+    print(f"[lowfreq] combo={specs} 有效行={int(out['_combo'].notna().sum())}", flush=True)
+    return out
+
+
 def prepare(df: pd.DataFrame, signal: str, h: int,
             ascending: bool = True) -> list[tuple]:
     """预计算各调仓日的截面，输出按日期升序的 ``(date, ids, q, buyable, ret)`` 列表。
@@ -414,6 +437,9 @@ def main() -> None:
                     help="波动率带用哪一列做池过滤，默认 vol_10")
     ap.add_argument("--max-out-frac", type=float, default=None,
                     help="每期主动卖出上限占 target_n 的比例，如 0.05；不给则不限制")
+    ap.add_argument("--combo", default=None,
+                    help="复合信号，逗号分隔的 --signal 取值，! 前缀表示反向，"
+                         "如 low_vol60,!pred；给了它就忽略 --signal")
     args = ap.parse_args()
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
@@ -427,18 +453,27 @@ def main() -> None:
                "low_vol120": ("vol_120", True),
                "low_turnover": ("dollar_vol_20", True), "mom": ("mom_20", False),
                "pred": ("pred", False)}
+    combo = [s.strip() for s in args.combo.split(",") if s.strip()] if args.combo else []
+    unknown = [s for s in combo if s.lstrip("!") not in sig_map]
+    if unknown:
+        raise SystemExit(f"复合信号里有未知分量 {unknown}，可选 {sorted(sig_map)}")
     signal, ascending = sig_map[args.signal]
     if args.reverse:
         ascending = not ascending
-    if args.signal == "pred" and not args.pred_prefix:
-        raise SystemExit("--signal pred 需要同时给 --pred-prefix")
+    needs_pred = args.signal == "pred" or any(s.lstrip("!") == "pred" for s in combo)
+    if needs_pred and not args.pred_prefix:
+        raise SystemExit("用到 pred 时需要同时给 --pred-prefix")
 
     need = {signal} | ({args.vol_band_col} if args.vol_band else set())
+    need |= {sig_map[s.lstrip("!")][0] for s in combo}
     codes = _universe(args.universe)
     df = build_frame(codes, horizons, refresh=args.refresh,
                      need_cols=tuple(c for c in sorted(need) if c != "pred"))
     if args.pred_prefix:
         df = join_predictions(df, args.pred_prefix, args.pred_model)
+    if combo:
+        df = combo_signal(df, combo, sig_map)
+        signal, ascending = "_combo", True
     # 基准始终是全可买池，只有选股池被波动率带收窄；两者共用同一调仓日网格。
     bench_df = df
     if args.vol_band:
