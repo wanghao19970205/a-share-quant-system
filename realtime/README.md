@@ -191,6 +191,7 @@ REALTIME_PAPER_VWAP_BREAK=0.02
 | **V3** | `ask1 / bid1` | 当日预测、新鲜度、盘口确认 + 风险预算 | 入场锁定ATR、硬止损/止盈/移动止盈、T+N | `_v3` |
 | **V4** | `ask1 / bid1` | V3 + 精确主行业ETF弱势与集中度控制 | 完整继承V3，暂不叠加板块卖出 | `_v4` |
 | **V5** | `ask1 / bid1` | V4 + 行业相对强度动态仓位 | 完整继承V4，只改变风险预算 | `_v5` |
+| **V7** | `ask1 / bid1` | 不看模型：60日波动率分位带 `(0.30,0.40]` + 等权 | 只有跌出 `(0.20,0.70]` 才卖，无止损/止盈/ATR/T+N | `_v7` |
 
 五个账户共享模型候选池、交易成本和二阶段买入：14:50 执行 `primary`，仅未成交账户在 14:53 执行 `retry`，14:55 后关闭；阶段状态跨重启持久化且分别形成审计。仓位取剩余名额均分、ATR 单笔风险额度和单票净值上限的最小值，融合预期收益只做 0.75-1.25 倍有限调整，缺 ATR 时退回固定止损口径。任一版本装配或交易异常均独立降级，不影响其他版本。
 
@@ -307,6 +308,29 @@ REALTIME_PAPER_V5_SECTOR_STRONG_FACTOR=1.15
 
 V1-V5 的持仓都由 `config.paper_state_files()` 纳入保护性订阅和热重载。V4/V5 赛马应重点比较成本后收益、最大回撤，以及 strong/neutral/lagging 三组实际兑现收益，不能仅按绝对净值晋级。
 
+## 8.5 V7 赛马账户（等权低波动带，不用模型）
+
+`realtime/v7.py` 的 `V7PaperTrader` 是与 V1-V6 取向相反的对照组：不读模型预测，只按 `realtime/vol_band.py` 算出的 60 日波动率日度截面分位进出，等权持有 20 只，除分位带外没有任何出场规则。研究口径（2057 个交易日、往返成本 0.004）对全可买等权基准年化超额 +16.07%（t=10.86），留出期 +15.08%（t=6.50），日均换手 0.033。
+
+```text
+进场：分位落在 (0.30, 0.40]，按分位升序取，等权（净值/20 每只，整手向下取整）
+出场：分位跌出 (0.20, 0.70] → vol_band_exit；分位取不到时继续持有
+不叠加：硬止损、止盈、ATR 出场、VWAP 破位、T+N 到期——任何额外出场都会把换手推高，
+        那就不是被验证过的那条策略了
+```
+
+```text
+REALTIME_PAPER_V7=true
+REALTIME_PAPER_V7_POSITIONS=20
+REALTIME_PAPER_V7_ENTRY_LO=0.30
+REALTIME_PAPER_V7_ENTRY_HI=0.40
+REALTIME_PAPER_V7_EXIT_LO=0.20
+REALTIME_PAPER_V7_EXIT_HI=0.70
+REALTIME_PAPER_V7_SUBSCRIBE_N=40
+```
+
+订阅是 V7 唯一影响其他账户的地方：带内约占全池 10%（数百只），不可能全部订阅。`watchlist._read_vol_band()` 只取带内分位最低的 `REALTIME_PAPER_V7_SUBSCRIBE_N` 只（与研究的选股规则一致，不引入额外选择偏差），并使用 `max_subscribe` 之外的独立配额，因此 V1-V6 的候选名额一只不减，代价是行情订阅总数增加约 40 只——2 MB 带宽上限下需要在首日核对 `recv` 与报价新鲜度。持仓照旧由 `config.paper_state_files()` 纳入保护性订阅。
+
 ## 9. 持久化与决策审计
 
 所有文件位于 `logs/realtime/` 挂载盘，容器重建后保留：
@@ -322,6 +346,7 @@ V1-V5 的持仓都由 `config.paper_state_files()` 纳入保护性订阅和热�
 | `paper_*_v3.json(l)` | V3 可成交报价与 ATR 规则账户的同名独立副本 |
 | `paper_*_v4.json(l)` | V4 行业ETF弱势回避账户的同名独立副本 |
 | `paper_*_v5.json(l)` | V5 行业相对强度动态仓位账户的同名独立副本 |
+| `paper_*_v7.json(l)` | V7 等权低波动带账户的同名独立副本 |
 | `signals_YYYYMMDD.jsonl` | 实时信号账本（含ETF强弱状态切换） |
 | `engine.YYYYMMDD.log` | 引擎运行日志 |
 
@@ -411,7 +436,7 @@ docker compose exec -T scheduler python -c "from realtime.config import load; c=
 
 `paper_state_v3.json`、`paper_state_v4.json` 和 `paper_state_v5.json` 在首次买入决策保存时才创建；仅在部署后、买入窗口前不存在不代表故障。排查零成交优先运行 `./restart.sh diag`，再查看对应版本决策事件，不应只检查成交流水。
 
-当前虚拟数据流回归为 **126 PASS / 0 FAIL**，覆盖模型池封闭、重排有界、要求有效实时价且排除封涨停票的行业/概念 Top5 Push、绕过行情 SDK stop 的安全热重载、A 股 T+1、五级卖出、保护性订阅、融合预期成本安全边际门、二阶段买入及跨重启恢复、决策 trace 和反事实幂等补齐；V1-V5 的 ATR 风险预算、融合收益有限加权和整手约束；V4 行业集中度；V5 strong/neutral/lagging 动态仓位、缺行情降级、独立账户和保护性订阅；四版基线同场买卖完整生命周期；NaN/Inf、全模型异常、无效盘口、损坏状态文件故障注入；以及 realtime-only 滚动约束、未兑现日期排除、进化权重目标诊断、40 日 OOS、4 worker 确定性、自动晋级、损坏回退、幂等执行和 10 日前向回滚。
+当前虚拟数据流回归为 **140 PASS / 0 FAIL**，覆盖模型池封闭、重排有界、要求有效实时价且排除封涨停票的行业/概念 Top5 Push、绕过行情 SDK stop 的安全热重载、A 股 T+1、五级卖出、保护性订阅、融合预期成本安全边际门、二阶段买入及跨重启恢复、决策 trace 和反事实幂等补齐；V1-V5 的 ATR 风险预算、融合收益有限加权和整手约束；V4 行业集中度；V5 strong/neutral/lagging 动态仓位、缺行情降级、独立账户和保护性订阅；四版基线同场买卖完整生命周期；NaN/Inf、全模型异常、无效盘口、损坏状态文件故障注入；以及 realtime-only 滚动约束、未兑现日期排除、进化权重目标诊断、40 日 OOS、4 worker 确定性、自动晋级、损坏回退、幂等执行和 10 日前向回滚；V7 的带内升序建仓、等权整手、跌出出带才卖（含"分位取不到即继续持有"）、T+1、独立账户文件和独立订阅配额。
 
 ## 11. 部署纪律
 

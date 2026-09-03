@@ -403,5 +403,5 @@ class V3PaperTrader(V2PaperTrader):
         self._append_trade(trade_rec)
         self._notifier.push(
             f"[{self._PAPER_TITLE}] 卖出 {self._label(pos['code'])} @{px:.2f} "
-            f"{_EXIT_LABEL_V3.get(reason, reason)}",
+            f"{self._exit_label(reason)}",
             self._sell_notice(pos, px, held, pnl, ret, reason, proceeds))
