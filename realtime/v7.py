@@ -37,7 +37,6 @@ from .v3 import V3PaperTrader
 
 _EXIT_LABEL_V7 = {"vol_band_exit": "跌出波动率分位带"}
 
-
 class V7PaperTrader(V3PaperTrader):
     _FILE_SUFFIX = "_v7"
     _VERSION = 7
@@ -45,36 +44,46 @@ class V7PaperTrader(V3PaperTrader):
     _EVENT_ID_PREFIX = "paper-buy-decision-v7"
     _POSITION_ID_PREFIX = "paper-pos-v7"
     _PAPER_TITLE = "模拟盘V7"
+    _METRIC = "vol60"
+    _CFG_PREFIX = "paper_v7"
+    _BAND_DEFAULTS = (0.30, 0.40, 0.20, 0.70)
+    _EXIT_TEXT = _EXIT_LABEL_V7["vol_band_exit"]
 
     def __init__(self, cfg, ctx, notifier, *args, **kwargs):
         super().__init__(cfg, ctx, notifier, *args, **kwargs)
-        self._entry_lo = float(getattr(cfg, "paper_v7_entry_lo", 0.30))
-        self._entry_hi = float(getattr(cfg, "paper_v7_entry_hi", 0.40))
-        self._exit_lo = float(getattr(cfg, "paper_v7_exit_lo", 0.20))
-        self._exit_hi = float(getattr(cfg, "paper_v7_exit_hi", 0.70))
-        self._target_positions = max(1, int(getattr(cfg, "paper_v7_positions", 20)))
+        d_elo, d_ehi, d_xlo, d_xhi = self._BAND_DEFAULTS
+        p = self._CFG_PREFIX
+        self._entry_lo = float(getattr(cfg, f"{p}_entry_lo", d_elo))
+        self._entry_hi = float(getattr(cfg, f"{p}_entry_hi", d_ehi))
+        self._exit_lo = float(getattr(cfg, f"{p}_exit_lo", d_xlo))
+        self._exit_hi = float(getattr(cfg, f"{p}_exit_hi", d_xhi))
+        self._target_positions = max(1, int(getattr(cfg, f"{p}_positions", 20)))
         if not (self._exit_lo <= self._entry_lo < self._entry_hi <= self._exit_hi):
             raise ValueError(
-                f"V7 分位带非法：进 ({self._entry_lo},{self._entry_hi}] "
+                f"{self._PAPER_TITLE} 分位带非法：进 ({self._entry_lo},{self._entry_hi}] "
                 f"必须被出 ({self._exit_lo},{self._exit_hi}] 包住")
         # V7 自己管持仓上限，不沿用 paper_max_positions（那是给 4 只票的账户设的）。
         self._max_positions = self._target_positions
 
     def _prefix(self) -> str:
-        return "[paper_v7]"
+        return f"[paper_v{self._VERSION}]"
 
     # ---------- 选股池 ----------
 
     def _ranks(self) -> dict:
-        """今天的波动率分位表；取不到就返回空，由调用方按"不动"处理。"""
+        """今天的分位表；取不到就返回空，由调用方按"不动"处理。"""
         try:
-            return vol_band.rank_pct(cache_dir=getattr(self._cfg, "ledger_dir", None))
+            return vol_band.rank_pct(metric=self._METRIC,
+                                     cache_dir=getattr(self._cfg, "ledger_dir", None))
         except Exception as e:  # noqa: BLE001 - 选股池算不出来不该拖垮引擎
-            print(f"{self._prefix()} 波动率分位不可用: {type(e).__name__}: {e}", flush=True)
+            print(f"{self._prefix()} 分位表不可用({self._METRIC}): "
+                  f"{type(e).__name__}: {e}", flush=True)
             return {}
 
     def _exit_label(self, reason: str) -> str:
-        return _EXIT_LABEL_V7.get(reason, super()._exit_label(reason))
+        if reason == "vol_band_exit":
+            return self._EXIT_TEXT
+        return super()._exit_label(reason)
 
     # ---------- 出场 ----------
 
@@ -142,7 +151,7 @@ class V7PaperTrader(V3PaperTrader):
             return
         ranks = self._ranks()
         if not ranks:
-            print(f"{self._prefix()} 波动率分位为空，本轮不买入", flush=True)
+            print(f"{self._prefix()} 分位表为空({self._METRIC})，本轮不买入", flush=True)
             return
         held_codes = {_digits(p["code"]) for p in positions}
         account_before = {
@@ -161,6 +170,7 @@ class V7PaperTrader(V3PaperTrader):
             if len(bought) >= free_slots:
                 break
             audit = {"code": code, "status": "eligible_ranked",
+                     "metric": self._METRIC, "rank_pct": round(float(q), 4),
                      "vol_rank_pct": round(float(q), 4)}
             trace.append(audit)
             skip, quote = self._v7_entry_skip(code)
@@ -190,7 +200,11 @@ class V7PaperTrader(V3PaperTrader):
                 "peak": round(fill_price, 3),
                 "peak_bid": round(quote["bid"] or fill_price, 3),
                 "cost_basis": round(cost_basis, 2),
-                "entry_vol_rank_pct": round(float(q), 4),
+                "entry_rank_pct": round(float(q), 4), "entry_metric": self._METRIC,
+                # V7 上线首日的 20 条持仓写的是旧字段名，vol60 这条腿继续同时写一份，
+                # 免得同一个账户的历史记录要按日期分两种口径读。
+                **({"entry_vol_rank_pct": round(float(q), 4)}
+                   if self._METRIC == "vol60" else {}),
                 "buy_quote_age_sec": quote["age"], "buy_fill_source": "ask1",
                 "buy_ask_volume1_raw": quote["ask_volume1"],
                 # V3 起 _price_of 返回 bid1，取"最新价"必须显式走基类实现，

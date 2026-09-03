@@ -289,6 +289,23 @@ class RealtimeConfig:
     paper_v7_subscribe_n: int = field(default_factory=lambda: max(
         0, _env_int("REALTIME_PAPER_V7_SUBSCRIBE_N", 40)))
 
+    # ---- V8 模拟盘（等权低成交额带，机制同 V7 只换指标）--------------------
+    # 与 V7 持仓几乎不重合（候选 Jaccard 0.0032、超额相关 0.174），开成独立账户
+    # 才能前向验证这条腿是否真的独立。带边界与风险见 realtime/v8.py。
+    paper_v8_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_V8", True))
+    paper_v8_positions: int = field(default_factory=lambda: max(
+        1, _env_int("REALTIME_PAPER_V8_POSITIONS", 20)))
+    paper_v8_entry_lo: float = field(default_factory=lambda: _env_float(
+        "REALTIME_PAPER_V8_ENTRY_LO", 0.10))
+    paper_v8_entry_hi: float = field(default_factory=lambda: _env_float(
+        "REALTIME_PAPER_V8_ENTRY_HI", 0.20))
+    paper_v8_exit_lo: float = field(default_factory=lambda: _env_float(
+        "REALTIME_PAPER_V8_EXIT_LO", 0.05))
+    paper_v8_exit_hi: float = field(default_factory=lambda: _env_float(
+        "REALTIME_PAPER_V8_EXIT_HI", 0.50))
+    paper_v8_subscribe_n: int = field(default_factory=lambda: max(
+        0, _env_int("REALTIME_PAPER_V8_SUBSCRIBE_N", 40)))
+
     # ---- 同量纲预期收益融合 + 历史校准 -------------------------------------
     # Ridge / ElasticNet / ExtraTrees 都直接回归 target_ret_{h}d，可融合为收益率；
     # LightGBM、IC 和 pred 是无量纲排序分，绝不进入收益融合。
@@ -402,6 +419,8 @@ class RealtimeConfig:
             files.append(base.parent / f"{base.stem}_v6{base.suffix}")
         if getattr(self, "paper_v7_enabled", False):
             files.append(base.parent / f"{base.stem}_v7{base.suffix}")
+        if getattr(self, "paper_v8_enabled", False):
+            files.append(base.parent / f"{base.stem}_v8{base.suffix}")
         return tuple(files)
 
 

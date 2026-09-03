@@ -37,6 +37,7 @@ from .v4 import V4PaperTrader
 from .v5 import V5PaperTrader
 from .v6 import V6PaperTrader
 from .v7 import V7PaperTrader
+from .v8 import V8PaperTrader
 from .rankboard import RankBoard
 from .sector_etf import SectorETFContext
 from .snapshot import Snapshot
@@ -72,6 +73,7 @@ class Engine:
         self._paper_v5 = None  # 实时模拟盘 V5（V4 + 行业相对强度动态仓位）
         self._paper_v6 = None  # 实时模拟盘 V6（V5 + 当前分钟入场择时）
         self._paper_v7 = None  # 实时模拟盘 V7（等权低波动带，不看模型）
+        self._paper_v8 = None  # 实时模拟盘 V8（等权低成交额带，不看模型）
         self._sector_ctx = SectorETFContext(self._cfg)
         self._sector_recv = 0
         self._feed: feed_mod.BaseFeed | None = None
@@ -262,6 +264,25 @@ class Engine:
         sys.stderr.flush()
         os.execv(sys.executable, [sys.executable, "-m", "realtime.engine"])
 
+    def _build_band_trader(self, cls, name_map, metric_label: str):
+        """装配一条分位带账户（V7/V8）。任一条装不起来都只降级自己，不影响其它账户。"""
+        try:
+            trader = cls(self._cfg, self._ctx, self._notifier, name_map)
+            ranks = vol_band.rank_pct(metric=cls._METRIC,
+                                      cache_dir=self._cfg.ledger_dir)
+            in_band = sum(1 for q in ranks.values()
+                          if trader._entry_lo < q <= trader._entry_hi)
+            print(f"[engine] {cls._PAPER_TITLE}就绪：{trader.summary()}，"
+                  f"等权{trader._target_positions}只 | "
+                  f"进带({trader._entry_lo:.2f},{trader._entry_hi:.2f}] "
+                  f"出带({trader._exit_lo:.2f},{trader._exit_hi:.2f}] | "
+                  f"{metric_label}截面{len(ranks)}只、带内{in_band}只", flush=True)
+            return trader
+        except Exception as e:  # noqa: BLE001 - 独立降级，不影响其它账户
+            print(f"[engine] {cls._PAPER_TITLE}装配失败(降级跳过，其它账户不受影响)："
+                  f"{type(e).__name__}: {e}", flush=True)
+            return None
+
     # ---- 主循环 --------------------------------------------------------------
     def run(self) -> None:
         self._install_signal_handlers()
@@ -370,21 +391,9 @@ class Engine:
                 print(f"[engine] 模拟盘V6装配失败(降级跳过，V1-V5 不受影响)："
                       f"{type(e).__name__}: {e}", flush=True)
         if getattr(self._cfg, "paper_v7_enabled", True):
-            try:
-                self._paper_v7 = V7PaperTrader(
-                    self._cfg, self._ctx, self._notifier, name_map)
-                ranks = vol_band.rank_pct(cache_dir=self._cfg.ledger_dir)
-                in_band = sum(1 for q in ranks.values()
-                              if self._paper_v7._entry_lo < q <= self._paper_v7._entry_hi)
-                print(f"[engine] 模拟盘V7就绪：{self._paper_v7.summary()}，"
-                      f"等权{self._paper_v7._target_positions}只 | "
-                      f"进带({self._paper_v7._entry_lo:.2f},{self._paper_v7._entry_hi:.2f}] "
-                      f"出带({self._paper_v7._exit_lo:.2f},{self._paper_v7._exit_hi:.2f}] | "
-                      f"波动率截面{len(ranks)}只、带内{in_band}只", flush=True)
-            except Exception as e:  # noqa: BLE001 - V7 独立降级，不影响 V1-V6
-                self._paper_v7 = None
-                print(f"[engine] 模拟盘V7装配失败(降级跳过，V1-V6 不受影响)："
-                      f"{type(e).__name__}: {e}", flush=True)
+            self._paper_v7 = self._build_band_trader(V7PaperTrader, name_map, "波动率")
+        if getattr(self._cfg, "paper_v8_enabled", True):
+            self._paper_v8 = self._build_band_trader(V8PaperTrader, name_map, "成交额")
         print(f"[engine] 启动实时层：股票 {len(codes)} 只 + 行业ETF/基准 "
               f"{len(sector_codes)} 只，同一会话共 {len(subscription_codes)} 只；"
               f"时段 {self._cfg.session_start}-{self._cfg.session_end}，"
@@ -444,6 +453,11 @@ class Engine:
                         self._paper_v7.maybe_trade(t)
                     except Exception as e:  # noqa: BLE001
                         print(f"[engine] 模拟盘V7交易异常: {type(e).__name__}", flush=True)
+                if self._paper_v8 is not None:
+                    try:
+                        self._paper_v8.maybe_trade(t)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[engine] 模拟盘V8交易异常: {type(e).__name__}", flush=True)
             else:
                 self._stop_feed("非交易时段/规避窗")
 
@@ -452,7 +466,7 @@ class Engine:
                 last_heartbeat = now
                 for trader in (self._paper, self._paper_v2, self._paper_v3,
                                self._paper_v4, self._paper_v5, self._paper_v6,
-                               self._paper_v7):
+                               self._paper_v7, self._paper_v8):
                     if trader is not None:
                         try:
                             trader.record_position_snapshot()
