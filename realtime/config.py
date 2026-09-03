@@ -271,6 +271,24 @@ class RealtimeConfig:
     paper_v6_minute_move_scale: float = field(default_factory=lambda: max(
         0.0005, _env_float("REALTIME_PAPER_V6_MINUTE_MOVE_SCALE", 0.006)))
 
+    # ---- V7 模拟盘（等权低波动带，不用模型）--------------------------------
+    # 带边界与持仓数的研究依据见 realtime/vol_band.py；改这些默认值等于换一条策略。
+    paper_v7_enabled: bool = field(default_factory=lambda: _env_bool("REALTIME_PAPER_V7", True))
+    paper_v7_positions: int = field(default_factory=lambda: max(
+        1, _env_int("REALTIME_PAPER_V7_POSITIONS", 20)))
+    paper_v7_entry_lo: float = field(default_factory=lambda: _env_float(
+        "REALTIME_PAPER_V7_ENTRY_LO", 0.30))
+    paper_v7_entry_hi: float = field(default_factory=lambda: _env_float(
+        "REALTIME_PAPER_V7_ENTRY_HI", 0.40))
+    paper_v7_exit_lo: float = field(default_factory=lambda: _env_float(
+        "REALTIME_PAPER_V7_EXIT_LO", 0.20))
+    paper_v7_exit_hi: float = field(default_factory=lambda: _env_float(
+        "REALTIME_PAPER_V7_EXIT_HI", 0.70))
+    # 带内约数百只，只订阅分位最低的这几只（与研究的"带内按分位升序取"一致）。
+    # 这是 max_subscribe 之外的独立配额，直接决定 V7 给行情带宽增加的量。
+    paper_v7_subscribe_n: int = field(default_factory=lambda: max(
+        0, _env_int("REALTIME_PAPER_V7_SUBSCRIBE_N", 40)))
+
     # ---- 同量纲预期收益融合 + 历史校准 -------------------------------------
     # Ridge / ElasticNet / ExtraTrees 都直接回归 target_ret_{h}d，可融合为收益率；
     # LightGBM、IC 和 pred 是无量纲排序分，绝不进入收益融合。
@@ -382,6 +400,8 @@ class RealtimeConfig:
             files.append(base.parent / f"{base.stem}_v5{base.suffix}")
         if getattr(self, "paper_v6_enabled", False):
             files.append(base.parent / f"{base.stem}_v6{base.suffix}")
+        if getattr(self, "paper_v7_enabled", False):
+            files.append(base.parent / f"{base.stem}_v7{base.suffix}")
         return tuple(files)
 
 

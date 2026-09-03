@@ -121,11 +121,36 @@ def _read_predictions(path: Path) -> list[str]:
     return [_norm(c) for c in df["code"].tolist()]
 
 
+def _read_vol_band(cfg: RealtimeConfig) -> list[str]:
+    """V7 的低波动带候选，按波动率分位升序取前 N 只；V7 未开或数据不足则为空。
+
+    只订阅带内分位最低的那几只，与研究里的选股规则完全一致（`simulate()` 在带内
+    按分位升序取 need 只），因此这个截断不引入研究之外的选择偏差。数量必须有界：
+    带内约占全池 10%（数百只），全订阅会打满行情带宽、连带影响 V1-V6 的报价新鲜度。
+    """
+    if not getattr(cfg, "paper_v7_enabled", False):
+        return []
+    quota = max(0, int(getattr(cfg, "paper_v7_subscribe_n", 40)))
+    if quota <= 0:
+        return []
+    try:
+        from . import vol_band
+        ranks = vol_band.rank_pct()
+    except Exception:  # noqa: BLE001 - 选股池算不出来不能阻断实时层启动
+        return []
+    lo = float(getattr(cfg, "paper_v7_entry_lo", 0.30))
+    hi = float(getattr(cfg, "paper_v7_entry_hi", 0.40))
+    band = sorted((q, _norm(c)) for c, q in ranks.items() if lo < q <= hi)
+    return [c for _, c in band[:quota]]
+
+
 def load_codes(cfg: RealtimeConfig) -> list[str]:
     """返回去重后的订阅代码列表（6 位）。
 
     模拟盘和人工持仓必须有实时价才能执行风控/卖出，因此优先于候选名单，不能在
     max_subscribe 截断时被挤掉。候选来源保持固定候选组 -> 预测 -> 兜底池的顺序。
+    V7 的低波动带候选走独立配额（见下方 limit），既不挤占 V1-V6 的候选名额，
+    也不会被模型候选挤掉。
     """
     ordered: list[str] = []
     seen: set[str] = set()
@@ -145,6 +170,9 @@ def load_codes(cfg: RealtimeConfig) -> list[str]:
     _extend(paper_positions)
     _extend(holdings)
     protected_count = len(ordered)
+    before_band = len(ordered)
+    _extend(_read_vol_band(cfg))
+    band_quota = len(ordered) - before_band
     _extend(candidates)
 
     # 固定候选快照缺失/为空：退回按预测分取 top，持仓仍保持最高优先级。
@@ -154,7 +182,8 @@ def load_codes(cfg: RealtimeConfig) -> list[str]:
     if not ordered:
         _extend(_read_lines(cfg.universe_file))
 
-    if cfg.max_subscribe and len(ordered) > cfg.max_subscribe:
-        safe_limit = max(int(cfg.max_subscribe), protected_count)
+    limit = int(cfg.max_subscribe) + band_quota if cfg.max_subscribe else 0
+    if limit and len(ordered) > limit:
+        safe_limit = max(limit, protected_count)
         ordered = ordered[:safe_limit]
     return ordered

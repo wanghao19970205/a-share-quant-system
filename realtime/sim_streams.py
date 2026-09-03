@@ -33,6 +33,8 @@ from realtime.v2 import V2PaperTrader
 from realtime.v3 import V3PaperTrader
 from realtime.v4 import V4PaperTrader
 from realtime.v5 import V5PaperTrader
+from realtime import v7 as v7_mod
+from realtime.v7 import V7PaperTrader
 from realtime.sector_etf import SectorETFContext
 from realtime.feed import subscription_code
 from realtime.reference import (RefRow, _load_expected_return,
@@ -1601,6 +1603,128 @@ def scenario_X():
           "预测热更新直接 exec 替换进程且不调用可能崩溃的行情 SDK stop")
 
 
+def _v7_position(code, *, buy_date="2020-01-02", buy_price=10.0, shares=400):
+    return {"position_id": f"paper-pos-v7-{code}", "code": code, "name": "",
+            "buy_date": buy_date, "buy_time": "14:50:00", "buy_price": buy_price,
+            "shares": shares, "peak": buy_price, "peak_bid": buy_price,
+            "cost_basis": buy_price * shares}
+
+
+def _v7_trader(ranks, *, positions=None, prices=None, snap_codes=None, **over):
+    """构造一个 V7 账户：ranks 即当日波动率分位表（同时被打桩进 vol_band），
+    快照按 snap_codes（缺省 ranks 全体）铺齐，价格缺省 10 元。"""
+    prices = prices or {}
+    codes = sorted(snap_codes if snap_codes is not None else ranks)
+    snaps = [mk_snap(c, prices.get(c, 10.0), pre_close=prices.get(c, 10.0),
+                     vwap=prices.get(c, 10.0)) for c in codes]
+    ctx = build_ctx({}, snaps)
+    v7_mod.vol_band.rank_pct = lambda *a, **k: dict(ranks)
+    trader = V7PaperTrader(new_cfg(**over), ctx, FakeNotifier())
+    trader._state["positions"] = [dict(p) for p in (positions or [])]
+    trader._now_hhmm = 1450
+    return trader
+
+
+def scenario_Y():
+    print("\n== Y. V7 等权低波动带账户（不看模型，只按波动率分位进出）==")
+    original = v7_mod.vol_band.rank_pct
+    try:
+        # 分位表：带内 3 只（0.31/0.33/0.35），带外一低一高，另有两只持仓分位。
+        ranks = {"000010": 0.31, "000020": 0.33, "000030": 0.35,
+                 "000040": 0.10, "000050": 0.50}
+        v7_mod.vol_band.rank_pct = lambda *a, **k: dict(ranks)
+
+        t = _v7_trader(ranks)
+        check(Path(t._state_file).name == "paper_state_v7.json" and
+              Path(t._trades_file).name == "paper_trades_v7.jsonl",
+              "V7 账户文件带 _v7 后缀，与 V1-V6 完全隔离")
+        t._run_buys()
+        held = [p["code"] for p in t._state["positions"]]
+        check(held == ["000010", "000020", "000030"],
+              "只买进带内标的、按分位升序建仓（带外 0.10/0.50 都不买）")
+        shares = {p["code"]: p["shares"] for p in t._state["positions"]}
+        check(len(set(shares.values())) == 1 and set(shares.values()) == {400},
+              f"等权建仓：10万/20只=5000元预算，每只整手 400 股（实际 {shares}）")
+        check(all(p.get("entry_vol_rank_pct") is not None and
+                  p.get("buy_last") is not None and p.get("buy_bid1") is not None and
+                  p.get("buy_ask1") is not None and
+                  p["buy_last"] != p["buy_bid1"]
+                  for p in t._state["positions"]),
+              "建仓记录入场分位与成交瞬间 last/bid1/ask1（last 走基类实现，不等于 bid1）")
+
+        # 当日买入 → T+1 不可卖，即使分位已跌出出带。
+        v7_mod.vol_band.rank_pct = lambda *a, **k: {c: 0.95 for c in ranks}
+        t._run_sells(1450)
+        check(len(t._state["positions"]) == 3,
+              "当日建仓的持仓分位跌出出带也不卖（A股 T+1 守住）")
+
+        # 历史持仓：分位仍在出带内 → 不卖，哪怕浮亏 -20%、已过 T+N。
+        v7_mod.vol_band.rank_pct = lambda *a, **k: dict(ranks)
+        t2 = _v7_trader(ranks, positions=[_v7_position("000050")],
+                        prices={"000050": 8.0})
+        t2._run_sells(1455)
+        check(len(t2._state["positions"]) == 1,
+              "分位 0.50 仍在出带 (0.20,0.70] 内：浮亏 -20% 且已过 T+1 也不卖"
+              "（无止损/无ATR/无 time_cap）")
+
+        # 历史持仓：分位跌出出带上沿 → 卖出，原因为 vol_band_exit。
+        t3 = _v7_trader({**ranks, "000050": 0.95},
+                        positions=[_v7_position("000050")])
+        t3._run_sells(1455)
+        check(len(t3._state["positions"]) == 0 and _last_exit(t3) == "vol_band_exit",
+              "分位升到 0.95 冲出出带上沿 → vol_band_exit 卖出")
+
+        # 分位低于出带下沿（波动过低、已不是同一批标的）→ 同样退出。
+        t4 = _v7_trader({**ranks, "000050": 0.05},
+                        positions=[_v7_position("000050")])
+        t4._run_sells(1455)
+        check(len(t4._state["positions"]) == 0 and _last_exit(t4) == "vol_band_exit",
+              "分位掉到 0.05 跌破出带下沿 → 同样按 vol_band_exit 退出")
+
+        # 分位表取不到：不买、也不卖（数据缺失不等于标的变差）。
+        t5 = _v7_trader(ranks, positions=[_v7_position("000050")])
+        v7_mod.vol_band.rank_pct = lambda *a, **k: {}
+        t5._run_buys()
+        t5._run_sells(1455)
+        check(len(t5._state["positions"]) == 1 and
+              t5._state["cash"] == t5._state["start_equity"],
+              "波动率分位不可用时既不建仓也不平仓（缺数据 → 原地不动）")
+
+        # 无行情快照的带内候选不成交（不虚构价格）。
+        t6 = _v7_trader({"000060": 0.32},
+                        snap_codes=[c for c, q in ranks.items() if q > 0.40])
+        t6._run_buys()
+        check(not t6._state["positions"],
+              "带内候选无快照/无买卖一价时不成交，不虚构成交价")
+
+        # 订阅配额：带内候选走独立额度，既不挤占 V1-V6 的候选名额，也不被其挤掉。
+        cfg_sub = new_cfg()
+        sub_root = Path(cfg_sub.ledger_dir)
+        cfg_sub.paper_v7_enabled = True
+        cfg_sub.paper_v7_entry_lo = 0.30
+        cfg_sub.paper_v7_entry_hi = 0.40
+        cfg_sub.paper_v7_subscribe_n = 3
+        cfg_sub.max_subscribe = 4
+        cfg_sub.mobile_snapshot_file = sub_root / "mobile.json"
+        cfg_sub.predictions_file = sub_root / "missing.parquet"
+        cfg_sub.holdings_file = sub_root / "missing.txt"
+        cfg_sub.universe_file = sub_root / "missing_universe.txt"
+        model_codes = ["600001", "600002", "600003", "600004"]
+        cfg_sub.mobile_snapshot_file.write_text(json.dumps(
+            {"groups": {"全A": {"rows": [{"code": c} for c in model_codes]}}}),
+            encoding="utf-8")
+        v7_mod.vol_band.rank_pct = lambda *a, **k: {
+            "000010": 0.31, "000020": 0.33, "000030": 0.35, "000031": 0.38,
+            "000040": 0.10}
+        subs = load_codes(cfg_sub)
+        check(subs[:3] == ["000010", "000020", "000030"],
+              "只订阅带内分位最低的 N 只（与研究「带内按分位升序取」一致）")
+        check(subs[3:] == model_codes and len(subs) == 7,
+              "V7 的订阅配额独立于 max_subscribe，模型候选一只不少（V1-V6 不受影响）")
+    finally:
+        v7_mod.vol_band.rank_pct = original
+
+
 def main() -> int:
     print("=" * 68)
     print(" 虚拟数据流验证：实时层重排/模拟盘/出场逻辑")
@@ -1610,7 +1734,7 @@ def main() -> int:
                scenario_I, scenario_J, scenario_K, scenario_L,
                scenario_M, scenario_N, scenario_O, scenario_P, scenario_Q,
                scenario_R, scenario_S, scenario_T, scenario_U, scenario_V,
-               scenario_W, scenario_X):
+               scenario_W, scenario_X, scenario_Y):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
