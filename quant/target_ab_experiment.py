@@ -12,6 +12,25 @@ filter_untradable=1、top_n=2）统一评测，输出对比表，看哪条腿在
 
 **只读实验，不改冠军 / manifest / 每日发布名单。** 详见 OPS_AB_TARGET_ALIGN_2026-07-25.md。
 
+结论（2026-08-31 训四腿、2026-09-03 用 --eval-only 统一尺子重算，cost=0.002、
+filter_untradable=1、top_n=2、231 期）：
+
+    mode            sharpe  annual   maxDD   月胜率
+    baseline        -1.346  -0.841  -0.829   0.083
+    buyin-mask      -1.460  -0.581  -0.637   0.167
+    tradable-label  -1.218  -0.727  -0.759   0.250
+    tradable-mask   -0.981  -0.443  -0.538   0.333
+
+口径对齐的方向是对的：两端都补的 tradable-mask 比 baseline 好 +39.8pp，月胜率从
+8.3% 升到 33.3%，四条腿的排序也符合预期（补得越全越好）。但**没有一条腿可投**：
+top_n=2 的日均换手 0.86-0.98，0.002 的往返成本按 252 期就是 -43% 到 -49%，
+tradable-mask 的 -44.3% 基本等于纯成本，也就是口径对齐之后 gross alpha ≈ 0。
+baseline 多亏的那 40pp 说明乐观标签不只是"高估"，是**主动有害**——它把模型推向
+买不进的封板票，评测时被 filter 剔掉，剩下的是残渣。
+
+所以这条线不再推进：不是"该不该修标签"，而是修完就没有信号了。V1/V2 的模型腿在
+top_n=4 上判负 alpha 与此一致，收益改进的方向已转到 V7/V8 的无模型分位带。
+
 用法（容器内，模块方式）：
     export QUANT_BT_COST_ROUNDTRIP=0.002
     python -m quant.target_ab_experiment                 # 全量 36 窗
