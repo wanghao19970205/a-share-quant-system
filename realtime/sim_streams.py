@@ -1721,6 +1721,29 @@ def scenario_Y():
               "只订阅带内分位最低的 N 只（与研究「带内按分位升序取」一致）")
         check(subs[3:] == model_codes and len(subs) == 7,
               "V7 的订阅配额独立于 max_subscribe，模型候选一只不少（V1-V6 不受影响）")
+
+        # 磁盘快照：全池分位实测要 29s，盘中 execv 重启不能再付一次这个代价。
+        band_mod = v7_mod.vol_band
+        cache_dir = Path(tempfile.mkdtemp(prefix="sim_volband_"))
+        calls = []
+        orig_universe, orig_vol = band_mod.universe, band_mod.volatility
+
+        def _fake_vol(codes, window=band_mod.VOL_WINDOW):
+            calls.append(1)
+            return {c: 0.01 + i * 1e-4 for i, c in enumerate(codes)}
+
+        try:
+            band_mod.universe = lambda *a, **k: [f"{i:06d}" for i in range(120)]
+            band_mod.volatility = _fake_vol
+            band_mod.reset_cache()
+            first = original(cache_dir=cache_dir)
+            band_mod.reset_cache()  # 模拟 execv 重启：进程内缓存全部丢失
+            second = original(cache_dir=cache_dir)
+            check(len(calls) == 1 and first == second and len(first) == 120,
+                  "波动率分位落一份当日磁盘快照，盘中重启直接复用而不重算全池")
+        finally:
+            band_mod.universe, band_mod.volatility = orig_universe, orig_vol
+            band_mod.reset_cache()
     finally:
         v7_mod.vol_band.rank_pct = original
 

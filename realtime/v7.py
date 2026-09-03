@@ -57,10 +57,10 @@ class V7PaperTrader(V3PaperTrader):
 
     # ---------- 选股池 ----------
 
-    def _ranks(self) -> dict[str, float]:
+    def _ranks(self) -> dict:
         """今天的波动率分位表；取不到就返回空，由调用方按"不动"处理。"""
         try:
-            return vol_band.rank_pct()
+            return vol_band.rank_pct(cache_dir=getattr(self._cfg, "ledger_dir", None))
         except Exception as e:  # noqa: BLE001 - 选股池算不出来不该拖垮引擎
             print(f"{self._prefix()} 波动率分位不可用: {type(e).__name__}: {e}", flush=True)
             return {}

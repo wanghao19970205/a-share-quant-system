@@ -108,17 +108,50 @@ def volatility(codes: list[str], window: int = VOL_WINDOW) -> dict[str, float]:
     return out
 
 
-def rank_pct(codes: Optional[list[str]] = None, window: int = VOL_WINDOW,
-             as_of: Optional[_dt.date] = None) -> dict[str, float]:
+def _disk_cache_path(cache_dir, day: _dt.date, window: int) -> Optional[Path]:
+    if not cache_dir:
+        return None
+    return Path(cache_dir) / f"vol_rank_{day:%Y%m%d}_{window}.json"
+
+
+def _prune_disk_cache(path: Path, keep: int = 5) -> None:
+    """只留最近几天的分位快照，避免 logs 目录无限增长。"""
+    try:
+        files = sorted(path.parent.glob(f"vol_rank_*_{path.stem.rsplit('_', 1)[-1]}.json"))
+        for old in files[:-keep]:
+            old.unlink()
+    except OSError:
+        pass
+
+
+def rank_pct(codes: Optional[list] = None, window: int = VOL_WINDOW,
+             as_of: Optional[_dt.date] = None, cache_dir=None) -> dict:
     """今天的波动率分位（0<q<=1，越小波动越低），按日期缓存。
 
     分位口径与研究一致：``rank(pct=True, ascending=True)``，即平均序号除以样本数，
     并列取平均。样本量少于 100 时直接返回空——截面太小，分位没有意义。
+
+    ``cache_dir`` 给出时额外落一份当日快照到磁盘。全池 3191 只要读 3000 多个
+    parquet 尾部、实测 29 秒；进程内缓存救不了盘中 execv 重启，而重启可能正好落在
+    14:50-14:55 买窗里，把所有账户的建仓机会拖过去。只有全池口径（codes 为空）
+    才用磁盘缓存，指定 codes 时的截面语义不同，不能混用同一份文件。
     """
-    key = (as_of or _dt.date.today(), window, tuple(codes) if codes else None)
+    day = as_of or _dt.date.today()
+    key = (day, window, tuple(codes) if codes else None)
     hit = _cache.get(key)
     if hit is not None:
         return hit
+    disk = _disk_cache_path(cache_dir, day, window) if codes is None else None
+    if disk is not None and disk.exists():
+        try:
+            import json
+            cached = json.loads(disk.read_text(encoding="utf-8"))
+            if isinstance(cached, dict) and len(cached) >= 100:
+                out = {str(k): float(v) for k, v in cached.items()}
+                _cache[key] = out
+                return out
+        except Exception:  # noqa: BLE001 - 缓存坏了就重算，不影响交易
+            pass
     pool = codes if codes is not None else universe()
     vols = volatility(pool, window)
     if len(vols) < 100:
@@ -132,6 +165,17 @@ def rank_pct(codes: Optional[list[str]] = None, window: int = VOL_WINDOW,
     ranked = s.rank(pct=True, ascending=True)
     out = {str(k): float(v) for k, v in ranked.items()}
     _cache[key] = out
+    if disk is not None:
+        try:
+            import json
+            import os
+            disk.parent.mkdir(parents=True, exist_ok=True)
+            tmp = disk.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(out), encoding="utf-8")
+            os.replace(tmp, disk)
+            _prune_disk_cache(disk)
+        except Exception:  # noqa: BLE001 - 落盘失败只是慢一点，不该拦交易
+            pass
     return out
 
 

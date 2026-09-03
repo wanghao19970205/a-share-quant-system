@@ -373,7 +373,7 @@ class Engine:
             try:
                 self._paper_v7 = V7PaperTrader(
                     self._cfg, self._ctx, self._notifier, name_map)
-                ranks = vol_band.rank_pct()
+                ranks = vol_band.rank_pct(cache_dir=self._cfg.ledger_dir)
                 in_band = sum(1 for q in ranks.values()
                               if self._paper_v7._entry_lo < q <= self._paper_v7._entry_hi)
                 print(f"[engine] 模拟盘V7就绪：{self._paper_v7.summary()}，"

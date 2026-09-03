@@ -135,7 +135,7 @@ def _read_vol_band(cfg: RealtimeConfig) -> list[str]:
         return []
     try:
         from . import vol_band
-        ranks = vol_band.rank_pct()
+        ranks = vol_band.rank_pct(cache_dir=getattr(cfg, "ledger_dir", None))
     except Exception:  # noqa: BLE001 - 选股池算不出来不能阻断实时层启动
         return []
     lo = float(getattr(cfg, "paper_v7_entry_lo", 0.30))
