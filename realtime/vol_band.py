@@ -1,16 +1,25 @@
-"""V7 的选股池：60 日波动率的日度截面分位。
+"""V7/V8 的选股池：日度横截面分位（60 日波动率 / 20 日成交额）。
 
-研究依据（`quant/lowfreq_backtest.py`，2057 个交易日、往返成本 0.004）：按 60 日
-收益率标准差的截面分位，进 ``(0.30, 0.40]``、跌出 ``(0.20, 0.70]`` 才卖、等权持有，
-对"全可买等权"基准年化超额 +16.07%（t=10.86），留出期（2023 起）+15.08%（t=6.50），
-分年度 9 年全为正。窗口取 60 日是扫描出来的最优点：10/20/40 日排名不稳、换手更高，
-120 日信号变钝（gross 从 +14.16% 掉到 +10.79%）。
+两条腿共用同一套机制——按某个横截面指标取一条分位带，进带买、跌出更宽的出带才卖、
+等权持有，除分位带之外没有任何出场规则。区别只在指标：
 
-这里只回答"今天每只票的波动率分位是多少"，进出阈值交给 V7 判定。分位是截面相对量，
-所以样本不足的票直接不进结果，不做任何填充——宁可少一个候选，也不能让口径失真。
+- ``vol60``（V7）：60 日收益率标准差，进 ``(0.30, 0.40]``、出 ``(0.20, 0.70]``。
+  研究依据（`quant/lowfreq_backtest.py`，2058 个交易日、往返成本 0.004、n=20）：
+  年化超额 +15.89%，IS +15.29%（t 3.92）/ OOS +16.70%（t 3.60）。窗口 60 日是扫出来
+  的最优点：10/20/40 日排名不稳、换手更高，120 日信号变钝。
+- ``dollar_vol20``（V8）：20 日均成交额（``volume × close``），进 ``(0.10, 0.20]``、
+  出 ``(0.05, 0.50]``。年化超额 +17.97%，IS +17.85%（t 4.32）/ OOS +17.23%（t 2.87）。
+
+两条腿几乎不重合，这是开第二个账户的唯一理由：每个调仓日候选前 20 的 Jaccard 均值
+0.0032（中位 0），日度超额相关系数 0.174，五五等权合并后 IR 从 1.86/1.78 升到 2.37。
+低成交额那一档听起来像"买不进去"，实测不是：带内 20 日均成交额中位 4237 万元、最小
+3455 万元，单笔 5000 元只占 0.012%，99.1% 的标的买得起 1 手。
+
+这里只回答"今天每只票在某个指标上的分位是多少"，进出阈值交给 V7/V8 判定。分位是截面
+相对量，所以样本不足的票直接不进结果，不做任何填充——宁可少一个候选，也不能让口径失真。
 
 一天的滞后：实盘 14:50 建仓时价格文件只到 T-1 收盘，研究口径算到 T 收盘。实测
-（2026-09-03 全池 3191 只）两者带内成员 319 vs 319、交集 284、Jaccard 0.8023，
+（2026-09-03 全池 3191 只，vol60）两者带内成员 319 vs 319、交集 284、Jaccard 0.8023，
 全池分位 Spearman 0.998652，但最大绝对差 0.1377——分位在带下沿很密，"带内最低的
 40 只"两种口径只重合 16/40。这不影响策略预期：同一条带下 target_n 从 20 扫到 319，
 年化超额 15.89%/17.52%/15.33%/16.07%/14.53%，留出期 t 全在 3.6 以上，说明超额来自
@@ -24,10 +33,19 @@ from typing import Optional
 
 VOL_WINDOW = 60
 VOL_MIN_PERIODS = 45
-# 只读尾部若干行即可算 60 日波动，避免每天全量扫历史。
-_TAIL_ROWS = VOL_WINDOW + 10
 
-_cache: dict[tuple, dict[str, float]] = {}
+# 每个指标的窗口、最短样本、需要的列和磁盘快照前缀。窗口与 min_periods 必须和
+# ``quant.lowfreq_backtest._price_features`` 逐字一致，否则实盘选出来的不是研究里
+# 那批标的（vol60 曾因为多筛了一次正收盘而让个别标的分位偏离 0.8 以上）。
+METRICS = {
+    "vol60": {"window": VOL_WINDOW, "min_periods": VOL_MIN_PERIODS,
+              "cols": ["date", "close"], "file": "vol_rank"},
+    "dollar_vol20": {"window": 20, "min_periods": 15,
+                     "cols": ["date", "close", "volume"], "file": "dv_rank"},
+}
+DEFAULT_METRIC = "vol60"
+
+_cache: dict[tuple, dict] = {}
 
 
 def _price_dir() -> Optional[Path]:
@@ -38,7 +56,7 @@ def _price_dir() -> Optional[Path]:
     return Path(getattr(_qc, "PRICE_DIR", Path(_qc.QUANT_DIR) / "price"))
 
 
-def universe(path: Optional[str] = None) -> list[str]:
+def universe(path: Optional[str] = None) -> list:
     """读股票池文件。每行形如 ``000001 平安银行``，允许 ``#`` 注释。"""
     if path is None:
         try:
@@ -49,7 +67,7 @@ def universe(path: Optional[str] = None) -> list[str]:
     p = Path(path) if path else None
     if not p or not p.exists():
         return []
-    codes: list[str] = []
+    codes: list = []
     for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = line.split("#", 1)[0].strip()
         if not line:
@@ -60,80 +78,101 @@ def universe(path: Optional[str] = None) -> list[str]:
     return sorted(set(codes))
 
 
-def _vol_of(px, window: int) -> Optional[float]:
-    """尾部 window 段日收益率的标准差，口径与 ``quant.lowfreq_backtest._price_features``
-    逐行对齐：先按日期排序、丢掉无效收盘，再 ``pct_change().rolling(window,
-    min_periods=VOL_MIN_PERIODS).std()`` 取最后一个值。
+def _clean(px):
+    """与研究口径逐行对齐的预处理：按日期排序、丢掉无效日期/收盘。
 
-    不要"先筛正收盘再算收益"这类看似更稳的写法——那会把停牌/异常价前后的样本拼到
-    一起，算出研究口径里不存在的收益，实测会让个别标的的分位偏离 0.8 以上。
+    不要"先筛正收盘再算收益/成交额"这类看似更稳的写法——那会把停牌、异常价前后的
+    样本拼到一起，算出研究口径里不存在的值。
     """
-    try:
-        import pandas as pd
-    except Exception:  # noqa: BLE001
-        return None
+    import pandas as pd
     px = px.copy()
     px["date"] = pd.to_datetime(px["date"], errors="coerce")
     px["close"] = pd.to_numeric(px["close"], errors="coerce")
     px = px.dropna(subset=["date", "close"]).sort_values("date")
-    if len(px) < 30:
-        return None
-    sd = px["close"].pct_change().rolling(
-        window, min_periods=VOL_MIN_PERIODS).std().iloc[-1]
+    return px if len(px) >= 30 else None
+
+
+def _tail_value(px, metric: str) -> Optional[float]:
+    """该票在给定指标上的最新值；样本不足、退化或缺列都返回 None。"""
     try:
-        sd = float(sd)
+        import pandas as pd
+    except Exception:  # noqa: BLE001
+        return None
+    spec = METRICS[metric]
+    px = _clean(px)
+    if px is None:
+        return None
+    if metric == "vol60":
+        value = px["close"].pct_change().rolling(
+            spec["window"], min_periods=spec["min_periods"]).std().iloc[-1]
+    else:
+        if "volume" not in px.columns:
+            return None
+        vol = pd.to_numeric(px["volume"], errors="coerce")
+        value = (vol * px["close"]).rolling(
+            spec["window"], min_periods=spec["min_periods"]).mean().iloc[-1]
+    try:
+        value = float(value)
     except (TypeError, ValueError):
         return None
-    if sd != sd or sd <= 0:      # NaN 或退化
+    if value != value or value <= 0:      # NaN 或退化
         return None
-    return sd
+    return value
 
 
-def volatility(codes: list[str], window: int = VOL_WINDOW) -> dict[str, float]:
-    """逐票算 60 日收益波动。读不到、列不全、样本不足的票一律不进结果。"""
+def metric_values(codes: list, metric: str = DEFAULT_METRIC) -> dict:
+    """逐票算指标值。读不到、列不全、样本不足的票一律不进结果。"""
     try:
         import pandas as pd
     except Exception:  # noqa: BLE001
         return {}
+    spec = METRICS[metric]
     pdir = _price_dir()
     if pdir is None or not pdir.exists():
         return {}
-    out: dict[str, float] = {}
+    tail = spec["window"] + 10
+    out: dict = {}
     for code in codes:
         f = pdir / f"{code}.parquet"
         if not f.exists():
             continue
         try:
-            px = pd.read_parquet(f, columns=["date", "close"])
+            px = pd.read_parquet(f, columns=spec["cols"])
         except Exception:  # noqa: BLE001 - 单票坏文件不应影响整个截面
             continue
         if px is None or px.empty or "close" not in px.columns:
             continue
-        sd = _vol_of(px.tail(_TAIL_ROWS), window)
-        if sd is not None:
-            out[code] = sd
+        value = _tail_value(px.tail(tail), metric)
+        if value is not None:
+            out[code] = value
     return out
 
 
-def _disk_cache_path(cache_dir, day: _dt.date, window: int) -> Optional[Path]:
+def volatility(codes: list, window: int = VOL_WINDOW) -> dict:
+    """兼容入口：60 日波动率。新代码请直接用 ``metric_values``。"""
+    return metric_values(codes, "vol60")
+
+
+def _disk_cache_path(cache_dir, day: _dt.date, metric: str) -> Optional[Path]:
     if not cache_dir:
         return None
-    return Path(cache_dir) / f"vol_rank_{day:%Y%m%d}_{window}.json"
+    spec = METRICS[metric]
+    return Path(cache_dir) / f"{spec['file']}_{day:%Y%m%d}_{spec['window']}.json"
 
 
 def _prune_disk_cache(path: Path, keep: int = 5) -> None:
     """只留最近几天的分位快照，避免 logs 目录无限增长。"""
     try:
-        files = sorted(path.parent.glob(f"vol_rank_*_{path.stem.rsplit('_', 1)[-1]}.json"))
-        for old in files[:-keep]:
+        prefix, _, window = path.stem.rsplit("_", 2)
+        for old in sorted(path.parent.glob(f"{prefix}_*_{window}.json"))[:-keep]:
             old.unlink()
-    except OSError:
+    except (OSError, ValueError):
         pass
 
 
-def rank_pct(codes: Optional[list] = None, window: int = VOL_WINDOW,
+def rank_pct(codes: Optional[list] = None, metric: str = DEFAULT_METRIC,
              as_of: Optional[_dt.date] = None, cache_dir=None) -> dict:
-    """今天的波动率分位（0<q<=1，越小波动越低），按日期缓存。
+    """今天该指标的横截面分位（0<q<=1，越小值越低），按日期缓存。
 
     分位口径与研究一致：``rank(pct=True, ascending=True)``，即平均序号除以样本数，
     并列取平均。样本量少于 100 时直接返回空——截面太小，分位没有意义。
@@ -143,12 +182,14 @@ def rank_pct(codes: Optional[list] = None, window: int = VOL_WINDOW,
     14:50-14:55 买窗里，把所有账户的建仓机会拖过去。只有全池口径（codes 为空）
     才用磁盘缓存，指定 codes 时的截面语义不同，不能混用同一份文件。
     """
+    if metric not in METRICS:
+        raise ValueError(f"未知指标 {metric}，可选 {sorted(METRICS)}")
     day = as_of or _dt.date.today()
-    key = (day, window, tuple(codes) if codes else None)
+    key = (day, metric, tuple(codes) if codes else None)
     hit = _cache.get(key)
     if hit is not None:
         return hit
-    disk = _disk_cache_path(cache_dir, day, window) if codes is None else None
+    disk = _disk_cache_path(cache_dir, day, metric) if codes is None else None
     if disk is not None and disk.exists():
         try:
             import json
@@ -160,16 +201,15 @@ def rank_pct(codes: Optional[list] = None, window: int = VOL_WINDOW,
         except Exception:  # noqa: BLE001 - 缓存坏了就重算，不影响交易
             pass
     pool = codes if codes is not None else universe()
-    vols = volatility(pool, window)
-    if len(vols) < 100:
+    values = metric_values(pool, metric)
+    if len(values) < 100:
         _cache[key] = {}
         return {}
     try:
         import pandas as pd
     except Exception:  # noqa: BLE001
         return {}
-    s = pd.Series(vols)
-    ranked = s.rank(pct=True, ascending=True)
+    ranked = pd.Series(values).rank(pct=True, ascending=True)
     out = {str(k): float(v) for k, v in ranked.items()}
     _cache[key] = out
     if disk is not None:

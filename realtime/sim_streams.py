@@ -35,6 +35,7 @@ from realtime.v4 import V4PaperTrader
 from realtime.v5 import V5PaperTrader
 from realtime import v7 as v7_mod
 from realtime.v7 import V7PaperTrader
+from realtime.v8 import V8PaperTrader
 from realtime.sector_etf import SectorETFContext
 from realtime.feed import subscription_code
 from realtime.reference import (RefRow, _load_expected_return,
@@ -1610,8 +1611,9 @@ def _v7_position(code, *, buy_date="2020-01-02", buy_price=10.0, shares=400):
             "cost_basis": buy_price * shares}
 
 
-def _v7_trader(ranks, *, positions=None, prices=None, snap_codes=None, **over):
-    """构造一个 V7 账户：ranks 即当日波动率分位表（同时被打桩进 vol_band），
+def _v7_trader(ranks, *, positions=None, prices=None, snap_codes=None,
+               cls=None, **over):
+    """构造一个分位带账户：ranks 即当日分位表（同时被打桩进 vol_band），
     快照按 snap_codes（缺省 ranks 全体）铺齐，价格缺省 10 元。"""
     prices = prices or {}
     codes = sorted(snap_codes if snap_codes is not None else ranks)
@@ -1619,7 +1621,7 @@ def _v7_trader(ranks, *, positions=None, prices=None, snap_codes=None, **over):
                      vwap=prices.get(c, 10.0)) for c in codes]
     ctx = build_ctx({}, snaps)
     v7_mod.vol_band.rank_pct = lambda *a, **k: dict(ranks)
-    trader = V7PaperTrader(new_cfg(**over), ctx, FakeNotifier())
+    trader = (cls or V7PaperTrader)(new_cfg(**over), ctx, FakeNotifier())
     trader._state["positions"] = [dict(p) for p in (positions or [])]
     trader._now_hhmm = 1450
     return trader
@@ -1726,24 +1728,100 @@ def scenario_Y():
         band_mod = v7_mod.vol_band
         cache_dir = Path(tempfile.mkdtemp(prefix="sim_volband_"))
         calls = []
-        orig_universe, orig_vol = band_mod.universe, band_mod.volatility
+        orig_universe, orig_vol = band_mod.universe, band_mod.metric_values
 
-        def _fake_vol(codes, window=band_mod.VOL_WINDOW):
-            calls.append(1)
+        def _fake_vol(codes, metric=band_mod.DEFAULT_METRIC):
+            calls.append(metric)
             return {c: 0.01 + i * 1e-4 for i, c in enumerate(codes)}
 
         try:
             band_mod.universe = lambda *a, **k: [f"{i:06d}" for i in range(120)]
-            band_mod.volatility = _fake_vol
+            band_mod.metric_values = _fake_vol
             band_mod.reset_cache()
             first = original(cache_dir=cache_dir)
             band_mod.reset_cache()  # 模拟 execv 重启：进程内缓存全部丢失
             second = original(cache_dir=cache_dir)
             check(len(calls) == 1 and first == second and len(first) == 120,
                   "波动率分位落一份当日磁盘快照，盘中重启直接复用而不重算全池")
-        finally:
-            band_mod.universe, band_mod.volatility = orig_universe, orig_vol
+            # 两条腿的快照必须分文件，否则成交额分位会读到波动率的缓存。
             band_mod.reset_cache()
+            dv = original(metric="dollar_vol20", cache_dir=cache_dir)
+            files = sorted(p.name.split("_")[0] for p in cache_dir.glob("*.json"))
+            check(calls == ["vol60", "dollar_vol20"] and len(dv) == 120 and
+                  files == ["dv", "vol"],
+                  "vol60 与 dollar_vol20 各自一份磁盘快照，互不串读")
+        finally:
+            band_mod.universe, band_mod.metric_values = orig_universe, orig_vol
+            band_mod.reset_cache()
+    finally:
+        v7_mod.vol_band.rank_pct = original
+
+
+def scenario_Z():
+    print("\n== Z. V8 等权低成交额带账户（机制同 V7，只换指标）==")
+    original = v7_mod.vol_band.rank_pct
+    try:
+        # V8 的进带是 (0.10,0.20]：0.05 太低、0.30 太高，都不该买。
+        ranks = {"000011": 0.11, "000021": 0.15, "000031": 0.19,
+                 "000041": 0.05, "000051": 0.30}
+        t = _v7_trader(ranks, cls=V8PaperTrader)
+        check(t._METRIC == "dollar_vol20" and
+              (t._entry_lo, t._entry_hi, t._exit_lo, t._exit_hi) == (0.10, 0.20, 0.05, 0.50),
+              "V8 默认走 20 日成交额，进带 (0.10,0.20] 出带 (0.05,0.50]")
+        check(Path(t._state_file).name == "paper_state_v8.json" and
+              Path(t._trades_file).name == "paper_trades_v8.jsonl",
+              "V8 账户文件带 _v8 后缀，与 V7 及 V1-V6 完全隔离")
+        t._run_buys()
+        held = [p["code"] for p in t._state["positions"]]
+        check(held == ["000011", "000021", "000031"],
+              "只买 V8 自己的带内标的（0.05 和 0.30 都不买）")
+        check(all(p.get("entry_metric") == "dollar_vol20" and
+                  p.get("entry_rank_pct") is not None and
+                  "entry_vol_rank_pct" not in p for p in t._state["positions"]),
+              "持仓记录 entry_metric=dollar_vol20，不再冒用 entry_vol_rank_pct 字段名")
+
+        # 出带比 V7 窄（上沿 0.50），跌出即卖，且中文原因是成交额而不是波动率。
+        t2 = _v7_trader({**ranks, "000051": 0.60}, cls=V8PaperTrader,
+                        positions=[_v7_position("000051")])
+        t2._run_sells(1455)
+        check(len(t2._state["positions"]) == 0 and _last_exit(t2) == "vol_band_exit" and
+              t2._notifier.msgs and "成交额" in t2._notifier.msgs[-1][0],
+              "分位 0.60 冲出 V8 出带上沿 0.50 → 卖出，推送写「跌出成交额分位带」")
+
+        # V7 的分位表不能被 V8 拿去用：两条腿各查自己的 metric。
+        v8, v7 = (_v7_trader(ranks, cls=V8PaperTrader),
+                  _v7_trader(ranks, cls=V7PaperTrader))
+        asked = []
+        v7_mod.vol_band.rank_pct = lambda *a, **k: (
+            asked.append(k.get("metric")) or {"000011": 0.11})
+        v8._ranks()
+        v7._ranks()
+        check(asked == ["dollar_vol20", "vol60"],
+              "V8 查 dollar_vol20、V7 查 vol60，两条腿不共用分位表")
+
+        # 订阅配额：两条腿各自一份，互不挤占，也不挤占模型候选。
+        cfg_sub = new_cfg()
+        sub_root = Path(cfg_sub.ledger_dir)
+        for prefix, lo, hi in (("paper_v7", 0.30, 0.40), ("paper_v8", 0.10, 0.20)):
+            setattr(cfg_sub, f"{prefix}_enabled", True)
+            setattr(cfg_sub, f"{prefix}_entry_lo", lo)
+            setattr(cfg_sub, f"{prefix}_entry_hi", hi)
+            setattr(cfg_sub, f"{prefix}_subscribe_n", 2)
+        cfg_sub.mobile_snapshot_file = sub_root / "mobile.json"
+        cfg_sub.predictions_file = sub_root / "missing.parquet"
+        cfg_sub.holdings_file = sub_root / "missing.txt"
+        cfg_sub.universe_file = sub_root / "missing_universe.txt"
+        cfg_sub.max_subscribe = 2
+        cfg_sub.mobile_snapshot_file.write_text(json.dumps(
+            {"groups": {"全A": {"rows": [{"code": "600001"}, {"code": "600002"}]}}}),
+            encoding="utf-8")
+        tables = {"vol60": {"000010": 0.31, "000020": 0.33, "000030": 0.35},
+                  "dollar_vol20": {"000011": 0.11, "000021": 0.15, "000031": 0.19}}
+        v7_mod.vol_band.rank_pct = lambda *a, **k: dict(
+            tables[k.get("metric", "vol60")])
+        subs = load_codes(cfg_sub)
+        check(subs == ["000010", "000020", "000011", "000021", "600001", "600002"],
+              "V7/V8 各取自己带内最低 2 只，模型候选 2 只一只不少（三份配额独立）")
     finally:
         v7_mod.vol_band.rank_pct = original
 
@@ -1757,7 +1835,7 @@ def main() -> int:
                scenario_I, scenario_J, scenario_K, scenario_L,
                scenario_M, scenario_N, scenario_O, scenario_P, scenario_Q,
                scenario_R, scenario_S, scenario_T, scenario_U, scenario_V,
-               scenario_W, scenario_X, scenario_Y):
+               scenario_W, scenario_X, scenario_Y, scenario_Z):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

@@ -121,8 +121,9 @@ def _read_predictions(path: Path) -> list[str]:
     return [_norm(c) for c in df["code"].tolist()]
 
 
-def _read_vol_band(cfg: RealtimeConfig) -> list[str]:
-    """V7 的低波动带候选，按波动率分位升序取前 N 只；V7 未开或数据不足则为空。
+def _read_band(cfg: RealtimeConfig, prefix: str, metric: str,
+               defaults: tuple) -> list:
+    """某条分位带腿的候选，按分位升序取前 N 只；该腿未开或数据不足则为空。
 
     只订阅带内分位最低的那几只，与研究里的选股规则一致（`simulate()` 在带内按分位
     升序取 need 只）。注意实盘 14:50 只能看到 T-1 收盘，研究算到 T 收盘，实测"带内
@@ -131,20 +132,32 @@ def _read_vol_band(cfg: RealtimeConfig) -> list[str]:
     所以这个截断和一天的滞后都不改变预期。数量必须有界：带内约占全池 10%（数百只），
     全订阅会打满行情带宽、连带影响 V1-V6 的报价新鲜度。
     """
-    if not getattr(cfg, "paper_v7_enabled", False):
+    if not getattr(cfg, f"{prefix}_enabled", False):
         return []
-    quota = max(0, int(getattr(cfg, "paper_v7_subscribe_n", 40)))
+    quota = max(0, int(getattr(cfg, f"{prefix}_subscribe_n", 40)))
     if quota <= 0:
         return []
     try:
         from . import vol_band
-        ranks = vol_band.rank_pct(cache_dir=getattr(cfg, "ledger_dir", None))
+        ranks = vol_band.rank_pct(metric=metric,
+                                  cache_dir=getattr(cfg, "ledger_dir", None))
     except Exception:  # noqa: BLE001 - 选股池算不出来不能阻断实时层启动
         return []
-    lo = float(getattr(cfg, "paper_v7_entry_lo", 0.30))
-    hi = float(getattr(cfg, "paper_v7_entry_hi", 0.40))
+    lo = float(getattr(cfg, f"{prefix}_entry_lo", defaults[0]))
+    hi = float(getattr(cfg, f"{prefix}_entry_hi", defaults[1]))
     band = sorted((q, _norm(c)) for c, q in ranks.items() if lo < q <= hi)
     return [c for _, c in band[:quota]]
+
+
+def _read_band_legs(cfg: RealtimeConfig) -> list:
+    """全部分位带腿的候选（V7 波动率 + V8 成交额），按腿顺序去重合并。"""
+    out: list = []
+    for prefix, metric, defaults in (("paper_v7", "vol60", (0.30, 0.40)),
+                                     ("paper_v8", "dollar_vol20", (0.10, 0.20))):
+        for code in _read_band(cfg, prefix, metric, defaults):
+            if code not in out:
+                out.append(code)
+    return out
 
 
 def load_codes(cfg: RealtimeConfig) -> list[str]:
@@ -152,7 +165,7 @@ def load_codes(cfg: RealtimeConfig) -> list[str]:
 
     模拟盘和人工持仓必须有实时价才能执行风控/卖出，因此优先于候选名单，不能在
     max_subscribe 截断时被挤掉。候选来源保持固定候选组 -> 预测 -> 兜底池的顺序。
-    V7 的低波动带候选走独立配额（见下方 limit），既不挤占 V1-V6 的候选名额，
+    分位带腿（V7/V8）的候选走独立配额（见下方 limit），既不挤占 V1-V6 的候选名额，
     也不会被模型候选挤掉。
     """
     ordered: list[str] = []
@@ -174,7 +187,7 @@ def load_codes(cfg: RealtimeConfig) -> list[str]:
     _extend(holdings)
     protected_count = len(ordered)
     before_band = len(ordered)
-    _extend(_read_vol_band(cfg))
+    _extend(_read_band_legs(cfg))
     band_quota = len(ordered) - before_band
     _extend(candidates)
 
