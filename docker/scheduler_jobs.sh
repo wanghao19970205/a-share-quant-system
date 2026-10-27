@@ -118,8 +118,6 @@ case "$job" in
     if [ "$workflow_rc" -eq 0 ]; then
         # 发布成功后立即确保实时引擎存活；已有引擎会按预测文件 mtime 自重载。
         "$0" realtime
-        # Top10 评估不参与预测发布和 realtime 决策，后台执行，避免阻塞日更完成信号。
-        TOP10_SOURCE_JOB=intraday-light "$0" top10-eval 6>&- >/dev/null 2>&1 &
     else
         exit "$workflow_rc"
     fi
@@ -146,8 +144,6 @@ case "$job" in
     if [ "$workflow_rc" -eq 0 ]; then
         # 日更可能挤掉 realtime；发布后立即幂等保活，避免等 watchdog 错过买入窗。
         "$0" realtime
-        # Top10 评估不参与预测发布和 realtime 决策，后台执行，避免阻塞日更完成信号。
-        TOP10_SOURCE_JOB=daily-light "$0" top10-eval 6>&- >/dev/null 2>&1 &
     else
         exit "$workflow_rc"
     fi
@@ -171,8 +167,6 @@ case "$job" in
     if [ "$workflow_rc" -eq 0 ]; then
         # 周更发布后同样立即恢复/保活 realtime，避免训练期间引擎被终止后无人拉起。
         "$0" realtime
-        # Top10 评估不参与预测发布和 realtime 决策，后台执行，避免阻塞日更完成信号。
-        TOP10_SOURCE_JOB=weekly-full "$0" top10-eval 6>&- >/dev/null 2>&1 &
     else
 
         exit "$workflow_rc"
